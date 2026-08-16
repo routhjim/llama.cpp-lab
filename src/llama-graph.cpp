@@ -1936,13 +1936,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         ggml_tensor * weights_in) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
 
     ggml_tensor * logits = nullptr;
+    ggml_tensor * probs = nullptr;
+    ggml_tensor * selection_probs = nullptr;
 
+    if (weights_in == nullptr) {
     if (probs_in == nullptr) {
         logits = build_lora_mm(gate_inp, cur); // [n_expert, n_tokens]
         if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
@@ -1958,7 +1962,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(logits, "ffn_moe_logits_biased", il);
     }
 
-    ggml_tensor * probs = nullptr;
     switch (gating_op) {
         case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:
             {
@@ -1983,7 +1986,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // add experts selection bias - introduced in DeepSeek V3
     // leave probs unbiased as it's later used to get expert weights
-    ggml_tensor * selection_probs = probs;
+    selection_probs = probs;
     if (exp_probs_b != nullptr) {
         selection_probs = ggml_add(ctx0, probs, exp_probs_b);
         cb(selection_probs, "ffn_moe_probs_biased", il);
@@ -2026,13 +2029,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     // select experts
+    } // weights_in == nullptr (routing)
+
     ggml_tensor * selected_experts = selected_experts_in;
     if (selected_experts == nullptr) {
+        GGML_ASSERT(weights_in == nullptr && "weights_in requires selected_experts_in");
         selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
         cb(selected_experts->src[0], "ffn_moe_argsort", il);
     }
     cb(selected_experts, "ffn_moe_topk", il);
 
+    if (weights_in == nullptr)
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented
         ggml_tensor * f_sel = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
@@ -2042,7 +2049,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
     }
 
-    ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
+    ggml_tensor * weights;
+    if (weights_in != nullptr) {
+        // tiered-MoE path: caller did routing/normalization; weights are
+        // aligned with selected_experts_in and must not be re-normalized.
+        GGML_ASSERT(selected_experts_in != nullptr);
+        weights = weights_in; // [1, n_expert_used, n_tokens]
+        cb(weights, "ffn_moe_weights_in", il);
+    } else {
+    weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
     cb(weights, "ffn_moe_weights", il);
 
 
@@ -2072,6 +2087,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         weights = ggml_scale(ctx0, weights, w_scale);
         cb(weights, "ffn_moe_weights_scaled", il);
     }
+    } // weights_in == nullptr
 
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
