@@ -160,11 +160,11 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
 
         // tiered MoE (v4-tiered): per-expert precision tiers, split tensors
         ggml_tensor * tier_hot_meta =
-            ml->get_tensor_meta(tn(LLM_TENSOR_FFN_GATE_EXPS_HOT, "weight", i).str().c_str());
+            ml.get_tensor_meta(tn(LLM_TENSOR_FFN_GATE_EXPS_HOT, "weight", i).str().c_str());
         if (tier_hot_meta != nullptr) {
             const int64_t n_hot = tier_hot_meta->ne[2];
             ggml_tensor * tier_mid_meta =
-                ml->get_tensor_meta(tn(LLM_TENSOR_FFN_GATE_EXPS_MID, "weight", i).str().c_str());
+                ml.get_tensor_meta(tn(LLM_TENSOR_FFN_GATE_EXPS_MID, "weight", i).str().c_str());
             GGML_ASSERT(tier_mid_meta != nullptr);
             const int64_t n_mid  = tier_mid_meta->ne[2];
             const int64_t n_cold = n_expert - n_hot - n_mid;
