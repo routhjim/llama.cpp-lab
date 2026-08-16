@@ -1405,14 +1405,17 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 { layer.ffn_up_exps_cold, layer.ffn_gate_exps_cold, layer.ffn_down_exps_cold, layer.ffn_exp_tier_ids_cold, layer.ffn_exp_tier_mask_cold },
             };
             moe_out = nullptr;
+            // get_rows with 2-D ids requires matching batch dims; flatten
+            ggml_tensor * selected_flat = ggml_reshape_1d(ctx0,
+                ggml_cont(ctx0, selected_experts), n_used * n_tokens);
             for (int t = 0; t < 3; t++) {
                 ggml_tensor * ids_f = ggml_cast(ctx0,
                     ggml_reshape_2d(ctx0, tiers[t].ids, 1, n_expert), GGML_TYPE_F32);
-                ggml_tensor * sel_f = ggml_get_rows(ctx0, ids_f, selected_experts);
+                ggml_tensor * sel_f = ggml_get_rows(ctx0, ids_f, selected_flat);
                 ggml_tensor * sel_t = ggml_cast(ctx0,
                     ggml_reshape_2d(ctx0, sel_f, n_used, n_tokens), GGML_TYPE_I32);
                 ggml_tensor * msk = ggml_get_rows(ctx0,
-                    ggml_reshape_2d(ctx0, tiers[t].mask, 1, n_expert), selected_experts);
+                    ggml_reshape_2d(ctx0, tiers[t].mask, 1, n_expert), selected_flat);
                 ggml_tensor * w_t = ggml_mul(ctx0, w,
                     ggml_reshape_3d(ctx0, msk, 1, n_used, n_tokens));
                 ggml_tensor * out_t = build_moe_ffn(cur,
