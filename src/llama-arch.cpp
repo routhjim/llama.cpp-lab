@@ -438,6 +438,16 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_FFN_GATE_EXPS,                          "blk.%d.ffn_gate_exps" },
     { LLM_TENSOR_FFN_GATE_UP_EXPS,                       "blk.%d.ffn_gate_up_exps" },
     { LLM_TENSOR_FFN_DOWN_EXPS,                          "blk.%d.ffn_down_exps" },
+    { LLM_TENSOR_FFN_GATE_EXPS_HOT,                      "blk.%d.ffn_gate_exps_hot" },
+    { LLM_TENSOR_FFN_UP_EXPS_HOT,                        "blk.%d.ffn_up_exps_hot" },
+    { LLM_TENSOR_FFN_DOWN_EXPS_HOT,                      "blk.%d.ffn_down_exps_hot" },
+    { LLM_TENSOR_FFN_GATE_EXPS_COLD,                     "blk.%d.ffn_gate_exps_cold" },
+    { LLM_TENSOR_FFN_UP_EXPS_COLD,                       "blk.%d.ffn_up_exps_cold" },
+    { LLM_TENSOR_FFN_DOWN_EXPS_COLD,                     "blk.%d.ffn_down_exps_cold" },
+    { LLM_TENSOR_FFN_EXP_TIER_IDS_HOT,                   "blk.%d.ffn_exp_tier_ids_hot" },
+    { LLM_TENSOR_FFN_EXP_TIER_MASK_HOT,                  "blk.%d.ffn_exp_tier_mask_hot" },
+    { LLM_TENSOR_FFN_EXP_TIER_IDS_COLD,                  "blk.%d.ffn_exp_tier_ids_cold" },
+    { LLM_TENSOR_FFN_EXP_TIER_MASK_COLD,                 "blk.%d.ffn_exp_tier_mask_cold" },
     { LLM_TENSOR_FFN_UP_EXPS,                            "blk.%d.ffn_up_exps" },
     { LLM_TENSOR_ATTN_POST_NORM,                         "blk.%d.post_attention_norm" },
     { LLM_TENSOR_ATTN_Q_NORM,                            "blk.%d.attn_q_norm" },
@@ -876,6 +886,16 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_DEC_ATTN_REL_B,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_GET_ROWS}},
     {LLM_TENSOR_ENC_ATTN_REL_B,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_GET_ROWS}},
     {LLM_TENSOR_FFN_DOWN_EXPS,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+    {LLM_TENSOR_FFN_GATE_EXPS_HOT,          {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+    {LLM_TENSOR_FFN_UP_EXPS_HOT,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+    {LLM_TENSOR_FFN_DOWN_EXPS_HOT,          {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+    {LLM_TENSOR_FFN_GATE_EXPS_COLD,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+    {LLM_TENSOR_FFN_UP_EXPS_COLD,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+    {LLM_TENSOR_FFN_DOWN_EXPS_COLD,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+    {LLM_TENSOR_FFN_EXP_TIER_IDS_HOT,       {LLM_TENSOR_LAYER_REPEATING, GGML_OP_GET_ROWS}},
+    {LLM_TENSOR_FFN_EXP_TIER_MASK_HOT,      {LLM_TENSOR_LAYER_REPEATING, GGML_OP_GET_ROWS}},
+    {LLM_TENSOR_FFN_EXP_TIER_IDS_COLD,      {LLM_TENSOR_LAYER_REPEATING, GGML_OP_GET_ROWS}},
+    {LLM_TENSOR_FFN_EXP_TIER_MASK_COLD,     {LLM_TENSOR_LAYER_REPEATING, GGML_OP_GET_ROWS}},
     {LLM_TENSOR_FFN_GATE_EXPS,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
     {LLM_TENSOR_FFN_UP_EXPS,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
     {LLM_TENSOR_FFN_GATE_UP_EXPS,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
@@ -1080,6 +1100,7 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
     switch (arch) {
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN35MOE:
+        case LLM_ARCH_QWEN4EXP:
         case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_NEMOTRON_H:
         case LLM_ARCH_NEMOTRON_H_MOE:

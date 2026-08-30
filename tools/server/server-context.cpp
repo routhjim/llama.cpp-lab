@@ -2531,6 +2531,41 @@ private:
                         break;
                     }
 
+                    // Persist the context checkpoints alongside the state file. Upstream serialises
+                    // only the sequence KV/recurrent state; for hybrid/recurrent memory llama.cpp
+                    // cannot truncate KV, so reusing a restored prefix REQUIRES a checkpoint from
+                    // slot.prompt.checkpoints -- which is in-RAM only and which the restore path
+                    // below wipes via prompt.clear(). Without this the NVMe slot cache silently
+                    // degrades to a full ~19 s re-prefill on every restore.
+                    {
+                        std::ofstream fckpt(filepath + ".ckpt", std::ios::binary);
+                        if (fckpt) {
+                            const uint32_t magic = 0x4b435054;
+                            const uint32_t ver   = 1;
+                            const uint32_t cnt   = (uint32_t) slot->prompt.checkpoints.size();
+                            fckpt.write((const char *) &magic, sizeof(magic));
+                            fckpt.write((const char *) &ver,   sizeof(ver));
+                            fckpt.write((const char *) &cnt,   sizeof(cnt));
+                            for (const auto & c : slot->prompt.checkpoints) {
+                                const int64_t n_tok = c.n_tokens;
+                                const int32_t idt   = (int32_t) c.id_task;
+                                const int32_t pmin  = (int32_t) c.pos_min;
+                                const int32_t pmax  = (int32_t) c.pos_max;
+                                fckpt.write((const char *) &n_tok, sizeof(n_tok));
+                                fckpt.write((const char *) &idt,   sizeof(idt));
+                                fckpt.write((const char *) &pmin,  sizeof(pmin));
+                                fckpt.write((const char *) &pmax,  sizeof(pmax));
+                                const std::vector<uint8_t> * vs[3] = { &c.data_tgt, &c.data_dft, &c.data_spec };
+                                for (int vi = 0; vi < 3; ++vi) {
+                                    const uint64_t n = (uint64_t) vs[vi]->size();
+                                    fckpt.write((const char *) &n, sizeof(n));
+                                    if (n) fckpt.write((const char *) vs[vi]->data(), n);
+                                }
+                            }
+                            SRV_INF("saved %u context checkpoint(s) alongside %s\n", cnt, filename.c_str());
+                        }
+                    }
+
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -2590,6 +2625,42 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+
+                        // prompt.clear() wipes checkpoints -- reload them from the sidecar
+                        std::ifstream fckpt(filepath + ".ckpt", std::ios::binary);
+                        if (fckpt) {
+                            uint32_t magic = 0, ver = 0, cnt = 0;
+                            fckpt.read((char *) &magic, sizeof(magic));
+                            fckpt.read((char *) &ver,   sizeof(ver));
+                            fckpt.read((char *) &cnt,   sizeof(cnt));
+                            if (fckpt && magic == 0x4b435054 && ver == 1) {
+                                for (uint32_t i = 0; i < cnt && fckpt; ++i) {
+                                    common_prompt_checkpoint c;
+                                    int64_t n_tok = 0; int32_t idt = 0, pmin = 0, pmax = 0;
+                                    fckpt.read((char *) &n_tok, sizeof(n_tok));
+                                    fckpt.read((char *) &idt,   sizeof(idt));
+                                    fckpt.read((char *) &pmin,  sizeof(pmin));
+                                    fckpt.read((char *) &pmax,  sizeof(pmax));
+                                    c.n_tokens = n_tok;
+                                    c.id_task  = idt;
+                                    c.pos_min  = pmin;
+                                    c.pos_max  = pmax;
+                                    std::vector<uint8_t> * vs[3] = { &c.data_tgt, &c.data_dft, &c.data_spec };
+                                    bool ok = true;
+                                    for (int vi = 0; vi < 3; ++vi) {
+                                        uint64_t n = 0;
+                                        fckpt.read((char *) &n, sizeof(n));
+                                        if (!fckpt || n > (uint64_t) 4ull * 1024 * 1024 * 1024) { ok = false; break; }
+                                        vs[vi]->resize((size_t) n);
+                                        if (n) fckpt.read((char *) vs[vi]->data(), n);
+                                    }
+                                    if (!ok || !fckpt) break;
+                                    slot->prompt.checkpoints.emplace_back(std::move(c));
+                                }
+                                SRV_INF("restored %zu context checkpoint(s) from sidecar\n",
+                                        slot->prompt.checkpoints.size());
+                            }
+                        }
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);

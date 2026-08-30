@@ -24,6 +24,9 @@
 #include <assert.h>
 #include <errno.h>
 #include <time.h>
+#if defined(__linux__)
+#include <sys/mman.h> // posix_madvise for mmap-backed expert-pack readahead
+#endif
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1460,6 +1463,209 @@ struct mmid_row_mapping {
     int32_t i2;
 };
 
+
+// ===================== managed expert cache (fn-expert-swap) =====================
+//
+// Problem: the 18 GiB cold expert pack is mmap'd, so it lives in PAGE CACHE, which the
+// kernel hands to whatever else wants memory. Under a container workload it collapses
+// (measured: 99% -> 8% resident) and decode goes fault-bound. Measured offline against
+// the 745k-token routing trace, the fault cost is BANDWIDTH-bound -- 30.2 cold
+// activations/token x 2.93 MiB = 88 MiB/token that must cross the NVMe. Reordering
+// requests (madvise) provably does NOT help: an A/B of madvise-vs-none-vs-lookahead
+// landed all configs within 1.5%. Only raising RESIDENCY reduces bytes moved.
+//
+// So: keep a BOUNDED, LRU-managed set of expert slabs mlock'd, which the kernel cannot
+// reclaim. Simulation over the real trace (policy vs cache size, miss %):
+//     cache    static-LFU     LRU   trace+LRU
+//      5.7G        42.3%      9.7%       7.9%
+//      8.6G        23.8%      6.2%       4.6%
+//     11.4G        11.6%      3.8%       2.4%
+// Recency beats the frequency-based hot/cold split itself by 4.4x, and trace-guided
+// admission takes another 20-37% off LRU.
+//
+// Design notes:
+//  * The cache is mlock'd RANGES over the existing mmap, not a copy buffer. A hit is a
+//    normal read with zero added work; a miss is an ordinary fault, exactly as costly
+//    as today (no regression path). mul_mat_id needs NO pointer redirection.
+//  * mlock() is SYNCHRONOUS -- it faults pages in and blocks. Speculatively admitting
+//    5 predicted slabs on the compute thread would stall ~3.5 ms, far worse than the
+//    miss it avoids. So admission runs on a BACKGROUND THREAD; the compute path only
+//    pushes keys onto an SPSC ring and returns.
+//  * The successor table is learned ONLINE (order-1 was measured best; order-2 was
+//    worse at equal budget). A trace file would encode the wrong workload.
+//
+// Env:
+//   GGML_EXPERT_CACHE_GIB=N    enable, cache size in GiB (0/unset = off)
+//   GGML_EXPERT_CACHE_TRACE=K  also admit the top-K learned successors (0 = LRU only)
+//   GGML_EXPERT_CACHE_STATS=1  print hit/miss/admit/evict every 10s
+#if defined(__linux__)
+#include <pthread.h>
+
+#define EC_MAX_LAYERS  128
+#define EC_STRIDE      512      // key = layer*EC_STRIDE + pack_local_expert
+#define EC_NKEY        (EC_MAX_LAYERS * EC_STRIDE)
+#define EC_QRING       8192
+#define EC_SUCC        4        // successor slots per key
+
+typedef struct { int32_t prev, next; uint8_t present; } ec_slot;
+typedef struct { uint32_t key; uint16_t cnt; } ec_succ;
+
+static struct {
+    int      inited, enabled, trace_k, stats;
+    size_t   cap_bytes, cur_bytes;
+    ec_slot  slot[EC_NKEY];            // indexed by key; LRU list over resident keys
+    int32_t  lru_head, lru_tail;       // head = MRU
+    struct { const char * data[3]; size_t nb02[3]; int have; } pk[EC_MAX_LAYERS];
+    ec_succ  succ[EC_NKEY][EC_SUCC];
+    uint32_t ring[EC_QRING];
+    volatile uint32_t q_head, q_tail;  // SPSC: producer=compute, consumer=worker
+    pthread_t th;
+    volatile int stop;
+    uint64_t n_hit, n_miss, n_admit, n_evict, n_lockfail;
+    int32_t  prev_key;
+    double   t_last;
+} ec;
+
+static size_t ec_slab_bytes(int layer) {
+    size_t b = 0;
+    for (int k = 0; k < 3; k++) b += ec.pk[layer].nb02[k];
+    return b;
+}
+
+static void ec_lru_unlink(int32_t k) {
+    if (ec.slot[k].prev >= 0) ec.slot[ec.slot[k].prev].next = ec.slot[k].next;
+    else                      ec.lru_head = ec.slot[k].next;
+    if (ec.slot[k].next >= 0) ec.slot[ec.slot[k].next].prev = ec.slot[k].prev;
+    else                      ec.lru_tail = ec.slot[k].prev;
+    ec.slot[k].prev = ec.slot[k].next = -1;
+}
+static void ec_lru_push(int32_t k) {
+    ec.slot[k].prev = -1; ec.slot[k].next = ec.lru_head;
+    if (ec.lru_head >= 0) ec.slot[ec.lru_head].prev = k;
+    ec.lru_head = k;
+    if (ec.lru_tail < 0) ec.lru_tail = k;
+}
+
+// worker-thread only
+static void ec_evict_one(void) {
+    int32_t k = ec.lru_tail;
+    if (k < 0) return;
+    int layer = k / EC_STRIDE, e = k % EC_STRIDE;
+    for (int i = 0; i < 3; i++) {
+        if (ec.pk[layer].data[i]) {
+            munlock((void *)(ec.pk[layer].data[i] + (size_t) e * ec.pk[layer].nb02[i]),
+                    ec.pk[layer].nb02[i]);
+        }
+    }
+    ec_lru_unlink(k);
+    ec.slot[k].present = 0;
+    ec.cur_bytes -= ec_slab_bytes(layer);
+    ec.n_evict++;
+}
+
+static void ec_admit(int32_t k) {
+    if (k < 0 || k >= EC_NKEY) return;
+    int layer = k / EC_STRIDE, e = k % EC_STRIDE;
+    if (!ec.pk[layer].have) return;
+    if (ec.slot[k].present) { ec_lru_unlink(k); ec_lru_push(k); return; }
+    const size_t need = ec_slab_bytes(layer);
+    while (ec.cur_bytes + need > ec.cap_bytes && ec.lru_tail >= 0) ec_evict_one();
+    if (ec.cur_bytes + need > ec.cap_bytes) return;      // cache smaller than one slab
+    for (int i = 0; i < 3; i++) {
+        if (!ec.pk[layer].data[i]) continue;
+        if (mlock((void *)(ec.pk[layer].data[i] + (size_t) e * ec.pk[layer].nb02[i]),
+                  ec.pk[layer].nb02[i]) != 0) { ec.n_lockfail++; }
+    }
+    ec.slot[k].present = 1; ec_lru_push(k);
+    ec.cur_bytes += need; ec.n_admit++;
+}
+
+static void ec_learn(int32_t a, int32_t b) {
+    if (a < 0 || a >= EC_NKEY) return;
+    ec_succ * row = ec.succ[a];
+    int min_i = 0;
+    for (int i = 0; i < EC_SUCC; i++) {
+        if (row[i].cnt && row[i].key == (uint32_t) b) { if (row[i].cnt < 0xFFFF) row[i].cnt++; return; }
+        if (row[i].cnt < row[min_i].cnt) min_i = i;
+    }
+    row[min_i].key = (uint32_t) b; row[min_i].cnt = 1;   // replace weakest
+}
+
+static void * ec_worker(void * arg) {
+    (void) arg;
+    while (!ec.stop) {
+        if (ec.q_tail == ec.q_head) { struct timespec ts = {0, 200000}; nanosleep(&ts, NULL); continue; }
+        uint32_t key = ec.ring[ec.q_tail % EC_QRING];
+        ec.q_tail++;
+        int32_t k = (int32_t) key;
+        if (ec.slot[k].present) { ec.n_hit++; ec_lru_unlink(k); ec_lru_push(k); }
+        else                    { ec.n_miss++; ec_admit(k); }
+        if (ec.prev_key >= 0) ec_learn(ec.prev_key, k);
+        if (ec.trace_k > 0) {
+            ec_succ * row = ec.succ[k];
+            for (int i = 0; i < EC_SUCC && i < ec.trace_k; i++)
+                if (row[i].cnt) ec_admit((int32_t) row[i].key);
+        }
+        ec.prev_key = k;
+        if (ec.stats) {
+            struct timespec tsn; clock_gettime(CLOCK_MONOTONIC, &tsn);
+            double now = tsn.tv_sec + tsn.tv_nsec * 1e-9;   // wall, NOT clock():
+            // clock() is process CPU time and advances ~nthreads x faster
+            if (now - ec.t_last > 10.0) {
+                ec.t_last = now;
+                fprintf(stderr, "[expert-cache] hit %llu miss %llu (%.1f%%) admit %llu "
+                        "evict %llu resident %.1f/%.1f GiB lockfail %llu\n",
+                        (unsigned long long) ec.n_hit, (unsigned long long) ec.n_miss,
+                        100.0 * ec.n_miss / (double)(ec.n_hit + ec.n_miss + 1),
+                        (unsigned long long) ec.n_admit, (unsigned long long) ec.n_evict,
+                        ec.cur_bytes / 1073741824.0, ec.cap_bytes / 1073741824.0,
+                        (unsigned long long) ec.n_lockfail);
+            }
+        }
+    }
+    return NULL;
+}
+
+static void ec_init(void) {
+    if (ec.inited) return;
+    ec.inited = 1;
+    const char * g = getenv("GGML_EXPERT_CACHE_GIB");
+    double gib = g ? atof(g) : 0.0;
+    if (gib <= 0.0) return;
+    const char * t = getenv("GGML_EXPERT_CACHE_TRACE");
+    ec.trace_k = t ? atoi(t) : 0;
+    ec.stats   = getenv("GGML_EXPERT_CACHE_STATS") ? 1 : 0;
+    ec.cap_bytes = (size_t)(gib * 1073741824.0);
+    ec.lru_head = ec.lru_tail = -1; ec.prev_key = -1;
+    for (int i = 0; i < EC_NKEY; i++) { ec.slot[i].prev = ec.slot[i].next = -1; }
+    ec.enabled = 1;
+    pthread_create(&ec.th, NULL, ec_worker, NULL);
+    fprintf(stderr, "[expert-cache] enabled: %.1f GiB, trace-k %d\n", gib, ec.trace_k);
+}
+
+static void ec_register(int layer, const char * name, const char * data, size_t nb02) {
+    if (layer < 0 || layer >= EC_MAX_LAYERS) return;
+    int kind = strstr(name, "ffn_up_") ? 0 : strstr(name, "ffn_gate_") ? 1
+             : strstr(name, "ffn_down_") ? 2 : -1;
+    if (kind < 0) return;
+    ec.pk[layer].data[kind] = data;
+    ec.pk[layer].nb02[kind] = nb02;
+    ec.pk[layer].have = 1;
+}
+
+// compute-thread side: record a touch. Never blocks, never allocates.
+static inline void ec_note(int layer, int expert) {
+    if (!ec.enabled) return;
+    uint32_t k = (uint32_t) layer * EC_STRIDE + (uint32_t) expert;
+    if (k >= EC_NKEY) return;
+    uint32_t h = ec.q_head;
+    if (h - ec.q_tail >= EC_QRING) return;        // full: drop, this is advisory only
+    ec.ring[h % EC_QRING] = k;
+    ec.q_head = h + 1;
+}
+#endif // __linux__
+// =================== end managed expert cache ===================
+
 static void ggml_compute_forward_mul_mat_id_one_chunk(
     struct ggml_tensor * dst,
     const struct ggml_tensor * src0,
@@ -1628,12 +1834,60 @@ static void ggml_compute_forward_mul_mat_id(
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
-                assert(i02 >= 0 && i02 < n_as);
+                if (i02 < 0 || i02 >= n_as) {
+                    // out-of-range id = sentinel (hot/cold split experts): the slot
+                    // belongs to another pack. Zero its dst row so the masked
+                    // weighted sum downstream sees exact zeros, not garbage.
+                    float * dst_row = (float *) ((char *) dst->data + id*nb1 + iid1*nb2);
+                    memset(dst_row, 0, ne0*sizeof(float));
+                    continue;
+                }
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;
             }
         }
+
+#if defined(__linux__)
+        // Expert-pack residency hooks (fn-expert-swap).
+        //
+        //   GGML_MMID_MADVISE=1     issue WILLNEED for the experts this call will touch.
+        //     Kept because it is free, but note the A/B: madvise vs none vs a 32-pass
+        //     lookahead all landed within 1.5% at batch 1. Reordering requests does not
+        //     help -- the cold-pack cost is bandwidth, not latency.
+        //
+        //   GGML_EXPERT_CACHE_GIB=N the thing that does work: keep a bounded LRU set of
+        //     slabs mlock'd so the kernel cannot reclaim them. Purely advisory here --
+        //     we only record touches; the worker thread does every mlock/munlock, so
+        //     nothing below can block or change what the matmul reads.
+        {
+            static int mmid_madvise = -1;
+            if (mmid_madvise < 0) {
+                const char * e = getenv("GGML_MMID_MADVISE");
+                mmid_madvise = (e && atoi(e) != 0) ? 1 : 0;
+            }
+            if (mmid_madvise && n_as > 8) {
+                for (int64_t i02 = 0; i02 < n_as; ++i02) {
+                    if (matrix_row_counts[i02] > 0) {
+                        // best-effort; EINVAL/ENOMEM on non-mmap memory is harmless
+                        posix_madvise((char *) src0->data + i02*nb02, nb02, POSIX_MADV_WILLNEED);
+                    }
+                }
+            }
+
+            ec_init();
+            if (ec.enabled && n_as > 8 && src0->name[0] &&
+                strncmp(src0->name, "blk.", 4) == 0 && strstr(src0->name, "_exps_cold")) {
+                const int layer = atoi(src0->name + 4);
+                ec_register(layer, src0->name, (const char *) src0->data, nb02);
+                for (int64_t i02 = 0; i02 < n_as; ++i02) {
+                    if (matrix_row_counts[i02] > 0) {
+                        ec_note(layer, (int) i02);
+                    }
+                }
+            }
+        }
+#endif
     }
 
     // reset current_chunk

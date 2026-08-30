@@ -17779,14 +17779,21 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
     };
 
     auto const &is_src_of = [](const ggml_tensor *dst, const ggml_tensor *src) -> bool {
+        const ggml_tensor *src2 = src->view_src ? src->view_src : src;
         for (uint32_t s = 0; s < GGML_MAX_SRC; ++s) {
             if (dst->src[s] == src) {
                 return true;
             }
+            // read-after-write through a view: dst reads a view of storage that src writes
+            if (dst->src[s] != nullptr) {
+                const ggml_tensor *base = dst->src[s]->view_src ? dst->src[s]->view_src : dst->src[s];
+                if (base == src2) {
+                    return true;
+                }
+            }
         }
         // implicit dependency if they view the same tensor
         const ggml_tensor *dst2 = dst->view_src ? dst->view_src : dst;
-        const ggml_tensor *src2 = src->view_src ? src->view_src : src;
         if (dst2 == src2) {
             return true;
         }
@@ -17858,7 +17865,11 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
         // that we support (e.g. RMS_NORM + MUL).
         // This first pass only grabs "real" (non-view nodes). Second pass grabs view nodes.
         // The goal is to not interleave real and view nodes in a way that breaks fusion.
-        const int NUM_TO_CHECK = 20;
+        static int NUM_TO_CHECK = -1;
+        if (NUM_TO_CHECK < 0) {
+            const char * e = getenv("GGML_VK_OPT_LOOKAHEAD");
+            NUM_TO_CHECK = e ? atoi(e) : 20;
+        }
         for (int j = first_unused+1; j < std::min(first_unused + NUM_TO_CHECK, graph->n_nodes); ++j) {
             if (used[j]) {
                 continue;
@@ -17881,8 +17892,8 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                     is_src_of(graph->nodes[j], graph->nodes[c]) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_RMS_NORM && graph->nodes[j]->op == GGML_OP_MUL) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT && graph->nodes[j]->op == GGML_OP_ADD) &&
-                    !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_ADD_ID) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_MUL) &&
+                    !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_ADD_ID) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_ADD && graph->nodes[j]->op == GGML_OP_ADD) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_SSM_CONV && graph->nodes[j]->op == GGML_OP_ADD) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_SSM_CONV && graph->nodes[j]->op == GGML_OP_UNARY)) {
@@ -17891,6 +17902,17 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                 }
             }
             if (ok) {
+                static int opt_log = -1;
+                if (opt_log < 0) { const char *e = getenv("GGML_VK_OPT_LOG"); opt_log = e ? atoi(e) : 0; }
+                if (opt_log) {
+                    for (int c = first_unused; c < j; ++c) {
+                        if (!used[c]) {
+                            fprintf(stderr, "VKOPT pull %s(%s) over %s(%s)\n",
+                                graph->nodes[j]->name, ggml_op_name(graph->nodes[j]->op),
+                                graph->nodes[c]->name, ggml_op_name(graph->nodes[c]->op));
+                        }
+                    }
+                }
                 current_set.push_back(j);
 
                 int rope_idx = j;
@@ -18021,6 +18043,37 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
         }
     }
     // Replace the graph with the new order.
+
+    {
+        static int opt_check = -1;
+        if (opt_check < 0) { const char *e = getenv("GGML_VK_OPT_CHECK"); opt_check = e ? atoi(e) : 0; }
+        if (opt_check) {
+            // validate new_order: every node's inputs (and their view bases) must
+            // have been produced by an earlier node, or be graph leaves
+            std::map<const ggml_tensor *, int> pos;   // producer tensor -> order idx
+            for (size_t i = 0; i < new_order.size(); ++i) {
+                pos[new_order[i]] = (int)i;
+            }
+            for (size_t i = 0; i < new_order.size(); ++i) {
+                const ggml_tensor *n = new_order[i];
+                for (uint32_t si = 0; si < GGML_MAX_SRC; ++si) {
+                    const ggml_tensor *src = n->src[si];
+                    if (!src) continue;
+                    const ggml_tensor *chk[2] = { src, src->view_src ? src->view_src : nullptr };
+                    for (int c = 0; c < 2; ++c) {
+                        if (!chk[c]) continue;
+                        auto it = pos.find(chk[c]);
+                        if (it != pos.end() && it->second > (int)i) {
+                            fprintf(stderr, "VKCHK VIOLATION: node[%zu] %s(%s) reads %s(%s) produced at [%d]\n",
+                                i, n->name, ggml_op_name(n->op),
+                                chk[c]->name, ggml_op_name(chk[c]->op), it->second);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     for (int i = 0; i < graph->n_nodes; ++i) {
         graph->nodes[i] = new_order[i];
     }
