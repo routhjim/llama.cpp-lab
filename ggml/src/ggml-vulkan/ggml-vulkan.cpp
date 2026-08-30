@@ -18318,6 +18318,34 @@ static enum ggml_backend_dev_type ggml_backend_vk_device_get_type(ggml_backend_d
     return ctx->is_integrated_gpu ? GGML_BACKEND_DEVICE_TYPE_IGPU : GGML_BACKEND_DEVICE_TYPE_GPU;
 }
 
+
+// Opt-in: let llama.cpp import the mmap'd model region directly as a Vulkan buffer
+// (VK_EXT_external_memory_host), so the GPU reads weights straight out of page cache.
+//
+// On an integrated GPU this is potentially a large win: "device-local" memory IS system
+// RAM, so importing the host mapping avoids a full copy of the weights at load time and
+// leaves them file-backed and reclaimable instead of pinned in a device allocation.
+// It is also the mechanism that would let expert tensors stay on the GPU compute path
+// without being resident in a device buffer -- i.e. no CPU-backend fallback for a
+// "cold" tier at all.
+//
+// Default OFF because it is unproven here: imported memory is HostVisible|HostCoherent|
+// HostCached, and GPU reads from it may be slower than from device-local memory. Enable
+// with GGML_VK_HOST_PTR=1 to measure. Requires VK_EXT_external_memory_host; the import
+// path itself already validates the extension and the alignment and fails soft.
+static bool ggml_vk_host_ptr_enabled(size_t dev_idx) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * e = getenv("GGML_VK_HOST_PTR");
+        enabled = (e && atoi(e) != 0) ? 1 : 0;
+    }
+    if (!enabled) {
+        return false;
+    }
+    auto device = ggml_vk_get_device(dev_idx);
+    return device && device->external_memory_host;
+}
+
 static void ggml_backend_vk_device_get_props(ggml_backend_dev_t dev, struct ggml_backend_dev_props * props) {
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
 
@@ -18329,7 +18357,7 @@ static void ggml_backend_vk_device_get_props(ggml_backend_dev_t dev, struct ggml
     props->caps = {
         /* .async                 = */ true,
         /* .host_buffer           = */ true,
-        /* .buffer_from_host_ptr  = */ false,
+        /* .buffer_from_host_ptr  = */ ggml_vk_host_ptr_enabled(ctx->device),
         /* .events                = */ true,
         /* .mmap_support          = */ !ctx->is_integrated_gpu,
     };
@@ -19081,6 +19109,27 @@ static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, si
         return {};
     }
 
+    // NOTE: this path is NOT usable as written, and alignment is only the first
+    // obstacle. VK_EXT_external_memory_host wants pointer and size aligned to
+    // minImportedHostPointerAlignment (4096); GGUF aligns tensor data to 32 bytes, so
+    // llama.cpp's mapping range essentially never qualifies (measured on Flash-Next:
+    // data starts at byte 11,047,776 = 864 mod 4096). That part is easy to widen.
+    //
+    // The real blocker is the address scheme: this backend uses a SINGLE synthetic base
+    // for every buffer --
+    //     static void * const vk_ptr_base = (void *)(uintptr_t) 0x1000;
+    //     vk_tensor_offset(t) = (uint8_t *) t->data - (uint8_t *) vk_ptr_base;
+    // -- whereas buffer_from_host_ptr gives tensors REAL host addresses, so every offset
+    // would come out as (host address - 0x1000). Widening the alignment ALONE turns a
+    // clean load failure into silent corruption.
+    //
+    // Making it work means deriving the offset from the tensor's OWN buffer base
+    // (tensor->buffer) instead of the global constant -- a change to a hot path used by
+    // every op, plus view_src handling. Feasible, but a real refactor.
+    //
+    // Worth doing: on an integrated GPU it would let the GPU compute directly from
+    // file-backed page cache, removing ~73 GiB of pinned GTT copies and making models
+    // far larger than RAM runnable at GPU speed rather than the CPU path's ~2x tax.
     uintptr_t uptr = reinterpret_cast<uintptr_t>(ptr);
     if (uptr & (device->min_imported_host_pointer_alignment - 1)) {
         return {};

@@ -1507,7 +1507,7 @@ struct mmid_row_mapping {
 #define EC_QRING       8192
 #define EC_SUCC        4        // successor slots per key
 
-typedef struct { int32_t prev, next; uint8_t present; } ec_slot;
+typedef struct { int32_t prev, next; uint8_t present, via_trace, used; } ec_slot;
 typedef struct { uint32_t key; uint16_t cnt; } ec_succ;
 
 static struct {
@@ -1522,6 +1522,10 @@ static struct {
     pthread_t th;
     volatile int stop;
     uint64_t n_hit, n_miss, n_admit, n_evict, n_lockfail;
+    // prefetch attribution: was a slab admitted by the successor table (via_trace)
+    // or by demand, and did it earn its keep before eviction?
+    uint64_t n_pf_admit, n_pf_hit, n_dem_hit, n_pf_dead;
+    size_t   n_pf_bytes_dead;
     int32_t  prev_key;
     double   t_last;
 } ec;
@@ -1557,13 +1561,16 @@ static void ec_evict_one(void) {
                     ec.pk[layer].nb02[i]);
         }
     }
+    if (ec.slot[k].via_trace && !ec.slot[k].used) {
+        ec.n_pf_dead++; ec.n_pf_bytes_dead += ec_slab_bytes(layer);
+    }
     ec_lru_unlink(k);
     ec.slot[k].present = 0;
     ec.cur_bytes -= ec_slab_bytes(layer);
     ec.n_evict++;
 }
 
-static void ec_admit(int32_t k) {
+static void ec_admit(int32_t k, int via_trace) {
     if (k < 0 || k >= EC_NKEY) return;
     int layer = k / EC_STRIDE, e = k % EC_STRIDE;
     if (!ec.pk[layer].have) return;
@@ -1577,6 +1584,8 @@ static void ec_admit(int32_t k) {
                   ec.pk[layer].nb02[i]) != 0) { ec.n_lockfail++; }
     }
     ec.slot[k].present = 1; ec_lru_push(k);
+    ec.slot[k].via_trace = (uint8_t) via_trace; ec.slot[k].used = 0;
+    if (via_trace) ec.n_pf_admit++;
     ec.cur_bytes += need; ec.n_admit++;
 }
 
@@ -1598,13 +1607,19 @@ static void * ec_worker(void * arg) {
         uint32_t key = ec.ring[ec.q_tail % EC_QRING];
         ec.q_tail++;
         int32_t k = (int32_t) key;
-        if (ec.slot[k].present) { ec.n_hit++; ec_lru_unlink(k); ec_lru_push(k); }
-        else                    { ec.n_miss++; ec_admit(k); }
+        if (ec.slot[k].present) {
+            ec.n_hit++;
+            if (!ec.slot[k].used) {   // first touch decides who gets the credit
+                if (ec.slot[k].via_trace) ec.n_pf_hit++; else ec.n_dem_hit++;
+                ec.slot[k].used = 1;
+            }
+            ec_lru_unlink(k); ec_lru_push(k);
+        } else { ec.n_miss++; ec_admit(k, 0); }
         if (ec.prev_key >= 0) ec_learn(ec.prev_key, k);
         if (ec.trace_k > 0) {
             ec_succ * row = ec.succ[k];
             for (int i = 0; i < EC_SUCC && i < ec.trace_k; i++)
-                if (row[i].cnt) ec_admit((int32_t) row[i].key);
+                if (row[i].cnt) ec_admit((int32_t) row[i].key, 1);
         }
         ec.prev_key = k;
         if (ec.stats) {
@@ -1620,6 +1635,13 @@ static void * ec_worker(void * arg) {
                         (unsigned long long) ec.n_admit, (unsigned long long) ec.n_evict,
                         ec.cur_bytes / 1073741824.0, ec.cap_bytes / 1073741824.0,
                         (unsigned long long) ec.n_lockfail);
+                fprintf(stderr, "[expert-cache] prefetch: admit %llu used %llu (%.1f%% precision) "
+                        "dead %llu (%.1f GiB) | first-touch credit trace %llu vs demand %llu (%.1f%% trace)\n",
+                        (unsigned long long) ec.n_pf_admit, (unsigned long long) ec.n_pf_hit,
+                        100.0 * ec.n_pf_hit / (double)(ec.n_pf_admit + 1),
+                        (unsigned long long) ec.n_pf_dead, ec.n_pf_bytes_dead / 1073741824.0,
+                        (unsigned long long) ec.n_pf_hit, (unsigned long long) ec.n_dem_hit,
+                        100.0 * ec.n_pf_hit / (double)(ec.n_pf_hit + ec.n_dem_hit + 1));
             }
         }
     }
@@ -1651,6 +1673,16 @@ static void ec_register(int layer, const char * name, const char * data, size_t 
     ec.pk[layer].data[kind] = data;
     ec.pk[layer].nb02[kind] = nb02;
     ec.pk[layer].have = 1;
+}
+
+// Eligible for the managed cache: the cold pack of a split model, or the whole
+// expert tensor of an UNSPLIT model pinned to CPU via -ot 'exps=CPU' (all-cold).
+// "_exps_hot" is GPU-resident and must never be admitted.
+static inline int ec_name_eligible(const char * name) {
+    const char * p = strstr(name, "_exps");
+    if (!p) return 0;
+    if (strncmp(p, "_exps_cold", 10) == 0) return 1;
+    return strcmp(p, "_exps.weight") == 0;
 }
 
 // compute-thread side: record a touch. Never blocks, never allocates.
@@ -1877,7 +1909,7 @@ static void ggml_compute_forward_mul_mat_id(
 
             ec_init();
             if (ec.enabled && n_as > 8 && src0->name[0] &&
-                strncmp(src0->name, "blk.", 4) == 0 && strstr(src0->name, "_exps_cold")) {
+                strncmp(src0->name, "blk.", 4) == 0 && ec_name_eligible(src0->name)) {
                 const int layer = atoi(src0->name + 4);
                 ec_register(layer, src0->name, (const char *) src0->data, nb02);
                 for (int64_t i02 = 0; i02 < n_as; ++i02) {

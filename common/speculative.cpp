@@ -2747,6 +2747,53 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
     return result;
 }
 
+
+// Optional precision gate for ngram drafters: only let an ngram draft REPLACE a
+// model-produced draft if the two agree on the first token.
+//
+// Motivation (measured on a live agent run):
+//   ngram fires on <1% of draft events but produces ~23% of drafted tokens, because it
+//   speculates 24-64 at a time. ~32% of its firings die at position 2, and each of those
+//   still pays a full 64-token verify batch -- ~81 experts/layer against ~16 for an MTP
+//   batch, since an MoE verify batch reads the UNION of its tokens' experts.
+//
+//   Raising --spec-ngram-mod-n-match improves precision only to ~92% and then saturates:
+//   after a long verbatim match the model sometimes legitimately diverges, and no amount
+//   of history predicts that. The missing information is the MODEL's opinion, which is
+//   exactly what a draft model supplies and an ngram matcher by construction cannot.
+//
+// Mechanism: run the model drafter first, then let ngram overwrite its result only when
+// ngram's first token matches. Costs one extra draft-model pass on the ~1% of steps
+// where ngram fires (~4 ms against a ~185 ms target step), and nothing otherwise.
+//
+// REQUIRES the model drafter to come FIRST in --spec-type, e.g.
+//     --spec-type draft-mtp,ngram-mod          (not ngram-mod,draft-mtp)
+// because the gate compares against a draft that has already been produced. With ngram
+// first there is nothing to compare to and the gate does nothing.
+//
+// Enable with LLAMA_SPEC_NGRAM_AGREE=1. Default off.
+static bool common_spec_ngram_agree_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char * e = getenv("LLAMA_SPEC_NGRAM_AGREE");
+        v = (e && atoi(e) != 0) ? 1 : 0;
+    }
+    return v != 0;
+}
+
+static bool common_spec_type_is_ngram(common_speculative_type t) {
+    switch (t) {
+        case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
+            return true;
+        default:
+            return false;
+    }
+}
+
 void common_speculative_draft(common_speculative * spec) {
     if (spec == nullptr) {
         return;
@@ -2771,11 +2818,59 @@ void common_speculative_draft(common_speculative * spec) {
     }
 
     for (auto & impl : spec->impls) {
+        // --- ngram agreement gate (LLAMA_SPEC_NGRAM_AGREE=1) -------------------------
+        // Retarget dp.result at a scratch buffer for sequences that ALREADY have a draft
+        // from an earlier (model) drafter, so this ngram impl can propose an upgrade
+        // without destroying it. Resolved after the impl runs.
+        const bool agree_gate = common_spec_ngram_agree_enabled() &&
+                                common_spec_type_is_ngram(impl->type);
+        std::vector<llama_tokens>   spec_agree_scratch;
+        std::vector<llama_tokens>   spec_agree_orig;
+        std::vector<llama_tokens *> spec_agree_saved;
+        if (agree_gate) {
+            spec_agree_scratch.resize(dparams.size());
+            spec_agree_orig.resize(dparams.size());
+            spec_agree_saved.assign(dparams.size(), nullptr);
+            for (size_t sid = 0; sid < dparams.size(); ++sid) {
+                auto & dp = dparams[sid];
+                if (!dp.drafting && dp.result && !dp.result->empty()) {
+                    spec_agree_orig[sid]  = *dp.result;
+                    spec_agree_saved[sid] = dp.result;
+                    spec_agree_scratch[sid].clear();
+                    dp.result   = &spec_agree_scratch[sid];
+                    dp.drafting = true;               // let this impl run for this seq
+                }
+            }
+        }
+
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
             impl->draft(dparams);
             impl->n_call_draft++;
         }
+
+        if (agree_gate) {
+            for (size_t sid = 0; sid < dparams.size(); ++sid) {
+                if (!spec_agree_saved[sid]) {
+                    continue;
+                }
+                auto & dp  = dparams[sid];
+                auto & scr = spec_agree_scratch[sid];
+                dp.result  = spec_agree_saved[sid];
+                // upgrade only on first-token agreement; otherwise keep the model draft
+                if (!scr.empty() && !spec_agree_orig[sid].empty() &&
+                    scr[0] == spec_agree_orig[sid][0]) {
+                    *dp.result = scr;
+                    spec->impl_last[sid] = impl.get();
+                    impl->n_gen_drafts++;
+                    impl->n_gen_tokens += scr.size();
+                } else {
+                    *dp.result = spec_agree_orig[sid];
+                }
+                dp.drafting = false;                  // already drafted either way
+            }
+        }
+        // ---------------------------------------------------------------------------
 
         int n_drafting = 0;
 
@@ -2831,6 +2926,7 @@ void common_speculative_draft(common_speculative * spec) {
         }
     }
 }
+
 
 void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
     common_speculative_impl * impl = spec->impl_last[seq_id];
