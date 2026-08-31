@@ -328,6 +328,23 @@ struct llama_layer {
     struct ggml_tensor * ffn_gate_inp_s    = nullptr; // gemma4
     struct ggml_tensor * ffn_gate_exps     = nullptr;
     struct ggml_tensor * ffn_down_exps     = nullptr;
+
+    // tiered expert packs (see LLM_TENSOR_FFN_*_EXPS_HOT/MID/COLD)
+    struct ggml_tensor * ffn_gate_exps_hot      = nullptr;
+    struct ggml_tensor * ffn_up_exps_hot        = nullptr;
+    struct ggml_tensor * ffn_down_exps_hot      = nullptr;
+    struct ggml_tensor * ffn_exp_tier_ids_hot   = nullptr;
+    struct ggml_tensor * ffn_exp_tier_mask_hot  = nullptr;
+    struct ggml_tensor * ffn_gate_exps_mid      = nullptr;
+    struct ggml_tensor * ffn_up_exps_mid        = nullptr;
+    struct ggml_tensor * ffn_down_exps_mid      = nullptr;
+    struct ggml_tensor * ffn_exp_tier_ids_mid   = nullptr;
+    struct ggml_tensor * ffn_exp_tier_mask_mid  = nullptr;
+    struct ggml_tensor * ffn_gate_exps_cold     = nullptr;
+    struct ggml_tensor * ffn_up_exps_cold       = nullptr;
+    struct ggml_tensor * ffn_down_exps_cold     = nullptr;
+    struct ggml_tensor * ffn_exp_tier_ids_cold  = nullptr;
+    struct ggml_tensor * ffn_exp_tier_mask_cold = nullptr;
     struct ggml_tensor * ffn_up_exps       = nullptr;
     struct ggml_tensor * ffn_gate_up_exps  = nullptr;
     struct ggml_tensor * ffn_gate_inp_b    = nullptr;
