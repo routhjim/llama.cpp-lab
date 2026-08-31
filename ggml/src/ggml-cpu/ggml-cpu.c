@@ -1629,10 +1629,10 @@ static void ggml_compute_forward_mul_mat_id(
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
-                // this row belongs to another expert pack -- see GGML_CPU_MMID_SENTINEL.
+                // this row belongs to another expert pack -- see GGML_MMID_SENTINEL.
                 // write exact zeros rather than leaving the row untouched: a caller that
                 // masks the weight to zero still propagates a NaN left in the buffer.
-                if (i02 == GGML_CPU_MMID_SENTINEL) {
+                if (i02 == GGML_MMID_SENTINEL) {
                     float * dst_row = (float *) ((char *) dst->data + id*nb1 + iid1*nb2);
                     memset(dst_row, 0, ne0*sizeof(float));
                     continue;
