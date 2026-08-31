@@ -4,6 +4,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
 #include "traits.h"
+#include "ggml-cpu.h"
 #include "ggml-cpu-impl.h"
 #include "ggml-impl.h"
 #include "quants.h"
@@ -1628,7 +1629,20 @@ static void ggml_compute_forward_mul_mat_id(
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
-                assert(i02 >= 0 && i02 < n_as);
+                // this row belongs to another expert pack -- see GGML_MMID_SENTINEL.
+                // write exact zeros rather than leaving the row untouched: a caller that
+                // masks the weight to zero still propagates a NaN left in the buffer.
+                if (i02 == GGML_MMID_SENTINEL) {
+                    float * dst_row = (float *) ((char *) dst->data + id*nb1 + iid1*nb2);
+                    memset(dst_row, 0, ne0*sizeof(float));
+                    continue;
+                }
+
+                // GGML_ASSERT, not assert(): the repack twin in repack.cpp uses the
+                // always-live form, and the two paths are selected by weight type rather
+                // than by the caller. An id of -2 must not abort on one and corrupt the
+                // work buffer on the other.
+                GGML_ASSERT(i02 >= 0 && i02 < n_as);
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;

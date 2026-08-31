@@ -4458,6 +4458,15 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     const int32_t i02 =
                         *(const int32_t *) ((const char *) ids->data + iid1 * ids->nb[1] + id * ids->nb[0]);
 
+                    // see GGML_MMID_SENTINEL. this path must agree with the plain CPU
+                    // one: the repacked kernels are selected by weight type, so whether a
+                    // given model reaches here is not something the caller controls.
+                    if (i02 == GGML_MMID_SENTINEL) {
+                        float * dst_row = (float *) ((char *) dst->data + id * nb1 + iid1 * nb2);
+                        memset(dst_row, 0, ne0 * sizeof(float));
+                        continue;
+                    }
+
                     GGML_ASSERT(i02 >= 0 && i02 < n_as);
 
                     MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = { id, iid1 };
