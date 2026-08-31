@@ -132,8 +132,14 @@ def main():
             continue
         b = slab_by_layer[il]  # already per-expert bytes
         if cold_bytes + b > budget:
-            break
+            continue    # not break: one oversized slab must not end selection and
+                        # silently under-spend the remaining budget
         cold_bytes += b; cold_mass += mass.ravel()[k]; cold_ct[il] += 1
+    # every layer needs at least one cold expert: a zero-extent _cold tensor trips the
+    # loader's n_cold > 0 assert, and the graph has no path that skips a pack entirely
+    for il in range(n_layer):
+        if cold_ct[il] == 0:
+            cold_ct[il] = 1
     hot_counts = n_expert - cold_ct
     print(f"[fn_split] slab {slab_by_layer.min()/2**20:.2f}-"
           f"{slab_by_layer.max()/2**20:.2f} MiB; cold "
@@ -167,6 +173,9 @@ def main():
     for i, (nm, dims, ty, off) in enumerate(tinfo):
         il, sh = layer_of(nm), short(nm)
         if il is not None and il < n_layer and sh in SLICE_SUFFIX:
+            assert delta[i] % n_expert == 0, (
+                f"{nm}: padded size {delta[i]} not divisible by n_expert {n_expert}; "
+                "a wrong stride scrambles the router silently")
             stride = delta[i] // n_expert
             base = nm[:-len('.weight')]
             H = hot_counts[il]

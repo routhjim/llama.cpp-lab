@@ -1,8 +1,9 @@
+import os
 #!/usr/bin/env python3
 """Pre-warm the cold expert pack: buffered-read the _cold tensor byte ranges
 so decode misses hit page cache instead of faulting from NVMe."""
 import struct, sys, time
-p = sys.argv[1] if len(sys.argv) > 1 else '/home/jrouth/models/fn-split/xl-split.gguf'
+p = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("FN_SPLIT_MODEL", "")
 f = open(p, 'rb')
 magic, ver, n_tensors, n_kv = struct.unpack('<IIQQ', f.read(24))
 def rs(f):
