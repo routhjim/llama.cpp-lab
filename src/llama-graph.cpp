@@ -1910,7 +1910,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         ggml_tensor * weights_in) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -1931,7 +1932,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         up_exps_s,
         gate_exps_s,
         down_exps_s,
-        selected_experts_in
+        selected_experts_in,
+        weights_in
     );
 }
 
@@ -1959,7 +1961,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         ggml_tensor * weights_in) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -2065,35 +2068,42 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
     }
 
-    ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
-    cb(weights, "ffn_moe_weights", il);
+    // Expert weights. A caller that routes ONCE over the full expert set and then
+    // dispatches to several packs must reuse those weights verbatim: re-deriving
+    // them per pack would renormalise over a subset and corrupt the coalition.
+    // Mirrors the selected_experts_in bypass above.
+    ggml_tensor * weights = weights_in;
+    if (weights == nullptr) {
+        weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
+        cb(weights, "ffn_moe_weights", il);
 
 
-    if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT) {
-        weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
-        weights = ggml_soft_max(ctx0, weights); // [n_expert_used, n_tokens]
-        weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
-        cb(weights, "ffn_moe_weights_softmax", il);
-    }
+        if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT) {
+            weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
+            weights = ggml_soft_max(ctx0, weights); // [n_expert_used, n_tokens]
+            weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
+            cb(weights, "ffn_moe_weights_softmax", il);
+        }
 
-    if (norm_w) {
-        weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
+        if (norm_w) {
+            weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
 
-        ggml_tensor * weights_sum = ggml_sum_rows(ctx0, weights); // [1, n_tokens]
-        cb(weights_sum, "ffn_moe_weights_sum", il);
+            ggml_tensor * weights_sum = ggml_sum_rows(ctx0, weights); // [1, n_tokens]
+            cb(weights_sum, "ffn_moe_weights_sum", il);
 
-        // Avoid division by zero, clamp to smallest number representable by F16
-        weights_sum = ggml_clamp(ctx0, weights_sum, 6.103515625e-5, INFINITY);
-        cb(weights_sum, "ffn_moe_weights_sum_clamped", il);
+            // Avoid division by zero, clamp to smallest number representable by F16
+            weights_sum = ggml_clamp(ctx0, weights_sum, 6.103515625e-5, INFINITY);
+            cb(weights_sum, "ffn_moe_weights_sum_clamped", il);
 
-        weights = ggml_div(ctx0, weights, weights_sum); // [n_expert_used, n_tokens]
-        cb(weights, "ffn_moe_weights_norm", il);
+            weights = ggml_div(ctx0, weights, weights_sum); // [n_expert_used, n_tokens]
+            cb(weights, "ffn_moe_weights_norm", il);
 
-        weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
-    }
-    if (w_scale != 0.0f && w_scale != 1.0f) {
-        weights = ggml_scale(ctx0, weights, w_scale);
-        cb(weights, "ffn_moe_weights_scaled", il);
+            weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
+        }
+        if (w_scale != 0.0f && w_scale != 1.0f) {
+            weights = ggml_scale(ctx0, weights, w_scale);
+            cb(weights, "ffn_moe_weights_scaled", il);
+        }
     }
 
     //call early so that topk-moe can be used
