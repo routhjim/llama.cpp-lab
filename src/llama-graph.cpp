@@ -1990,7 +1990,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         logits = probs_in;
     }
 
-    if (gate_inp_b) {
+    if (gate_inp_b && !routed_by_caller) {
+        // guarded with the rest of the routing: on the bypass `logits` is null and
+        // ggml_add would dereference it. Not reachable from the 20-arg overload, which
+        // has no gate_inp_b, but this one is public.
         logits = ggml_add(ctx0, logits, gate_inp_b);
         cb(logits, "ffn_moe_logits_biased", il);
     }
@@ -2089,6 +2092,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // them per pack would renormalise over a subset and corrupt the coalition.
     // Mirrors the selected_experts_in bypass above.
     ggml_tensor * weights = weights_in;
+    if (weights != nullptr) {
+        // ggml_mul only requires ne[i] % weights->ne[i] == 0, so a narrower weights_in
+        // would broadcast cyclically instead of erroring -- silently wrong output. Be exact.
+        GGML_ASSERT(weights->ne[0] == 1 && weights->ne[1] == n_expert_used &&
+                    weights->ne[2] == n_tokens && "weights_in must be [1, n_expert_used, n_tokens]");
+        // norm_w, w_scale and the SOFTMAX_WEIGHT softmax are all skipped on this path; the
+        // caller has already applied whatever it wanted. Assert rather than ignore silently,
+        // so a future caller that forwards hparams by habit fails loudly.
+        GGML_ASSERT(!norm_w && w_scale == 0.0f &&
+                    gating_op != LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT &&
+                    "weights_in supplies final weights; norm_w/w_scale must be no-ops");
+        cb(weights, "ffn_moe_weights_in", il);
+    }
     if (weights == nullptr) {
         weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
         cb(weights, "ffn_moe_weights", il);
