@@ -4,6 +4,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
 #include "traits.h"
+#include "ggml-cpu.h"
 #include "ggml-cpu-impl.h"
 #include "ggml-impl.h"
 #include "quants.h"
@@ -1627,6 +1628,15 @@ static void ggml_compute_forward_mul_mat_id(
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+
+                // this row belongs to another expert pack -- see GGML_CPU_MMID_SENTINEL.
+                // write exact zeros rather than leaving the row untouched: a caller that
+                // masks the weight to zero still propagates a NaN left in the buffer.
+                if (i02 == GGML_CPU_MMID_SENTINEL) {
+                    float * dst_row = (float *) ((char *) dst->data + id*nb1 + iid1*nb2);
+                    memset(dst_row, 0, ne0*sizeof(float));
+                    continue;
+                }
 
                 assert(i02 >= 0 && i02 < n_as);
 
