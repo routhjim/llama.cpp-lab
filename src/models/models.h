@@ -2350,6 +2350,11 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * cur,
                             int   il);
 
+        // hot/cold split expert packs: one routing pass, one build_moe_ffn per pack
+        ggml_tensor * build_moe_ffn_split(
+                    ggml_tensor * cur,
+                            int   il) const;
+
         ggml_tensor * build_norm_gated(
                     ggml_tensor * input,
                     ggml_tensor * weights,
