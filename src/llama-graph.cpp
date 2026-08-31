@@ -2966,6 +2966,56 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
+    // [DSA_GATHER] The masked path above runs DENSE attention over the whole KV
+    // cache and discards ~(1 - n_top_k/n_kv) of the scores in the softmax, so the
+    // indexer's sparsity buys nothing at decode: cost stays O(n_kv) per layer.
+    // When there is a single token in the batch we can instead GATHER the selected
+    // rows and attend over n_top_k, making decode cost independent of context.
+    //
+    // Restricted to n_batch == 1 because each token has its own top_k set, so a
+    // shared gathered K only exists in the decode case. ggml_get_rows enforces the
+    // same thing structurally (a->ne[2] == b->ne[1]).
+    // Opt-in while it is being validated: LLAMA_DSA_GATHER=1
+    static const bool dsa_gather_env = [] {
+        const char * e = getenv("LLAMA_DSA_GATHER");
+        return e != nullptr && atoi(e) != 0;
+    }();
+
+    const int64_t n_top_k_sel = top_k->ne[0];
+
+    if (dsa_gather_env && top_k->ne[1] == 1 && n_top_k_sel < k->ne[2]) {
+        // k is [n_embd_head_k, n_head_kv, n_kv, n_stream]; get_rows gathers along
+        // dim1, so swap dims 1 and 2 (n_head_kv == 1 for MLA, stride is a no-op).
+        ggml_tensor * k_rows = ggml_view_4d(ctx0, k,
+                k->ne[0], k->ne[2], k->ne[1], k->ne[3],
+                k->nb[2], k->nb[1], k->nb[3], 0);
+
+        ggml_tensor * kg = ggml_get_rows(ctx0, k_rows, top_k_3d); // [n_embd, n_top_k, 1, n_stream] f32
+
+        k = ggml_view_4d(ctx0, kg,
+                kg->ne[0], kg->ne[2], kg->ne[1], kg->ne[3],
+                kg->nb[2], kg->nb[1], kg->nb[3], 0);
+        v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+
+        // Gather the ORIGINAL mask at the same indices rather than rebuilding one,
+        // so causality and invalid/padding cells are preserved exactly.
+        ggml_tensor * mask_rows = ggml_view_4d(ctx0, kq_mask,
+                1, kq_mask->ne[0], kq_mask->ne[1], kq_mask->ne[3],
+                kq_mask->nb[0], kq_mask->nb[1], kq_mask->nb[2], 0);
+
+        ggml_tensor * mg = ggml_get_rows(ctx0, mask_rows, top_k_3d); // [1, n_top_k, n_batch, n_stream] f32
+
+        ggml_tensor * mask_g = ggml_view_4d(ctx0, mg,
+                mg->ne[1], mg->ne[2], 1, mg->ne[3],
+                mg->nb[2], mg->nb[3], mg->nb[3], 0);
+
+        if (mask_g->type != kq_mask->type) {
+            mask_g = ggml_cast(ctx0, mask_g, kq_mask->type);
+        }
+
+        kq_mask_top_k = mask_g;
+    }
+
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_top_k, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
