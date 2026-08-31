@@ -2552,6 +2552,72 @@ private:
                         break;
                     }
 
+                    // Persist the context checkpoints alongside the state file.
+                    //
+                    // llama_state_seq_save_file serialises only the sequence KV/recurrent
+                    // state. For hybrid and recurrent memory llama.cpp cannot partially
+                    // truncate KV, so reusing a restored prefix requires a checkpoint from
+                    // slot.prompt.checkpoints - which is in-RAM only, and which the restore
+                    // path below wipes via prompt.clear(). Without this sidecar an on-disk
+                    // slot cache silently degrades to a full re-prefill on every restore.
+                    //
+                    // Written to a temporary and renamed, so a crash mid-write cannot leave
+                    // a truncated sidecar next to a valid state file. The header records the
+                    // state file's size and mtime so a stale sidecar is ignored rather than
+                    // applied to state it does not belong to.
+                    {
+                        const std::string ckpt_path = filepath + ".ckpt";
+                        const std::string ckpt_tmp  = ckpt_path + ".tmp";
+
+                        std::error_code ec;
+                        const uint64_t st_size  = (uint64_t) std::filesystem::file_size(filepath, ec);
+                        const int64_t  st_mtime = ec ? 0 :
+                            (int64_t) std::filesystem::last_write_time(filepath, ec).time_since_epoch().count();
+
+                        std::ofstream fckpt(ckpt_tmp, std::ios::binary);
+                        if (fckpt) {
+                            const uint32_t magic = 0x4b435054;
+                            const uint32_t ver   = 2;
+                            const uint32_t cnt   = (uint32_t) slot->prompt.checkpoints.size();
+                            fckpt.write((const char *) &magic,    sizeof(magic));
+                            fckpt.write((const char *) &ver,      sizeof(ver));
+                            fckpt.write((const char *) &cnt,      sizeof(cnt));
+                            fckpt.write((const char *) &st_size,  sizeof(st_size));
+                            fckpt.write((const char *) &st_mtime, sizeof(st_mtime));
+                            for (const auto & c : slot->prompt.checkpoints) {
+                                const int64_t n_tok = c.n_tokens;
+                                const int32_t idt   = (int32_t) c.id_task;
+                                const int32_t pmin  = (int32_t) c.pos_min;
+                                const int32_t pmax  = (int32_t) c.pos_max;
+                                fckpt.write((const char *) &n_tok, sizeof(n_tok));
+                                fckpt.write((const char *) &idt,   sizeof(idt));
+                                fckpt.write((const char *) &pmin,  sizeof(pmin));
+                                fckpt.write((const char *) &pmax,  sizeof(pmax));
+                                const std::vector<uint8_t> * vs[3] = { &c.data_tgt, &c.data_dft, &c.data_spec };
+                                for (int vi = 0; vi < 3; ++vi) {
+                                    const uint64_t n = (uint64_t) vs[vi]->size();
+                                    fckpt.write((const char *) &n, sizeof(n));
+                                    if (n) {
+                                        fckpt.write((const char *) vs[vi]->data(), n);
+                                    }
+                                }
+                            }
+                            fckpt.close();
+                            if (fckpt) {
+                                std::filesystem::rename(ckpt_tmp, ckpt_path, ec);
+                                if (ec) {
+                                    std::filesystem::remove(ckpt_tmp, ec);
+                                    SRV_WRN("could not install checkpoint sidecar for %s\n", filename.c_str());
+                                } else {
+                                    SRV_INF("saved %u context checkpoint(s) alongside %s\n", cnt, filename.c_str());
+                                }
+                            } else {
+                                std::filesystem::remove(ckpt_tmp, ec);
+                                SRV_WRN("could not write checkpoint sidecar for %s\n", filename.c_str());
+                            }
+                        }
+                    }
+
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -2611,6 +2677,84 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+
+                        // prompt.clear() above drops the in-RAM checkpoints; reload them
+                        // from the sidecar if one is present and belongs to this state file.
+                        {
+                            const std::string ckpt_path = filepath + ".ckpt";
+                            std::error_code ec;
+                            const uint64_t ckpt_bytes = (uint64_t) std::filesystem::file_size(ckpt_path, ec);
+                            std::ifstream fckpt(ckpt_path, std::ios::binary);
+                            if (!ec && fckpt) {
+                                uint32_t magic = 0, ver = 0, cnt = 0;
+                                uint64_t st_size = 0; int64_t st_mtime = 0;
+                                fckpt.read((char *) &magic,    sizeof(magic));
+                                fckpt.read((char *) &ver,      sizeof(ver));
+                                fckpt.read((char *) &cnt,      sizeof(cnt));
+                                fckpt.read((char *) &st_size,  sizeof(st_size));
+                                fckpt.read((char *) &st_mtime, sizeof(st_mtime));
+
+                                std::error_code ec2;
+                                const uint64_t cur_size  = (uint64_t) std::filesystem::file_size(filepath, ec2);
+                                const int64_t  cur_mtime = ec2 ? 0 :
+                                    (int64_t) std::filesystem::last_write_time(filepath, ec2).time_since_epoch().count();
+
+                                if (!fckpt || magic != 0x4b435054 || ver != 2) {
+                                    SRV_WRN("ignoring unrecognised checkpoint sidecar for %s\n", filename.c_str());
+                                } else if (st_size != cur_size || st_mtime != cur_mtime) {
+                                    SRV_WRN("ignoring stale checkpoint sidecar for %s\n", filename.c_str());
+                                } else {
+                                    // Clamp to the configured budget. The trim loop lives in
+                                    // create_checkpoint, so nothing evicts these afterwards;
+                                    // with --n-ctx-checkpoints 0 an unclamped restore turns a
+                                    // disabled feature back on from disk.
+                                    const uint32_t cnt_max = params_base.n_ctx_checkpoints > 0 ?
+                                        (uint32_t) params_base.n_ctx_checkpoints : 0;
+                                    if (cnt > cnt_max) {
+                                        SRV_WRN("checkpoint sidecar holds %u; keeping %u per --n-ctx-checkpoints\n",
+                                                cnt, cnt_max);
+                                    }
+                                    for (uint32_t i = 0; i < cnt && i < cnt_max && fckpt; ++i) {
+                                        common_prompt_checkpoint c;
+                                        int64_t n_tok = 0; int32_t idt = 0, pmin = 0, pmax = 0;
+                                        fckpt.read((char *) &n_tok, sizeof(n_tok));
+                                        fckpt.read((char *) &idt,   sizeof(idt));
+                                        fckpt.read((char *) &pmin,  sizeof(pmin));
+                                        fckpt.read((char *) &pmax,  sizeof(pmax));
+                                        c.n_tokens = n_tok;
+                                        // NOT idt: id_task is a process-local counter, so a
+                                        // restored id aliases a fresh task's id and defeats
+                                        // create_checkpoint's min-step eviction guard, which
+                                        // compares it against the current task. -1 matches no
+                                        // live task.
+                                        (void) idt;
+                                        c.id_task  = -1;
+                                        c.pos_min  = pmin;
+                                        c.pos_max  = pmax;
+                                        std::vector<uint8_t> * vs[3] = { &c.data_tgt, &c.data_dft, &c.data_spec };
+                                        bool ok = true;
+                                        for (int vi = 0; vi < 3; ++vi) {
+                                            uint64_t n = 0;
+                                            fckpt.read((char *) &n, sizeof(n));
+                                            // bound the allocation by what the sidecar can actually hold
+                                            if (!fckpt || n > ckpt_bytes) { ok = false; break; }
+                                            vs[vi]->resize((size_t) n);
+                                            if (n) {
+                                                fckpt.read((char *) vs[vi]->data(), n);
+                                            }
+                                        }
+                                        if (!ok || !fckpt) {
+                                            SRV_WRN("checkpoint sidecar for %s is truncated; keeping %zu of %u\n",
+                                                    filename.c_str(), slot->prompt.checkpoints.size(), cnt);
+                                            break;
+                                        }
+                                        slot->prompt.checkpoints.emplace_back(std::move(c));
+                                    }
+                                    SRV_INF("restored %zu context checkpoint(s) from sidecar\n",
+                                            slot->prompt.checkpoints.size());
+                                }
+                            }
+                        }
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
