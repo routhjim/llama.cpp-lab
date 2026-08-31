@@ -2704,7 +2704,17 @@ private:
                                 } else if (st_size != cur_size || st_mtime != cur_mtime) {
                                     SRV_WRN("ignoring stale checkpoint sidecar for %s\n", filename.c_str());
                                 } else {
-                                    for (uint32_t i = 0; i < cnt && fckpt; ++i) {
+                                    // Clamp to the configured budget. The trim loop lives in
+                                    // create_checkpoint, so nothing evicts these afterwards;
+                                    // with --n-ctx-checkpoints 0 an unclamped restore turns a
+                                    // disabled feature back on from disk.
+                                    const uint32_t cnt_max = params_base.n_ctx_checkpoints > 0 ?
+                                        (uint32_t) params_base.n_ctx_checkpoints : 0;
+                                    if (cnt > cnt_max) {
+                                        SRV_WRN("checkpoint sidecar holds %u; keeping %u per --n-ctx-checkpoints\n",
+                                                cnt, cnt_max);
+                                    }
+                                    for (uint32_t i = 0; i < cnt && i < cnt_max && fckpt; ++i) {
                                         common_prompt_checkpoint c;
                                         int64_t n_tok = 0; int32_t idt = 0, pmin = 0, pmax = 0;
                                         fckpt.read((char *) &n_tok, sizeof(n_tok));
@@ -2712,7 +2722,13 @@ private:
                                         fckpt.read((char *) &pmin,  sizeof(pmin));
                                         fckpt.read((char *) &pmax,  sizeof(pmax));
                                         c.n_tokens = n_tok;
-                                        c.id_task  = idt;
+                                        // NOT idt: id_task is a process-local counter, so a
+                                        // restored id aliases a fresh task's id and defeats
+                                        // create_checkpoint's min-step eviction guard, which
+                                        // compares it against the current task. -1 matches no
+                                        // live task.
+                                        (void) idt;
+                                        c.id_task  = -1;
                                         c.pos_min  = pmin;
                                         c.pos_max  = pmax;
                                         std::vector<uint8_t> * vs[3] = { &c.data_tgt, &c.data_dft, &c.data_spec };
