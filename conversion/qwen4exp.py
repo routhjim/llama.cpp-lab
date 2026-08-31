@@ -114,10 +114,32 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     @classmethod
     def filter_tensors(cls, item):
         name = item[0]
-        # The MTP block brings its own hyper-connection mixer. In an MTP-only file it takes the
-        # model-level slot, so rename it before _QwenMtpMixin drops it as a non-MTP tensor.
+        # Accept both spellings. _QwenMtpMixin.filter_tensors normalises model.mtp.* -> mtp.*,
+        # but this hook runs BEFORE super(), so a model.mtp.* checkpoint would fall through
+        # matching neither branch and abort with "Can not map tensor".
+        if name.startswith("model.mtp."):
+            name = name.replace("model.", "", 1)
+            item = (name, item[1])
+
+        # The MTP block brings its own hyper-connection mixer. Only an MTP-ONLY file has a
+        # free model-level slot for it.
+        #
+        # In a COMBINED file the trunk already owns model.hyper_connection_mixer.* (mapped to
+        # HC_HEAD_* and loaded as required), and ModelBase.index_tensors stores by name, so
+        # whichever shard is indexed last silently wins and the other is lost -- yielding a
+        # target GGUF whose output-norm mixer holds the draft head's weights, with no warning
+        # and no tensor-count mismatch to catch it. The combined layout cannot represent both:
+        # the arch has no per-layer NEXTN_SHARED_HEAD_NORM slot.
         if name.startswith("mtp.hyper_connection_mixer."):
-            return None if cls.no_mtp else (name.replace("mtp.", "model.", 1), item[1])
+            if cls.mtp_only:
+                return (name.replace("mtp.", "model.", 1), item[1])
+            if not cls.no_mtp:
+                raise ValueError(
+                    "qwen4exp: the MTP block's hyper_connection_mixer has no slot in a "
+                    "combined GGUF and would overwrite the trunk's. Convert the draft "
+                    "separately as an MTP-only file and pass it with -md."
+                )
+            return None
         return super().filter_tensors(item)
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:

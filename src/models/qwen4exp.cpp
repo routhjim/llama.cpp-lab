@@ -10,6 +10,14 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     // absent in a normal file, 1 in an MTP draft file: n_layer() and the per-layer arrays are
     // sized by n_layer_all, so this has to be read before anything below uses either
     ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS,              hparams.n_layer_nextn, false);
+    // n_layer() is n_layer_all - n_layer_nextn in unsigned arithmetic: a GGUF declaring
+    // predict_layers >= block_count underflows to ~4e9, narrows to a negative int n_layer,
+    // skips the trunk loop, and then indexes layers[il] negatively during load.
+    if (hparams.n_layer_nextn >= hparams.n_layer_all) {
+        throw std::runtime_error(format(
+            "%s: nextn.predict_layers (%u) must be < block_count (%u)",
+            __func__, hparams.n_layer_nextn, hparams.n_layer_all));
+    }
 
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
@@ -1368,13 +1376,17 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, hc*n_embd, n_tokens);
 
-    // chained heads read the streams back, as the trunk hands them over
-    res->t_h_nextn = flat;
-
     if (inp_out_ids) {
         flat = ggml_get_rows(ctx0, flat, inp_out_ids);
         inpL = ggml_reshape_3d(ctx0, flat, n_embd, hc, n_outputs);
     }
+
+    // chained heads read the streams back, as the trunk hands them over. Assign AFTER the
+    // crop: llama_context::decode indexes t_h_nextn by OUTPUT row, so an uncropped tensor
+    // returns the first N rows of the batch instead of the flagged ones for any draft
+    // ubatch that does not flag every token. Latent while n_layer_nextn == 1 forces
+    // chain_heads = false; deepseek4 and qwen3next both crop first.
+    res->t_h_nextn = flat;
 
     cur = build_hc_mix(inpL, model.hc_head_norm, model.hc_head_down, model.hc_head_up, nullptr, nullptr, -1);
     cb(cur, "result_norm", -1);
