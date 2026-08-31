@@ -386,7 +386,28 @@ class vk_perf_logger;
 static void ggml_vk_destroy_buffer(vk_buffer& buf);
 static void ggml_vk_synchronize(ggml_backend_vk_context * ctx);
 
-static constexpr uint32_t mul_mat_vec_max_cols = 8;
+// Raised 8 -> 16 (local experiment, Strix Halo / RADV).
+//
+// This bounds the DENSE mul_mat_vec path: above it, ggml_vk_mul_mat falls through to the
+// general matmul (see the dst->ne[1] <= mul_mat_vec_max_cols test). Together with the
+// MUL_MAT_ID threshold it forms a two-part cliff at batch 8 -- measured decode step cost
+// on unsplit Q4_K_XL Flash-Next jumped 130.8 ms (batch 7) -> 297.3 ms (batch 9).
+// Raising only the _id threshold recovered a constant ~42 ms/step (297.3 -> 256.7);
+// this is the other component.
+//
+// COST: NUM_COLS is a specialization constant, so no shader regeneration is needed -- but
+// this loop creates one pipeline per column count per type per wg size, so doubling it
+// doubles that pipeline count (slower startup). Register pressure also scales, since the
+// shaders hold temp[NUM_COLS][NUM_ROWS] in registers; 32 risks VGPR spilling on RDNA,
+// which is why this stops at 16. Existing column counts are specialized separately and
+// are bit-identical to before.
+//
+// NOT a general win: the cliff hurts here because a 256 GB/s iGPU pays full price for the
+// GEMM path's padding, and this model is extremely sparse (512 experts, 10 active ->
+// ~0.18 rows/expert at batch 9, so its tiles are nearly all padding). A dGPU with ~800+
+// GB/s and 2-3x the CUs would see a much smaller penalty and a lower crossover, so 8 may
+// well be correct there. Device-tuned, not universal.
+static constexpr uint32_t mul_mat_vec_max_cols = 16;
 static constexpr uint32_t p021_max_gqa_ratio = 8;
 
 enum vk_device_architecture {
@@ -10713,11 +10734,40 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     }
 }
 
+// Token-count threshold for choosing the per-token GEMV path over the general matmul for
+// MUL_MAT_ID. The stock value is 8, mirroring mul_mat_vec_max_cols -- but that constant
+// is the DENSE path's column-batching limit, and the _id pipelines have no column
+// variants at all (pipeline_dequant_mul_mat_vec_id_f32[wg][type], no [cols] dimension).
+// So this path issues ONE DISPATCH PER TOKEN and its cost is exactly linear.
+//
+// Measured on Strix Halo / RADV, unsplit Q4_K_XL Flash-Next (512 experts, 10 active),
+// decode step cost vs verify-batch size:
+//     GEMV path (batch 2..7):  32.1 + 14.1*b ms   -- linear, residuals ~0
+//     GEMM path (batch 9..17): 150.5 + 16.31*b ms -- a ~140 ms STEP up at the boundary
+// i.e. crossing 8 doubles step cost (130.8 ms at batch 7 -> 297.3 at batch 9) and decode
+// collapses 26.5 -> 11.9 t/s. The GEMM path is padding-dominated here: at batch 9 each
+// expert receives ~9*10/512 = 0.18 rows, so its tiles are almost entirely padding.
+//
+// GEMM's marginal cost does decay as tiles fill (16.5 ms/tok at batch 9-13, ~6.8 by
+// batch 2048 inferred from prefill), so the paths do cross -- estimated near batch 38.
+// Raising this to ~16-32 should recover the window. Above the crossover it will hurt.
+//
+// NOTE: raising it exercises the GEMV path at token counts the stock build never
+// dispatches. Verify numerically (perplexity), not just by throughput.
+static uint32_t ggml_vk_mmvid_max() {
+    static uint32_t v = 0;
+    if (v == 0) {
+        const char * e = getenv("GGML_VK_MMVID_MAX");
+        v = e ? (uint32_t) std::max(1, atoi(e)) : 8;
+    }
+    return v;
+}
+
 static bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
     ggml_tensor * src2 = dst->src[2];
-    return (src2->ne[1] <= 8) && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type));
+    return (src2->ne[1] <= ggml_vk_mmvid_max()) && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type));
 }
 
 static void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
