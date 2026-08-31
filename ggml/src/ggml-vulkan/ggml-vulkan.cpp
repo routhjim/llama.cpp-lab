@@ -386,7 +386,30 @@ class vk_perf_logger;
 static void ggml_vk_destroy_buffer(vk_buffer& buf);
 static void ggml_vk_synchronize(ggml_backend_vk_context * ctx);
 
-static constexpr uint32_t mul_mat_vec_max_cols = 8;
+// Column-batching limit for the DENSE mul_mat_vec path: above this many columns,
+// ggml_vk_mul_mat falls through to the general matmul. It is a real constraint, not a
+// heuristic - one pipeline is compiled per column count (see the loop in
+// ggml_vk_load_shaders), it bounds the pipeline arrays, and it is asserted against in
+// ggml_vk_get_dequantize_mul_mat_vec (which ggml_vk_mul_mat_vec_q_f16 calls).
+//
+// Raising it costs pipeline objects at startup (one more set per column count per type per
+// workgroup size). The binding limit, though, is SHARED MEMORY, not registers:
+// mul_mat_vec_base.glsl declares `shared FLOAT_TYPE tmpsh[NUM_COLS][NUM_ROWS][BLOCK_SIZE]`
+// for every DMMV_WG_SIZE_LARGE pipeline, sized at pipeline-creation time. Worked example on
+// an AMD GCN-class device: rm_iq = 8, BLOCK_SIZE = subgroup_size*4 = 256, FLOAT_TYPE =
+// float16_t, so the current limit of 8 needs 8*8*256*2 = 32768 bytes -- exactly the 32 KiB
+// maxComputeSharedMemorySize RADV reports, i.e. ZERO headroom. Doubling it there makes
+// createComputePipeline fail, and ggml_vk_create_pipeline_func logs and RETHROWS: a hard
+// failure at device init, not a fallback to a smaller pipeline. Check the device's
+// maxComputeSharedMemorySize before raising this. Existing column counts are specialised
+// separately and are unaffected.
+//
+// Whether raising it pays is device-dependent, so it is a build option rather than a new
+// default. See GGML_VULKAN_MMV_MAX_COLS in ggml/CMakeLists.txt.
+#ifndef GGML_VULKAN_MMV_MAX_COLS
+#define GGML_VULKAN_MMV_MAX_COLS 8
+#endif
+static constexpr uint32_t mul_mat_vec_max_cols = GGML_VULKAN_MMV_MAX_COLS;
 static constexpr uint32_t p021_max_gqa_ratio = 8;
 
 enum vk_device_architecture {
