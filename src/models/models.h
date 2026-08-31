@@ -1202,6 +1202,14 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * hc_scale,
                 ggml_tensor * hc_base) const;
 
+        // Tiered expert packs: one routing pass, one build_moe_ffn per tier.
+        ggml_tensor * build_moe_ffn_tiered(
+                const llama_model & model,
+                ggml_tensor * cur,
+                ggml_tensor * exp_probs_b,
+                ggml_tensor * selected_experts,
+                int il) const;
+
         ggml_tensor * build_attention(
                 const llama_model & model,
                 llm_graph_input_dsv4 * inp_dsv4,
