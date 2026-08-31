@@ -1448,6 +1448,21 @@ extern "C" {
             struct ggml_tensor * a,
             enum ggml_op_hint    hint);
 
+    // Reserved expert id for ggml_mul_mat_id: selects no expert.
+    //
+    // A model whose experts are split across several weight tensors ("packs") dispatches
+    // MUL_MAT_ID once per pack with the same id vector, marking ids owned by another pack
+    // with this value. Code that MULTIPLIES with ids leaves those rows out of the product
+    // and writes exact zeros; code that merely INSPECTS ids -- the scheduler deciding which
+    // expert slabs to copy, for instance -- must not count them as used.
+    //
+    // Zeroing rather than skipping is required: an unwritten row holds whatever was in the
+    // buffer, and masking its weight to zero downstream does not remove a NaN (0*NaN = NaN).
+    //
+    // Only this exact value is reserved. Every other out-of-range id remains a programming
+    // error and keeps whatever diagnostic it has today.
+    #define GGML_MMID_SENTINEL (-1)
+
     // indirect matrix multiplication
     GGML_API struct ggml_tensor * ggml_mul_mat_id(
             struct ggml_context * ctx,

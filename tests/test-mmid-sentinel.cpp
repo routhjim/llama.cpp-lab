@@ -1,4 +1,4 @@
-// test-mmid-sentinel.cpp: GGML_CPU_MMID_SENTINEL in GGML_OP_MUL_MAT_ID.
+// test-mmid-sentinel.cpp: GGML_MMID_SENTINEL in GGML_OP_MUL_MAT_ID.
 //
 // A model whose experts are split across several weight tensors dispatches MUL_MAT_ID once
 // per pack with the same id vector, marking ids owned by another pack with the sentinel.
@@ -47,7 +47,7 @@ int main(void) {
     for (int64_t t = 0; t < N_TOK; t++) {
         for (int64_t u = 0; u < N_USED; u++) {
             const bool sentinel = (t == 0 && u == 0) || (t == 3) || (t == 5 && u == N_USED - 1);
-            ids[u + t*N_USED] = sentinel ? GGML_CPU_MMID_SENTINEL
+            ids[u + t*N_USED] = sentinel ? GGML_MMID_SENTINEL
                                          : (int32_t) ((t*N_USED + u) % N_MATS);
         }
     }
@@ -88,7 +88,7 @@ int main(void) {
             const int32_t id = ids[u + t*N_USED];
             for (int64_t j = 0; j < M; j++) {
                 const float got = out_d[j + u*M + t*M*N_USED];
-                if (id == GGML_CPU_MMID_SENTINEL) {
+                if (id == GGML_MMID_SENTINEL) {
                     n_sent++;
                     // exact zero, not "small" and not NaN
                     if (!(got == 0.0f)) {

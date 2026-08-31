@@ -7,25 +7,6 @@
 extern "C" {
 #endif
 
-    // Reserved expert id for GGML_OP_MUL_MAT_ID, honoured by the CPU backend only.
-    //
-    // A model whose experts are split across several weight tensors ("packs") dispatches
-    // MUL_MAT_ID once per pack, passing the same id vector each time. Ids belonging to a
-    // different pack are marked with this value; the CPU backend leaves those rows out of
-    // the multiply and writes exact zeros, so a caller that masks the corresponding
-    // weights to zero sums the packs correctly.
-    //
-    // Zeroing is what makes this safe rather than merely convenient: an unwritten dst row
-    // holds whatever was in the buffer, and if that is NaN or Inf then masking the weight
-    // to zero does NOT remove it (0 * NaN = NaN).
-    //
-    // Every OTHER out-of-range id remains a programming error and still asserts.
-    //
-    // NOT part of the cross-backend MUL_MAT_ID contract. Other backends assert or index
-    // out of bounds on this value, so a graph using it must place the op on the CPU
-    // backend (e.g. llama.cpp's -ot).
-    #define GGML_CPU_MMID_SENTINEL (-1)
-
     // the compute plan that needs to be prepared for ggml_graph_compute()
     // since https://github.com/ggml-org/ggml/issues/287
     struct ggml_cplan {
