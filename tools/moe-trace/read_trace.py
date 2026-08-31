@@ -92,10 +92,16 @@ def main():
         n_tok += len(tokens)
         for il in range(tr.n_layer):
             ids = topk[il].ravel()
-            ids = ids[ids != 0xFFFF]   # 0xFFFF = no valid expert id (dense layer, or an
-                                   # id outside the uint16 encoding); not a real expert
-        np.add.at(counts[il], ids, 1.0)
-            np.add.at(mass[il], ids, wnorm[il].ravel().astype(np.float64))
+            w   = wnorm[il].ravel().astype(np.float64)
+            # 0xFFFF = no valid expert id: a dense layer that emitted no routing, or an
+            # id outside the uint16 encoding. Mask ids and weights together so the two
+            # stay aligned -- filtering only ids would shift every weight after the first
+            # gap onto the wrong expert.
+            keep = ids != 0xFFFF
+            ids  = ids[keep]
+            w    = w[keep]
+            np.add.at(counts[il], ids, 1.0)
+            np.add.at(mass[il], ids, w)
 
     print(f"traced {n_tok} tokens", file=sys.stderr)
 
