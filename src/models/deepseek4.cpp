@@ -160,15 +160,15 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
         }
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, flags);
 
-        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff_exp, n_expert}, flags);
-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd,   n_expert}, flags);
-        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff_exp, n_expert}, flags);
-
         // Tiered expert packs: the same experts split across three tensors by activation
         // frequency, so each tier can carry a different quantisation. Optional -- a model
         // without the hot pack takes the single-tensor path above, unchanged.
-        ggml_tensor * tier_hot_meta =
-            ml.get_tensor_meta(tn(LLM_TENSOR_FFN_GATE_EXPS_HOT, "weight", i).str().c_str());
+        // Trunk blocks only. The nextn/MTP block reads the single-tensor expert weights,
+        // so tiering it would load cleanly and then abort the moment speculative decoding
+        // is enabled.
+        ggml_tensor * tier_hot_meta = i < (int) n_layer
+            ? ml.get_tensor_meta(tn(LLM_TENSOR_FFN_GATE_EXPS_HOT, "weight", i).str().c_str())
+            : nullptr;
         if (tier_hot_meta != nullptr) {
             ggml_tensor * tier_mid_meta =
                 ml.get_tensor_meta(tn(LLM_TENSOR_FFN_GATE_EXPS_MID, "weight", i).str().c_str());
@@ -196,6 +196,13 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
             layer.ffn_exp_tier_mask_mid  = create_tensor(tn(LLM_TENSOR_FFN_EXP_TIER_MASK_MID,  i), {n_expert}, flags);
             layer.ffn_exp_tier_ids_cold  = create_tensor(tn(LLM_TENSOR_FFN_EXP_TIER_IDS_COLD,  i), {n_expert}, flags);
             layer.ffn_exp_tier_mask_cold = create_tensor(tn(LLM_TENSOR_FFN_EXP_TIER_MASK_COLD, i), {n_expert}, flags);
+        } else {
+            // Exclusive with the tiers above, not additive: creating these as required
+            // alongside a tiered pack makes a pure tiered GGUF fail to load, and a
+            // dual-copy pack cost twice the expert bytes -- the opposite of the point.
+            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff_exp, n_expert}, flags);
+            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd,   n_expert}, flags);
+            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff_exp, n_expert}, flags);
         }
 
         layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd,                     n_ff_exp * n_expert_shared}, flags);
@@ -488,8 +495,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_post(
 // sum to the result the full expert set would have produced. That is what the weights_in
 // parameter of build_moe_ffn is for.
 //
-// Experts outside a tier are marked with GGML_CPU_MMID_SENTINEL in that tier's id table and
-// masked to zero weight, so each tier contributes only its own rows.
+// Experts outside a tier are masked to zero weight, so each tier contributes only its own
+// rows. Their id entries are whatever the pack builder wrote -- tier_split.py uses id 0,
+// a valid id, so this path needs no reserved-sentinel support on any backend.
 ggml_tensor * llama_model_deepseek4::graph::build_moe_ffn_tiered(
         const llama_model & model,
         ggml_tensor * cur,
@@ -500,6 +508,13 @@ ggml_tensor * llama_model_deepseek4::graph::build_moe_ffn_tiered(
     const int64_t n_tokens = cur->ne[1];
     const int64_t n_used   = hparams.n_expert_used;
     const int64_t n_expert = hparams.n_expert;
+
+    // build_moe_ffn additionally does DeepSeek-V3 group-limited top-k when
+    // n_expert_groups > 1; this path does not. LLM_KV_EXPERT_GROUP_COUNT is read
+    // generically for every arch, so a GGUF carrying it would select a different
+    // coalition here than on the non-tiered path, with no other signal.
+    GGML_ASSERT(hparams.n_expert_groups <= 1 &&
+                "tiered MoE does not implement group-limited expert selection");
 
     ggml_tensor * logits = build_lora_mm(layer.ffn_gate_inp, cur);
     cb(logits, "ffn_moe_logits", il);
@@ -555,15 +570,21 @@ ggml_tensor * llama_model_deepseek4::graph::build_moe_ffn_tiered(
 
     ggml_tensor * moe_out = nullptr;
     for (int t = 0; t < 3; t++) {
-        // global expert id -> this tier's local id (sentinel for non-members)
+        // global expert id -> this tier's local id. Non-members carry whatever the pack
+        // builder put there; tier_split.py zero-initialises, so they get id 0 with mask 0 --
+        // a valid id, NOT GGML_MMID_SENTINEL. That is what makes this path Vulkan-safe and
+        // independent of the reserved-sentinel change.
         ggml_tensor * ids_f = ggml_cast(ctx0,
             ggml_reshape_2d(ctx0, tiers[t].ids, 1, n_expert), GGML_TYPE_F32);
         ggml_tensor * sel_f = ggml_get_rows(ctx0, ids_f, selected_flat);
         ggml_tensor * sel_t = ggml_cast(ctx0,
             ggml_reshape_2d(ctx0, sel_f, n_used, n_tokens), GGML_TYPE_I32);
 
+        // cast before the gather: ggml_get_rows returns the source type, and
+        // ggml_mul(f32, i32) has no implementation on any backend.
         ggml_tensor * msk = ggml_get_rows(ctx0,
-            ggml_reshape_2d(ctx0, tiers[t].mask, 1, n_expert), selected_flat);
+            ggml_cast(ctx0, ggml_reshape_2d(ctx0, tiers[t].mask, 1, n_expert), GGML_TYPE_F32),
+            selected_flat);
         ggml_tensor * w_t = ggml_mul(ctx0, w,
             ggml_reshape_3d(ctx0, msk, 1, n_used, n_tokens));
 
