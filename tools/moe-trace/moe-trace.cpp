@@ -203,15 +203,25 @@ static void flush_chunk(trace_ctx & tc) {
     tc.tok_offset += n_tokens;
     fwrite(toks.data(), sizeof(int32_t), n_tokens, tc.fout);
 
+    // 0xFFFF: no valid expert id. n_expert is bounded below this by the check at load.
+    static const uint16_t MOE_TRACE_ID_NONE = 0xFFFF;
+
     std::vector<uint16_t> ids;
     for (int il = 0; il < tc.n_layer; ++il) {
         const auto & s = tc.stage[il];
         const size_t n_sel = (size_t) tc.n_used * n_tokens;
 
         // expert ids as uint16 (v2) — 512-expert models exceed the old uint8 encoding
-        ids.assign(n_sel, 0);
+        // MOE_TRACE_ID_NONE marks both "this layer recorded no routing" and any id that
+        // does not fit the uint16 encoding -- a reserved negative id (see GGML_MMID_SENTINEL)
+        // or a hash-routed id straight from model data. Without this a -1 became 65535 and
+        // read_trace.py indexed out of bounds; a dense leading layer was written as
+        // "expert 0, every token" and summarised as a maximally skewed learned layer,
+        // which is exactly the signature that says "prune the cold tail here".
+        ids.assign(n_sel, MOE_TRACE_ID_NONE);
         for (size_t i = 0; i < n_sel && i < s.topk.size(); ++i) {
-            ids[i] = (uint16_t) s.topk[i];
+            const int32_t e = s.topk[i];
+            ids[i] = (e >= 0 && e < MOE_TRACE_ID_NONE) ? (uint16_t) e : MOE_TRACE_ID_NONE;
         }
         fwrite(ids.data(), sizeof(uint16_t), n_sel, tc.fout);
 
@@ -230,6 +240,13 @@ static void flush_chunk(trace_ctx & tc) {
 
 int main(int argc, char ** argv) {
     common_params params;
+
+    // common_params::n_ctx defaults to 0, meaning "the context the model was trained
+    // with". Left at 0 the n_batch bump below is a no-op, llama_n_ctx() then returns
+    // n_ctx_train (163840 for some MoE models), and llama_decode aborts on
+    // n_tokens_all <= cparams.n_batch. Set a workable default BEFORE parsing so an
+    // explicit -c still wins. tools/imatrix does the same, for the same reason.
+    params.n_ctx = 512;
 
     // IMATRIX scope: same shape of tool (corpus in via -f, artifact out via -o).
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_IMATRIX)) {
@@ -294,7 +311,7 @@ int main(int argc, char ** argv) {
         LOG_ERR("%s: not an MoE model (n_expert=%d)\n", __func__, n_expert);
         return 1;
     }
-    if (n_expert > 65536) {
+    if (n_expert >= 65535) {   // 0xFFFF is reserved as "no id" in the trace encoding
         LOG_ERR("%s: n_expert=%d exceeds the uint16 id encoding in this format\n", __func__, n_expert);
         return 1;
     }
