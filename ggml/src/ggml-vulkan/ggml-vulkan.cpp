@@ -18129,7 +18129,22 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
         static int NUM_TO_CHECK = -1;
         if (NUM_TO_CHECK < 0) {
             const char * e = getenv("GGML_VK_OPT_LOOKAHEAD");
-            NUM_TO_CHECK = e ? atoi(e) : 20;
+            NUM_TO_CHECK = 20;
+            if (e != nullptr) {
+                // Clamped and validated. Unvalidated atoi made three inputs silently mean
+                // "reordering off": a large value overflowed first_unused + NUM_TO_CHECK,
+                // whose negative std::min bound empties the window; non-numeric input became
+                // 0, likewise empty; and a negative value additionally defeated the < 0
+                // caching sentinel, so getenv/atoi re-ran on every optimize call.
+                char * end = nullptr;
+                const long v = strtol(e, &end, 10);
+                if (end != e && *end == '\0' && v >= 1 && v <= 4096) {
+                    NUM_TO_CHECK = (int) v;
+                } else {
+                    GGML_LOG_WARN("%s: ignoring GGML_VK_OPT_LOOKAHEAD=\"%s\" (want 1..4096)\n",
+                                  __func__, e);
+                }
+            }
         }
         for (int j = first_unused+1; j < std::min(first_unused + NUM_TO_CHECK, graph->n_nodes); ++j) {
             if (used[j]) {
