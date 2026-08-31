@@ -10789,11 +10789,46 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     }
 }
 
+// Token-count threshold for choosing the per-token GEMV path over the general matmul for
+// MUL_MAT_ID. Overridable with GGML_VK_MMVID_MAX; default 8, i.e. unchanged behaviour.
+//
+// The stock 8 mirrors mul_mat_vec_max_cols, but that constant is the DENSE path's
+// column-batching limit and does not apply here: the _id pipelines have no column
+// variants (pipeline_dequant_mul_mat_vec_id_f32[wg][type] has no [cols] dimension), so
+// this path issues one dispatch per token and its cost is linear in the token count.
+//
+// Whether 8 is the right crossover is device- and model-dependent. The general matmul
+// tiles over experts, so with n_expert_used << n_expert each tile is mostly padding at
+// small token counts, and the more bandwidth-starved the device the more that padding
+// costs. On an integrated GPU with a very sparse MoE the GEMV path stays ahead well past
+// 8; on a discrete GPU with several times the bandwidth the crossover is lower and 8 may
+// be correct. Hence a knob rather than a new constant.
+static uint32_t ggml_vk_mmvid_max() {
+    static uint32_t v = 0;
+    if (v == 0) {
+        const char * e = getenv("GGML_VK_MMVID_MAX");
+        // std::stoul, not atoi: atoi maps empty or non-numeric input to 0, which
+        // std::max(1, ...) turns into a threshold of 1 -- silently disabling the
+        // mat-vec-id path for every multi-token batch. Matches the idiom used by
+        // GGML_VK_MAX_NODES_PER_SUBMIT elsewhere in this file.
+        v = 8;
+        if (e != nullptr) {
+            try {
+                v = std::max((uint32_t) std::stoul(e), 1u);
+            } catch (const std::exception &) {
+                GGML_LOG_WARN("%s: ignoring malformed GGML_VK_MMVID_MAX=\"%s\"\n", __func__, e);
+            }
+            GGML_LOG_INFO("%s: GGML_VK_MMVID_MAX = %u\n", __func__, v);
+        }
+    }
+    return v;
+}
+
 static bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
     ggml_tensor * src2 = dst->src[2];
-    return (src2->ne[1] <= 8) && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type));
+    return (src2->ne[1] <= ggml_vk_mmvid_max()) && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type));
 }
 
 static void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
