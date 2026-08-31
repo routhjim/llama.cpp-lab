@@ -18124,7 +18124,13 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
         // that we support (e.g. RMS_NORM + MUL).
         // This first pass only grabs "real" (non-view nodes). Second pass grabs view nodes.
         // The goal is to not interleave real and view nodes in a way that breaks fusion.
-        const int NUM_TO_CHECK = 20;
+        // GGML_VK_OPT_LOOKAHEAD overrides the reorder window. Declared here so both
+        // passes below (real nodes, then view nodes) share one value.
+        static int NUM_TO_CHECK = -1;
+        if (NUM_TO_CHECK < 0) {
+            const char * e = getenv("GGML_VK_OPT_LOOKAHEAD");
+            NUM_TO_CHECK = e ? atoi(e) : 20;
+        }
         for (int j = first_unused+1; j < std::min(first_unused + NUM_TO_CHECK, graph->n_nodes); ++j) {
             if (used[j]) {
                 continue;
@@ -18167,6 +18173,17 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                 }
             }
             if (ok) {
+                static int opt_log = -1;
+                if (opt_log < 0) { const char * e = getenv("GGML_VK_OPT_LOG"); opt_log = e ? atoi(e) : 0; }
+                if (opt_log) {
+                    for (int c = first_unused; c < j; ++c) {
+                        if (!used[c]) {
+                            fprintf(stderr, "VKOPT pull %s(%s) over %s(%s)\n",
+                                graph->nodes[j]->name, ggml_op_name(graph->nodes[j]->op),
+                                graph->nodes[c]->name, ggml_op_name(graph->nodes[c]->op));
+                        }
+                    }
+                }
                 current_set.push_back(j);
 
                 int rope_idx = j;
@@ -18296,6 +18313,39 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
             first_unused++;
         }
     }
+    // GGML_VK_OPT_CHECK validates the reordered graph: every node's sources, and the
+    // base tensor of any view among them, must be produced earlier in new_order or
+    // be a graph leaf. Catches read-after-write introduced by the reorder.
+    // Limitation: only sees producers that appear as nodes in new_order, so a view
+    // whose base is produced outside this graph is invisible to it.
+    {
+        static int opt_check = -1;
+        if (opt_check < 0) { const char * e = getenv("GGML_VK_OPT_CHECK"); opt_check = e ? atoi(e) : 0; }
+        if (opt_check) {
+            std::unordered_map<const ggml_tensor *, int> pos;
+            for (size_t i = 0; i < new_order.size(); ++i) {
+                pos[new_order[i]] = (int) i;
+            }
+            for (size_t i = 0; i < new_order.size(); ++i) {
+                const ggml_tensor * n = new_order[i];
+                for (uint32_t si = 0; si < GGML_MAX_SRC; ++si) {
+                    const ggml_tensor * src = n->src[si];
+                    if (!src) continue;
+                    const ggml_tensor * chk[2] = { src, src->view_src ? src->view_src : nullptr };
+                    for (int c = 0; c < 2; ++c) {
+                        if (!chk[c]) continue;
+                        auto it = pos.find(chk[c]);
+                        if (it != pos.end() && it->second > (int) i) {
+                            fprintf(stderr, "VKCHK VIOLATION: node[%zu] %s(%s) reads %s(%s) produced at [%d]\n",
+                                i, n->name, ggml_op_name(n->op),
+                                chk[c]->name, ggml_op_name(chk[c]->op), it->second);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Replace the graph with the new order.
     for (int i = 0; i < graph->n_nodes; ++i) {
         graph->nodes[i] = new_order[i];
