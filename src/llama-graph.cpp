@@ -1967,9 +1967,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
 
+    // A caller that supplies BOTH selected_experts_in and weights_in has already done the
+    // routing itself and reads neither logits nor probs below. gate_inp is legitimately null
+    // in that case -- a tiered/split MoE routes once over the full expert set and then calls
+    // this function per pack -- so the routing matmul must not run at all. Guarding only the
+    // weight derivation is not enough: build_lora_mm would dereference the null gate_inp.
+    const bool routed_by_caller = (weights_in != nullptr && selected_experts_in != nullptr);
+    GGML_ASSERT((weights_in == nullptr || selected_experts_in != nullptr) &&
+                "weights_in requires selected_experts_in");
+
     ggml_tensor * logits = nullptr;
 
-    if (probs_in == nullptr) {
+    if (routed_by_caller) {
+        // no routing to do; logits/probs stay null and are never read
+    } else if (probs_in == nullptr) {
         logits = build_lora_mm(gate_inp, cur); // [n_expert, n_tokens]
         if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
             ggml_mul_mat_set_prec(logits, GGML_PREC_F32);
@@ -1985,6 +1996,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     ggml_tensor * probs = nullptr;
+    if (!routed_by_caller)
     switch (gating_op) {
         case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:
             {
