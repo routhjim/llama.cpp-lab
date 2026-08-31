@@ -10789,11 +10789,34 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     }
 }
 
+// Token-count threshold for choosing the per-token GEMV path over the general matmul for
+// MUL_MAT_ID. Overridable with GGML_VK_MMVID_MAX; default 8, i.e. unchanged behaviour.
+//
+// The stock 8 mirrors mul_mat_vec_max_cols, but that constant is the DENSE path's
+// column-batching limit and does not apply here: the _id pipelines have no column
+// variants (pipeline_dequant_mul_mat_vec_id_f32[wg][type] has no [cols] dimension), so
+// this path issues one dispatch per token and its cost is linear in the token count.
+//
+// Whether 8 is the right crossover is device- and model-dependent. The general matmul
+// tiles over experts, so with n_expert_used << n_expert each tile is mostly padding at
+// small token counts, and the more bandwidth-starved the device the more that padding
+// costs. On an integrated GPU with a very sparse MoE the GEMV path stays ahead well past
+// 8; on a discrete GPU with several times the bandwidth the crossover is lower and 8 may
+// be correct. Hence a knob rather than a new constant.
+static uint32_t ggml_vk_mmvid_max() {
+    static uint32_t v = 0;
+    if (v == 0) {
+        const char * e = getenv("GGML_VK_MMVID_MAX");
+        v = e ? (uint32_t) std::max(1, atoi(e)) : 8;
+    }
+    return v;
+}
+
 static bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
     ggml_tensor * src2 = dst->src[2];
-    return (src2->ne[1] <= 8) && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type));
+    return (src2->ne[1] <= ggml_vk_mmvid_max()) && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type));
 }
 
 static void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
