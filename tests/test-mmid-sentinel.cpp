@@ -34,7 +34,9 @@ static const int64_t N_TOK   = 6;
 static uint64_t g_rng = 0x9e3779b97f4a7c15ULL;
 static float frand(void) {
     g_rng = g_rng * 6364136223846793005ULL + 1442695040888963407ULL;
-    return (float) ((int32_t) (g_rng >> 33)) / (float) (1u << 30);
+    // >> 32 keeps the sign bit so the range really is [-1, 1); >> 33 was always
+    // non-negative, so the reference dot products never exercised cancellation.
+    return (float) ((int32_t) (uint32_t) (g_rng >> 32)) / (float) (1u << 31);
 }
 
 int main(void) {

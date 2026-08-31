@@ -1461,6 +1461,16 @@ extern "C" {
     //
     // Only this exact value is reserved. Every other out-of-range id remains a programming
     // error and keeps whatever diagnostic it has today.
+    //
+    // WHICH BACKENDS HONOUR IT: the CPU backend (both the plain and repacked mul_mat_id) and
+    // ggml_backend_sched. NOT Vulkan, CUDA, Metal or SYCL, and not the SpaceMIT IME CPU
+    // kernels. Those read the id into an unsigned type, so -1 becomes a huge offset that is
+    // usually still inside the backend's arena -- the multiply silently reads another
+    // tensor's bytes rather than faulting.
+    //
+    // THE RULE THIS IMPLIES: a pack whose id table uses the sentinel must be placed on the
+    // CPU backend (llama.cpp: -ot). Anything resident on another backend must use a valid
+    // dummy id with a zero weight mask instead. Both existing consumers follow this.
     #define GGML_MMID_SENTINEL (-1)
 
     // indirect matrix multiplication
