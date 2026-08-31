@@ -386,7 +386,23 @@ class vk_perf_logger;
 static void ggml_vk_destroy_buffer(vk_buffer& buf);
 static void ggml_vk_synchronize(ggml_backend_vk_context * ctx);
 
-static constexpr uint32_t mul_mat_vec_max_cols = 8;
+// Column-batching limit for the DENSE mul_mat_vec path: above this many columns,
+// ggml_vk_mul_mat falls through to the general matmul. It is a real constraint, not a
+// heuristic - one pipeline is compiled per column count (see the loop in
+// ggml_vk_load_shaders), it bounds the pipeline arrays, and it is asserted against in
+// ggml_vk_mul_mat_vec_q_f16.
+//
+// Raising it costs pipeline objects at startup (one more set per column count per type per
+// workgroup size) and register pressure in the shaders, which hold temp[NUM_COLS][NUM_ROWS]
+// in registers; large values risk spilling. Existing column counts are specialised
+// separately and are unaffected.
+//
+// Whether raising it pays is device-dependent, so it is a build option rather than a new
+// default. See GGML_VULKAN_MMV_MAX_COLS in ggml/CMakeLists.txt.
+#ifndef GGML_VULKAN_MMV_MAX_COLS
+#define GGML_VULKAN_MMV_MAX_COLS 8
+#endif
+static constexpr uint32_t mul_mat_vec_max_cols = GGML_VULKAN_MMV_MAX_COLS;
 static constexpr uint32_t p021_max_gqa_ratio = 8;
 
 enum vk_device_architecture {
@@ -10789,11 +10805,34 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     }
 }
 
+// Token-count threshold for choosing the per-token GEMV path over the general matmul for
+// MUL_MAT_ID. Overridable with GGML_VK_MMVID_MAX; default 8, i.e. unchanged behaviour.
+//
+// The stock 8 mirrors mul_mat_vec_max_cols, but that constant is the DENSE path's
+// column-batching limit and does not apply here: the _id pipelines have no column
+// variants (pipeline_dequant_mul_mat_vec_id_f32[wg][type] has no [cols] dimension), so
+// this path issues one dispatch per token and its cost is linear in the token count.
+//
+// Whether 8 is the right crossover is device- and model-dependent. The general matmul
+// tiles over experts, so with n_expert_used << n_expert each tile is mostly padding at
+// small token counts, and the more bandwidth-starved the device the more that padding
+// costs. On an integrated GPU with a very sparse MoE the GEMV path stays ahead well past
+// 8; on a discrete GPU with several times the bandwidth the crossover is lower and 8 may
+// be correct. Hence a knob rather than a new constant.
+static uint32_t ggml_vk_mmvid_max() {
+    static uint32_t v = 0;
+    if (v == 0) {
+        const char * e = getenv("GGML_VK_MMVID_MAX");
+        v = e ? (uint32_t) std::max(1, atoi(e)) : 8;
+    }
+    return v;
+}
+
 static bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
     ggml_tensor * src2 = dst->src[2];
-    return (src2->ne[1] <= 8) && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type));
+    return (src2->ne[1] <= ggml_vk_mmvid_max()) && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type));
 }
 
 static void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
