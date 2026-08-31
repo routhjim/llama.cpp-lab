@@ -9,61 +9,6 @@
 #include <cinttypes>
 
 
-// The hot/cold split routing subgraph (fn-expert-swap) is mis-executed by a Vulkan
-// graph optimization at ubatch >= ~512. Measured on Qwen3.8-Flash-Next UD-Q4_K_XL,
-// 25 wiki chunks at -c 4096 -b 4096 -ub 2048:
-//
-//     no workaround              PPL 23.1193 +/- 0.459
-//     GGML_VK_OPT_LOOKAHEAD=3    PPL  3.9970 +/- 0.038   (unsplit XL: 3.987)
-//
-// 5.79x, and SILENT: decode runs at batch 1-3 and is clean, so greedy output matches
-// the unsplit model byte-for-byte and the text stays fluent. Only PREFILL is corrupted,
-// so the model reads its context through a broken computation and writes confidently
-// from the damage. A full 39-task agent benchmark was once run in this state and its
-// results looked plausible but were worthless.
-//
-// GGML_VK_OPT_LOOKAHEAD caps the optimizer's reorder window (K<=3 clean, K>=4 broken)
-// and is read LAZILY, on the first graph optimization -- which happens after model
-// load -- so the loader can still force it here. GGML_VK_DISABLE_GRAPH_OPTIMIZE is read
-// at Vulkan *device init*, before load, so the loader cannot set that one; it remains
-// available as a heavier manual alternative.
-//
-// This exists because relying on callers to export the variable failed in practice:
-// the perplexity harness set it, the serving path did not, and an audit found only 3 of
-// 21 launcher scripts had any workaround at all. An explicit user setting always wins.
-static void qwen4exp_force_vk_reorder_cap() {
-    static bool done = false;
-    if (done) {
-        return;
-    }
-    done = true;
-
-    if (getenv("GGML_VK_DISABLE_GRAPH_OPTIMIZE") != nullptr) {
-        return; // optimizer already disabled outright; nothing to cap
-    }
-
-    const char * cur = getenv("GGML_VK_OPT_LOOKAHEAD");
-    if (cur == nullptr) {
-#if defined(_WIN32)
-        _putenv_s("GGML_VK_OPT_LOOKAHEAD", "3");
-#else
-        setenv("GGML_VK_OPT_LOOKAHEAD", "3", 0); // 0: never clobber an explicit setting
-#endif
-        // WARN, not INFO: llama.cpp filters INFO from the loader in several tools
-        // (llama-perplexity shows only W and above), and a loader silently overriding
-        // the user's environment to dodge a correctness bug must be visible.
-        LLAMA_LOG_WARN("%s: hot/cold split experts detected - forcing "
-                       "GGML_VK_OPT_LOOKAHEAD=3 (Vulkan graph-optimizer reorder bug; "
-                       "without it prefill is silently corrupted at ubatch>=512)\n",
-                       __func__);
-    } else if (atoi(cur) > 3) {
-        LLAMA_LOG_ERROR("%s: GGML_VK_OPT_LOOKAHEAD=%s is UNSAFE with hot/cold split "
-                        "experts - values >3 silently corrupt prefill at ubatch>=512 "
-                        "(measured PPL 23.12 vs 3.997). Use 3, or unset it and let the "
-                        "loader force the safe value.\n", __func__, cur);
-    }
-}
-
 void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
@@ -264,11 +209,6 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         ggml_tensor * hot_meta =
             ml.get_tensor_meta(tn(LLM_TENSOR_FFN_GATE_EXPS_HOT, "weight", il).str().c_str());
         if (hot_meta != nullptr) {
-            // TODO(workaround): see "Known-bad" in the PR description. A Vulkan graph
-            // reorder mis-executes the split routing subgraph; without capping the
-            // optimiser lookahead the model produces PPL 23.1 instead of 4.0, silently.
-            qwen4exp_force_vk_reorder_cap();
-
             const int64_t n_hot  = hot_meta->ne[2];
             const int64_t n_cold = n_expert - n_hot;
             GGML_ASSERT(n_hot > 0 && n_cold > 0 && "split experts: each pack must be non-empty");
@@ -1073,13 +1013,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_moe_ffn_split(ggml_tensor * cur
                 nullptr, nullptr, nullptr, nullptr, nullptr,
                 sel_t, w_t);
 
-        // TODO(workaround): see "Known-bad" in the PR description. The pack-combine ADD
-        // must not directly follow a pack's final reduce ADD -- the Vulkan graph
-        // optimiser's ADD+ADD grouping exemption assumes a fusable bias pattern and
-        // mis-executes this dependent pair at batch (PPL 383 vs 1.65 on wiki chunk 1).
-        // The no-op scale breaks that adjacency. The mechanism is a hypothesis fitted to
-        // one observation, not a root cause.
-        moe_out = moe_out ? ggml_add(ctx0, moe_out, ggml_scale(ctx0, out_t, 1.0f)) : out_t;
+        moe_out = moe_out ? ggml_add(ctx0, moe_out, out_t) : out_t;
     }
     return moe_out;
 }
