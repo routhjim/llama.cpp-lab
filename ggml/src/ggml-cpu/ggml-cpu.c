@@ -1497,6 +1497,7 @@ struct mmid_row_mapping {
 #if defined(__linux__)
 #include <pthread.h>
 #include <sys/mman.h>   // mlock/munlock
+#include <sys/resource.h>  // getrlimit(RLIMIT_MEMLOCK)
 
 #define EC_MAX_LAYERS  128
 #define EC_STRIDE      512      // key = layer*EC_STRIDE + pack_local_expert
@@ -1504,7 +1505,11 @@ struct mmid_row_mapping {
 #define EC_QRING       8192
 #define EC_SUCC        4        // successor slots per key
 
-typedef struct { int32_t prev, next; uint8_t present, via_trace, used; } ec_slot;
+// bytes = what this key was CHARGED at admission; refund exactly this and never a
+// recomputed ec_slab_bytes(). A pack registers one kind per MUL_MAT_ID node, so a key
+// admitted before gate/down registered was charged less than the full slab.
+// locked = bitmask of the kinds whose mlock() actually succeeded.
+typedef struct { int32_t prev, next; size_t bytes; uint8_t present, via_trace, used, locked; } ec_slot;
 typedef struct { uint32_t key; uint16_t cnt; } ec_succ;
 
 static struct {
@@ -1553,17 +1558,19 @@ static void ec_evict_one(void) {
     if (k < 0) return;
     int layer = k / EC_STRIDE, e = k % EC_STRIDE;
     for (int i = 0; i < 3; i++) {
-        if (ec.pk[layer].data[i]) {
+        if (ec.slot[k].locked & (1u << i)) {
             munlock(ec.pk[layer].data[i] + (size_t) e * ec.pk[layer].nb02[i],
                     ec.pk[layer].nb02[i]);
         }
     }
     if (ec.slot[k].via_trace && !ec.slot[k].used) {
-        ec.n_pf_dead++; ec.n_pf_bytes_dead += ec_slab_bytes(layer);
+        ec.n_pf_dead++; ec.n_pf_bytes_dead += ec.slot[k].bytes;
     }
     ec_lru_unlink(k);
     ec.slot[k].present = 0;
-    ec.cur_bytes -= ec_slab_bytes(layer);
+    ec.slot[k].locked  = 0;
+    ec.cur_bytes -= ec.slot[k].bytes;
+    ec.slot[k].bytes = 0;
     ec.n_evict++;
 }
 
@@ -1575,12 +1582,18 @@ static void ec_admit(int32_t k, int via_trace) {
     const size_t need = ec_slab_bytes(layer);
     while (ec.cur_bytes + need > ec.cap_bytes && ec.lru_tail >= 0) ec_evict_one();
     if (ec.cur_bytes + need > ec.cap_bytes) return;      // cache smaller than one slab
+    uint8_t locked = 0;
     for (int i = 0; i < 3; i++) {
         if (!ec.pk[layer].data[i]) continue;
         if (mlock(ec.pk[layer].data[i] + (size_t) e * ec.pk[layer].nb02[i],
-                  ec.pk[layer].nb02[i]) != 0) { ec.n_lockfail++; }
+                  ec.pk[layer].nb02[i]) != 0) { ec.n_lockfail++; continue; }
+        locked |= (uint8_t) (1u << i);
     }
+    // Nothing got pinned, so the slab is not resident. Claiming it here would make the
+    // hit rate count LRU membership the kernel is free to reclaim under us.
+    if (locked == 0) { return; }
     ec.slot[k].present = 1; ec_lru_push(k);
+    ec.slot[k].locked = locked; ec.slot[k].bytes = need;
     ec.slot[k].via_trace = (uint8_t) via_trace; ec.slot[k].used = 0;
     if (via_trace) ec.n_pf_admit++;
     ec.cur_bytes += need; ec.n_admit++;
@@ -1655,6 +1668,17 @@ static void ec_init(void) {
     ec.trace_k = t ? atoi(t) : 0;
     ec.stats   = getenv("GGML_EXPERT_CACHE_STATS") ? 1 : 0;
     ec.cap_bytes = (size_t)(gib * 1073741824.0);
+    // A cap above RLIMIT_MEMLOCK makes every mlock past the limit fail. Clamp instead of
+    // churning: the default limit is 8 MiB on a login shell, unlimited under systemd.
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_MEMLOCK, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY) {
+        if (ec.cap_bytes > (size_t) rl.rlim_cur) {
+            fprintf(stderr, "[expert-cache] cap %.1f GiB exceeds RLIMIT_MEMLOCK %.1f GiB, clamping\n",
+                    gib, (double) rl.rlim_cur / 1073741824.0);
+            ec.cap_bytes = (size_t) rl.rlim_cur;
+        }
+    }
+    if (ec.cap_bytes == 0) return;
     ec.lru_head = ec.lru_tail = -1; ec.prev_key = -1;
     for (int i = 0; i < EC_NKEY; i++) { ec.slot[i].prev = ec.slot[i].next = -1; }
     ec.enabled = 1;
