@@ -386,7 +386,23 @@ class vk_perf_logger;
 static void ggml_vk_destroy_buffer(vk_buffer& buf);
 static void ggml_vk_synchronize(ggml_backend_vk_context * ctx);
 
-static constexpr uint32_t mul_mat_vec_max_cols = 8;
+// Column-batching limit for the DENSE mul_mat_vec path: above this many columns,
+// ggml_vk_mul_mat falls through to the general matmul. It is a real constraint, not a
+// heuristic - one pipeline is compiled per column count (see the loop in
+// ggml_vk_load_shaders), it bounds the pipeline arrays, and it is asserted against in
+// ggml_vk_mul_mat_vec_q_f16.
+//
+// Raising it costs pipeline objects at startup (one more set per column count per type per
+// workgroup size) and register pressure in the shaders, which hold temp[NUM_COLS][NUM_ROWS]
+// in registers; large values risk spilling. Existing column counts are specialised
+// separately and are unaffected.
+//
+// Whether raising it pays is device-dependent, so it is a build option rather than a new
+// default. See GGML_VULKAN_MMV_MAX_COLS in ggml/CMakeLists.txt.
+#ifndef GGML_VULKAN_MMV_MAX_COLS
+#define GGML_VULKAN_MMV_MAX_COLS 8
+#endif
+static constexpr uint32_t mul_mat_vec_max_cols = GGML_VULKAN_MMV_MAX_COLS;
 static constexpr uint32_t p021_max_gqa_ratio = 8;
 
 enum vk_device_architecture {

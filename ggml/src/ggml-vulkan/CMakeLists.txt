@@ -142,6 +142,11 @@ if (Vulkan_FOUND)
         add_compile_definitions(GGML_VULKAN_VALIDATE)
     endif()
 
+    if (GGML_VULKAN_MMV_MAX_COLS AND NOT GGML_VULKAN_MMV_MAX_COLS EQUAL 8)
+        add_compile_definitions(GGML_VULKAN_MMV_MAX_COLS=${GGML_VULKAN_MMV_MAX_COLS})
+        message(STATUS "ggml-vulkan: dense mul_mat_vec column limit set to ${GGML_VULKAN_MMV_MAX_COLS}")
+    endif()
+
     if (GGML_VULKAN_RUN_TESTS)
         add_compile_definitions(GGML_VULKAN_RUN_TESTS)
         # the test path also calls ggml_graph_compute_with_ctx() (ggml-cpu)
