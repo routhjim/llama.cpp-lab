@@ -10807,7 +10807,19 @@ static uint32_t ggml_vk_mmvid_max() {
     static uint32_t v = 0;
     if (v == 0) {
         const char * e = getenv("GGML_VK_MMVID_MAX");
-        v = e ? (uint32_t) std::max(1, atoi(e)) : 8;
+        // std::stoul, not atoi: atoi maps empty or non-numeric input to 0, which
+        // std::max(1, ...) turns into a threshold of 1 -- silently disabling the
+        // mat-vec-id path for every multi-token batch. Matches the idiom used by
+        // GGML_VK_MAX_NODES_PER_SUBMIT elsewhere in this file.
+        v = 8;
+        if (e != nullptr) {
+            try {
+                v = std::max((uint32_t) std::stoul(e), 1u);
+            } catch (const std::exception &) {
+                GGML_LOG_WARN("%s: ignoring malformed GGML_VK_MMVID_MAX=\"%s\"\n", __func__, e);
+            }
+            GGML_LOG_INFO("%s: GGML_VK_MMVID_MAX = %u\n", __func__, v);
+        }
     }
     return v;
 }
