@@ -142,7 +142,11 @@ if (Vulkan_FOUND)
         add_compile_definitions(GGML_VULKAN_VALIDATE)
     endif()
 
-    if (GGML_VULKAN_MMV_MAX_COLS AND NOT GGML_VULKAN_MMV_MAX_COLS EQUAL 8)
+    # DEFINED, not truthiness: `AND NOT ... EQUAL 8` treated 0 and the empty string as
+    # false, so -DGGML_VULKAN_MMV_MAX_COLS=0 (or a build script whose computed value came
+    # out empty) silently produced a default build with a log indistinguishable from a
+    # plain configure.
+    if (DEFINED GGML_VULKAN_MMV_MAX_COLS AND NOT GGML_VULKAN_MMV_MAX_COLS STREQUAL "" AND NOT GGML_VULKAN_MMV_MAX_COLS EQUAL 8)
         add_compile_definitions(GGML_VULKAN_MMV_MAX_COLS=${GGML_VULKAN_MMV_MAX_COLS})
         message(STATUS "ggml-vulkan: dense mul_mat_vec column limit set to ${GGML_VULKAN_MMV_MAX_COLS}")
     endif()
