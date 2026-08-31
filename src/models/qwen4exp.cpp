@@ -1,10 +1,68 @@
 #include "models.h"
+
+#include <cstdlib>
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
 
 #include <algorithm>
 #include <cinttypes>
+
+
+// The hot/cold split routing subgraph (fn-expert-swap) is mis-executed by a Vulkan
+// graph optimization at ubatch >= ~512. Measured on Qwen3.8-Flash-Next UD-Q4_K_XL,
+// 25 wiki chunks at -c 4096 -b 4096 -ub 2048:
+//
+//     no workaround              PPL 23.1193 +/- 0.459
+//     GGML_VK_OPT_LOOKAHEAD=3    PPL  3.9970 +/- 0.038   (unsplit XL: 3.987)
+//
+// 5.79x, and SILENT: decode runs at batch 1-3 and is clean, so greedy output matches
+// the unsplit model byte-for-byte and the text stays fluent. Only PREFILL is corrupted,
+// so the model reads its context through a broken computation and writes confidently
+// from the damage. A full 39-task agent benchmark was once run in this state and its
+// results looked plausible but were worthless.
+//
+// GGML_VK_OPT_LOOKAHEAD caps the optimizer's reorder window (K<=3 clean, K>=4 broken)
+// and is read LAZILY, on the first graph optimization -- which happens after model
+// load -- so the loader can still force it here. GGML_VK_DISABLE_GRAPH_OPTIMIZE is read
+// at Vulkan *device init*, before load, so the loader cannot set that one; it remains
+// available as a heavier manual alternative.
+//
+// This exists because relying on callers to export the variable failed in practice:
+// the perplexity harness set it, the serving path did not, and an audit found only 3 of
+// 21 launcher scripts had any workaround at all. An explicit user setting always wins.
+static void qwen4exp_force_vk_reorder_cap() {
+    static bool done = false;
+    if (done) {
+        return;
+    }
+    done = true;
+
+    if (getenv("GGML_VK_DISABLE_GRAPH_OPTIMIZE") != nullptr) {
+        return; // optimizer already disabled outright; nothing to cap
+    }
+
+    const char * cur = getenv("GGML_VK_OPT_LOOKAHEAD");
+    if (cur == nullptr) {
+#if defined(_WIN32)
+        _putenv_s("GGML_VK_OPT_LOOKAHEAD", "3");
+#else
+        setenv("GGML_VK_OPT_LOOKAHEAD", "3", 0); // 0: never clobber an explicit setting
+#endif
+        // WARN, not INFO: llama.cpp filters INFO from the loader in several tools
+        // (llama-perplexity shows only W and above), and a loader silently overriding
+        // the user's environment to dodge a correctness bug must be visible.
+        LLAMA_LOG_WARN("%s: hot/cold split experts detected - forcing "
+                       "GGML_VK_OPT_LOOKAHEAD=3 (Vulkan graph-optimizer reorder bug; "
+                       "without it prefill is silently corrupted at ubatch>=512)\n",
+                       __func__);
+    } else if (atoi(cur) > 3) {
+        LLAMA_LOG_ERROR("%s: GGML_VK_OPT_LOOKAHEAD=%s is UNSAFE with hot/cold split "
+                        "experts - values >3 silently corrupt prefill at ubatch>=512 "
+                        "(measured PPL 23.12 vs 3.997). Use 3, or unset it and let the "
+                        "loader force the safe value.\n", __func__, cur);
+    }
+}
 
 void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
@@ -199,8 +257,38 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         }
 
         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, 0);
-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, 0);
-        create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, 0);
+
+        // Hot/cold split expert packs. Present when the GGUF was produced by
+        // tools/moe-trace/fn_split.py; the per-layer hot count is read off the tensor
+        // itself rather than carried as a hyperparameter, so one build reads any split.
+        ggml_tensor * hot_meta =
+            ml.get_tensor_meta(tn(LLM_TENSOR_FFN_GATE_EXPS_HOT, "weight", il).str().c_str());
+        if (hot_meta != nullptr) {
+            // TODO(workaround): see "Known-bad" in the PR description. A Vulkan graph
+            // reorder mis-executes the split routing subgraph; without capping the
+            // optimiser lookahead the model produces PPL 23.1 instead of 4.0, silently.
+            qwen4exp_force_vk_reorder_cap();
+
+            const int64_t n_hot  = hot_meta->ne[2];
+            const int64_t n_cold = n_expert - n_hot;
+            GGML_ASSERT(n_hot > 0 && n_cold > 0 && "split experts: each pack must be non-empty");
+
+            layer.ffn_gate_exps_hot  = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS_HOT,  "weight", il), { n_embd,   n_ff_exp, n_hot  }, 0);
+            layer.ffn_up_exps_hot    = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS_HOT,    "weight", il), { n_embd,   n_ff_exp, n_hot  }, 0);
+            layer.ffn_down_exps_hot  = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS_HOT,  "weight", il), { n_ff_exp, n_embd,   n_hot  }, 0);
+            layer.ffn_gate_exps_cold = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS_COLD, "weight", il), { n_embd,   n_ff_exp, n_cold }, 0);
+            layer.ffn_up_exps_cold   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS_COLD,   "weight", il), { n_embd,   n_ff_exp, n_cold }, 0);
+            layer.ffn_down_exps_cold = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS_COLD, "weight", il), { n_ff_exp, n_embd,   n_cold }, 0);
+
+            // global expert id -> pack-local id, and a 1/0 membership mask, per pack
+            layer.ffn_exp_tier_ids_hot   = create_tensor(tn(LLM_TENSOR_FFN_EXP_TIER_IDS_HOT,   il), { n_expert }, 0);
+            layer.ffn_exp_tier_mask_hot  = create_tensor(tn(LLM_TENSOR_FFN_EXP_TIER_MASK_HOT,  il), { n_expert }, 0);
+            layer.ffn_exp_tier_ids_cold  = create_tensor(tn(LLM_TENSOR_FFN_EXP_TIER_IDS_COLD,  il), { n_expert }, 0);
+            layer.ffn_exp_tier_mask_cold = create_tensor(tn(LLM_TENSOR_FFN_EXP_TIER_MASK_COLD, il), { n_expert }, 0);
+        } else {
+            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, 0);
+            create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, 0);
+        }
 
         layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, 0);
         layer.ffn_gate_shexp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", il), { n_embd, n_ff_shexp }, 0);
@@ -909,10 +997,101 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     return cur;
 }
 
+// Hot/cold split expert packs.
+//
+// The expert set is split across two weight tensors so the rarely-routed "cold" pack can be
+// placed on a different backend (CPU, streamed from page cache) while the hot pack stays
+// resident on the GPU. Routing happens ONCE over the full set; each pack is then dispatched
+// with pack-local ids and the shared weights masked to its own members.
+//
+// The weights must be reused verbatim across packs. Re-deriving them per pack would
+// renormalise over that pack's subset, so the two partial outputs would not sum to the
+// result the full expert set produces -- see the weights_in parameter of build_moe_ffn.
+//
+// Asymmetry between the packs is deliberate and is NOT cosmetic:
+//   - the COLD table marks non-members with the reserved sentinel id, which the CPU backend
+//     skips (see the mmid sentinel PR). The cold pack must therefore be placed on CPU.
+//   - the HOT table cannot use sentinels, because Vulkan has no such contract. Its
+//     non-members are mapped onto a real id and neutralised by the zero mask instead.
+ggml_tensor * llama_model_qwen4exp::graph::build_moe_ffn_split(ggml_tensor * cur, int il) const {
+    const auto & layer = model.layers[il];
+    const int64_t n_tokens = cur->ne[1];
+    const int64_t n_used   = n_expert_used;
+
+    ggml_tensor * logits = build_lora_mm(layer.ffn_gate_inp, cur);   // [n_expert, n_tokens]
+    ggml_tensor * probs  = ggml_soft_max(ctx0, logits);
+    cb(probs, "ffn_moe_probs", il);
+
+    ggml_tensor * selected_experts = ggml_argsort_top_k(ctx0, probs, n_used);
+    cb(selected_experts, "ffn_moe_topk", il);
+
+    // normalise over the FULL coalition (the norm_w path of build_moe_ffn)
+    ggml_tensor * probs3 = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
+    ggml_tensor * w = ggml_get_rows(ctx0, probs3, selected_experts);  // [1, n_used, n_tokens]
+    w = ggml_reshape_2d(ctx0, w, n_used, n_tokens);
+    ggml_tensor * ws = ggml_sum_rows(ctx0, w);
+    ws = ggml_clamp(ctx0, ws, 6.103515625e-5, INFINITY);
+    w = ggml_div(ctx0, w, ws);
+    w = ggml_reshape_3d(ctx0, w, 1, n_used, n_tokens);
+    if (hparams.expert_weights_scale != 0.0f && hparams.expert_weights_scale != 1.0f) {
+        w = ggml_scale(ctx0, w, hparams.expert_weights_scale);
+    }
+    cb(w, "ffn_moe_weights_norm", il);
+
+    // ggml_get_rows with 2-D ids requires matching batch dims, so flatten the selection
+    ggml_tensor * selected_flat = ggml_reshape_1d(ctx0,
+        ggml_cont(ctx0, selected_experts), n_used * n_tokens);
+
+    struct pack_t { ggml_tensor * up, * gate, * down, * ids, * mask; };
+    const pack_t packs[2] = {
+        { layer.ffn_up_exps_hot,  layer.ffn_gate_exps_hot,  layer.ffn_down_exps_hot,  layer.ffn_exp_tier_ids_hot,  layer.ffn_exp_tier_mask_hot  },
+        { layer.ffn_up_exps_cold, layer.ffn_gate_exps_cold, layer.ffn_down_exps_cold, layer.ffn_exp_tier_ids_cold, layer.ffn_exp_tier_mask_cold },
+    };
+
+    ggml_tensor * moe_out = nullptr;
+    for (int t = 0; t < 2; t++) {
+        ggml_tensor * ids_f = ggml_cast(ctx0,
+            ggml_reshape_2d(ctx0, packs[t].ids, 1, n_expert), GGML_TYPE_F32);
+        ggml_tensor * sel_f = ggml_get_rows(ctx0, ids_f, selected_flat);
+        ggml_tensor * sel_t = ggml_cast(ctx0,
+            ggml_reshape_2d(ctx0, sel_f, n_used, n_tokens), GGML_TYPE_I32);
+
+        ggml_tensor * msk = ggml_get_rows(ctx0,
+            ggml_reshape_2d(ctx0, packs[t].mask, 1, n_expert), selected_flat);
+        ggml_tensor * w_t = ggml_mul(ctx0, w,
+            ggml_reshape_3d(ctx0, msk, 1, n_used, n_tokens));
+
+        ggml_tensor * out_t = build_moe_ffn(cur,
+                nullptr,
+                packs[t].up,
+                packs[t].gate,
+                packs[t].down,
+                nullptr,
+                packs[t].gate->ne[2], n_used,
+                LLM_FFN_SILU, /*norm_w =*/ false, /*w_scale =*/ 0.0f,
+                LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
+                nullptr, nullptr, nullptr, nullptr, nullptr,
+                sel_t, w_t);
+
+        // TODO(workaround): see "Known-bad" in the PR description. The pack-combine ADD
+        // must not directly follow a pack's final reduce ADD -- the Vulkan graph
+        // optimiser's ADD+ADD grouping exemption assumes a fusable bias pattern and
+        // mis-executes this dependent pair at batch (PPL 383 vs 1.65 on wiki chunk 1).
+        // The no-op scale breaks that adjacency. The mechanism is a hypothesis fitted to
+        // one observation, not a root cause.
+        moe_out = moe_out ? ggml_add(ctx0, moe_out, ggml_scale(ctx0, out_t, 1.0f)) : out_t;
+    }
+    return moe_out;
+}
+
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
-    ggml_tensor * moe_out =
+    ggml_tensor * moe_out;
+    if (model.layers[il].ffn_gate_exps_hot != nullptr) {
+        moe_out = build_moe_ffn_split(cur, il);
+    } else {
+    moe_out =
         build_moe_ffn(cur,
             model.layers[il].ffn_gate_inp,
             model.layers[il].ffn_up_exps,
@@ -927,6 +1106,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
             model.layers[il].ffn_up_exps_s,
             model.layers[il].ffn_gate_exps_s,
             model.layers[il].ffn_down_exps_s);
+    }
     cb(moe_out, "ffn_moe_out", il);
 
     // shared experts, as in the Qwen3Next reference
