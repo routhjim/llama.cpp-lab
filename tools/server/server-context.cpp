@@ -1,4 +1,6 @@
 #include "server-context.h"
+
+#include <climits>
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
@@ -1598,9 +1600,27 @@ private:
             }
         }
 
-        // find the slot that has been least recently used
+        // find the slot that keeps the active stream span smallest, then the least recently used
         if (ret == nullptr) {
-            int64_t t_last = -1;
+            // Attention cost scales with the stream RANGE spanned by the active sequences --
+            // get_k/get_v view ns = s1 - s0 + 1 streams (llama-kv-cache.h) -- not with how many
+            // are active. Two sequences on slots {0,3} therefore cost the same as four on
+            // {0,1,2,3} and measure ~38% slower per slot than the same two on {0,1}. Plain LRU
+            // ignores the index and so drifts the active set apart. Prefer the free slot that
+            // keeps the span tightest; fall back to LRU to break ties, so prompt-cache value is
+            // still respected. Position does not matter, only density: {2,3} is as good as {0,1}.
+            int lo = INT_MAX;
+            int hi = INT_MIN;
+
+            for (server_slot & slot : slots) {
+                if (slot.is_processing()) {
+                    lo = std::min(lo, slot.id);
+                    hi = std::max(hi, slot.id);
+                }
+            }
+
+            int     span_best = INT_MAX;
+            int64_t t_last    = -1;
 
             for (server_slot & slot : slots) {
                 // skip the slot if it is not available
@@ -1608,15 +1628,20 @@ private:
                     continue;
                 }
 
+                const int span_cur = (lo == INT_MAX)
+                    ? 1
+                    : (std::max(hi, slot.id) - std::min(lo, slot.id) + 1);
+
                 // select the current slot if the criteria match
-                if (!ret || slot.t_last_used <= t_last) {
-                    t_last = slot.t_last_used;
-                    ret = &slot;
+                if (!ret || span_cur < span_best || (span_cur == span_best && slot.t_last_used <= t_last)) {
+                    span_best = span_cur;
+                    t_last    = slot.t_last_used;
+                    ret       = &slot;
                 }
             }
 
             if (ret != nullptr) {
-                SLT_INF(*ret, "selected slot by LRU, t_last = %" PRId64 "\n", t_last);
+                SLT_INF(*ret, "selected slot by span/LRU, span = %d, t_last = %" PRId64 "\n", span_best, t_last);
 
                 update_cache = true;
             }
