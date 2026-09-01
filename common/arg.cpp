@@ -1710,6 +1710,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--slot-pack"},
+        "keep active slots packed at the lowest indices by relocating idle slot caches.\n"
+        "attention cost scales with the stream RANGE spanned by active sequences, not their\n"
+        "count, so a sparse active set pays for the idle slots inside it.\n"
+        "allocates ONE extra sequence as device-resident swap scratch, so the KV cache grows\n"
+        "by 1/n_parallel -- raise -c accordingly to keep the same context per slot",
+        [](common_params & params) {
+            params.n_seq_extra = 1;
+        }
+    ).set_env("LLAMA_ARG_SLOT_PACK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),

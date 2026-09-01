@@ -44,8 +44,11 @@ static common_speculative_output_limits server_output_limits(const common_params
         return { params.n_batch, 1 };
     }
 
+    // the context is created with n_seq_max = n_parallel + n_seq_extra, and the constructor
+    // calls output_reserve(n_seq_max), so the budget must cover the extra scratch sequence
+    // even though it is never decoded
     auto result = common_speculative_get_output_limits(
-            params.n_batch, params.n_parallel, common_speculative_n_max(&params.speculative));
+            params.n_batch, params.n_parallel + params.n_seq_extra, common_speculative_n_max(&params.speculative));
 
     result.total   = std::max<int32_t>(1, result.total);
     result.per_seq = std::max<int32_t>(1, result.per_seq);
@@ -717,6 +720,67 @@ struct server_slot {
         }
 
         return res;
+    }
+
+    // Relocate this slot's cached prompt -- and its KV, target and draft alike, since
+    // common_memory wraps both -- into an EMPTY slot. Cheap: a device-side seq_cp.
+    // Legal only while both slots are idle, which is the case at a turn boundary.
+    void migrate_cache_to(server_slot & other) {
+        GGML_ASSERT(!is_processing());
+        GGML_ASSERT(!other.is_processing());
+        GGML_ASSERT(other.prompt.n_tokens() == 0);
+
+        mem.seq_mv(id, other.id);
+
+        other.prompt      = std::move(prompt);
+        other.t_last_used = t_last_used;
+
+        prompt.clear();
+    }
+
+    // Exchange this slot's cached prompt with an OCCUPIED slot's, staying entirely in device
+    // memory. seq_cp cannot swap in place, so this rotates through a scratch stream:
+    //
+    //     this -> scratch ; other -> this ; scratch -> other
+    //
+    // The scratch stream is seq id n_parallel, which exists only because the context was
+    // created with n_seq_max = n_parallel + 1 (common_params::n_seq_extra). It is never
+    // exposed as a slot, so nothing else can be using it.
+    //
+    // The alternative -- llama_state_seq_get_data/set_data through a host buffer -- measured
+    // ~40 ms for an 800-token cache (~1.25 GB/s), which extrapolates to ~1.4 s at this
+    // workload's p90 cache size. That machinery is for banking large preambles, not for
+    // shuffling live slots. This path is three device-side copies.
+    void swap_cache_with(server_slot & other, llama_seq_id scratch) {
+        GGML_ASSERT(!is_processing());
+        GGML_ASSERT(!other.is_processing());
+        GGML_ASSERT(scratch != id && scratch != other.id);
+
+        // three true moves, not cp+rm: seq_mv relocates every sub-memory correctly, including
+        // the recurrent state (whose seq_cp aliases rather than moves) and its rs_idx
+        const llama_pos a0 = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), id);
+        const llama_pos a1 = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), id);
+        const llama_pos b0 = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), other.id);
+        const llama_pos b1 = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), other.id);
+
+        mem.seq_mv(other.id, scratch);   // idle steps aside
+        mem.seq_mv(id, other.id);        // active moves down -- single hop
+        mem.seq_mv(scratch, id);         // idle lands where the active one was
+
+        // structural check: the two position ranges must have exchanged exactly and nothing may
+        // be left in scratch. Cheap (no serialisation) and, unlike comparing serialised bytes,
+        // it is not confounded by physical cell placement -- a correct relocation changes the
+        // layout, so byte-level comparison flags even a known-good move.
+        if (llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), other.id) != a0 ||
+            llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), other.id) != a1 ||
+            llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), id)       != b0 ||
+            llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), id)       != b1 ||
+            llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), scratch)  >= 0) {
+            SRV_ERR("slot swap %d <-> %d CORRUPT: expected [%d,%d]x[%d,%d]\n", id, other.id, a0, a1, b0, b1);
+        }
+
+        std::swap(prompt,      other.prompt);
+        std::swap(t_last_used, other.t_last_used);
     }
 
     void copy_state_to(server_slot & other) const {
@@ -1594,6 +1658,74 @@ private:
                 // if we are about to lose a large portion of the existing context - save it in the prompt cache
                 if (f_keep < 0.5f) {
                     update_cache = true;
+                }
+            }
+        }
+
+        // Keep the ACTIVE slots packed at the front.
+        //
+        // With a non-unified KV cache, get_k/get_v view ns = s1 - s0 + 1 streams -- the RANGE
+        // between the lowest and highest active stream, not the count (llama-kv-cache.h) -- and
+        // attention is computed over every stream in that range, idle ones included. Two
+        // sequences on slots {0,3} therefore cost the same as four on {0,1,2,3}, and measure
+        // ~38% slower per slot than the same two on {0,1}.
+        //
+        // Neither selector above considers the index: LCP-similarity picks whichever slot holds
+        // the matching prefix, and LRU picks the oldest. So the active set drifts apart. Here we
+        // relocate the chosen slot's cache down to the lowest non-processing index, which
+        // restores the invariant "active slots occupy {0 .. k-1}". The invariant is
+        // self-sustaining: while it holds, the lowest non-processing index IS the optimal
+        // placement, so no search is needed and it generalises to any n_parallel.
+        //
+        // A task finishing at j < k punches a hole; it is refilled by the next arrival, or by
+        // the task above it at ITS next turn boundary -- every tool call, for agent traffic.
+        //
+        // Only slots that are idle at this instant are touched (both selectors skip
+        // is_processing()), so nothing is ever moved mid-generation.
+        if (params_base.n_seq_extra > 0 && ret != nullptr && task.id_slot == -1 && ret->prompt.n_tokens() > 0) {
+            server_slot * dst = nullptr;
+
+            for (server_slot & slot : slots) {
+                if (!slot.is_processing() && (dst == nullptr || slot.id < dst->id)) {
+                    dst = &slot;
+                }
+            }
+
+            if (dst != nullptr && dst->id < ret->id) {
+                const int64_t t0     = ggml_time_us();
+                const int     n_move = ret->prompt.n_tokens();
+                const int     n_evic = dst->prompt.n_tokens();
+
+                // a swap costs a host round-trip proportional to the displaced cache; refuse
+                // one that is large enough to cost more than the span it buys back.
+                // LLAMA_SLOT_PACK_MAX_EVICT caps the displaced cache in tokens (-1 = no cap).
+                static const int max_evict = []() {
+                    const char * e = getenv("LLAMA_SLOT_PACK_MAX_EVICT");
+                    return e ? atoi(e) : -1;
+                }();
+
+                // swapping an occupied slot needs the scratch stream; without it only the
+                // empty-destination fast path is available
+                const bool can_swap = params_base.n_seq_extra > 0;
+
+                if (n_evic == 0 || (can_swap && (max_evict < 0 || n_evic <= max_evict))) {
+                    const int from = ret->id;
+
+                    if (n_evic == 0) {
+                        ret->migrate_cache_to(*dst);
+
+                    } else {
+                        ret->swap_cache_with(*dst, params_base.n_parallel);
+                    }
+
+                    SRV_INF("slot pack: %s cache %d -> %d (%d tokens, displaced %d, %.1f ms)\n",
+                            n_evic == 0 ? "moved" : "swapped", from, dst->id, n_move, n_evic,
+                            (ggml_time_us() - t0) / 1000.0);
+
+                    ret = dst;
+                } else {
+                    SRV_DBG("slot pack: skipped %d -> %d, displaced cache %d > limit %d\n",
+                            ret->id, dst->id, n_evic, max_evict);
                 }
             }
         }
