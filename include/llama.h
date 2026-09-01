@@ -754,6 +754,13 @@ extern "C" {
     // Copy all tokens that belong to the specified sequence to another sequence
     // p0 < 0 : [0,  p1]
     // p1 < 0 : [p0, inf)
+    // Move a sequence to another id, vacating the source. Unlike seq_cp + seq_rm this is
+    // correct for recurrent/hybrid memories, whose seq_cp aliases rather than relocates.
+    LLAMA_API void llama_memory_seq_mv(
+            llama_memory_t mem,
+              llama_seq_id seq_id_src,
+              llama_seq_id seq_id_dst);
+
     LLAMA_API void llama_memory_seq_cp(
             llama_memory_t mem,
               llama_seq_id seq_id_src,
