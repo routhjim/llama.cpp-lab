@@ -283,6 +283,43 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
     }
 }
 
+void llama_memory_recurrent::seq_mv(llama_seq_id seq_id_src, llama_seq_id seq_id_dst) {
+    if (seq_id_src == seq_id_dst) {
+        return;
+    }
+
+    if ((uint32_t) seq_id_src >= n_seq_max || (uint32_t) seq_id_dst >= n_seq_max) {
+        LLAMA_LOG_ERROR("%s: invalid seq_id (%d -> %d), n_seq_max = %d\n",
+                __func__, seq_id_src, seq_id_dst, n_seq_max);
+        return;
+    }
+
+    // free whatever the destination held
+    seq_rm(seq_id_dst, -1, -1);
+
+    if ((uint32_t) seq_id_src < size && (uint32_t) seq_id_dst < size) {
+        auto & tail_src = cells[seq_id_src];
+
+        if (tail_src.tail >= 0) {
+            auto & cell = cells[tail_src.tail];
+
+            // transfer ownership of the state cell rather than aliasing it: unlike seq_cp,
+            // the source must not keep referencing it afterwards
+            cell.seq_id.erase (seq_id_src);
+            cell.seq_id.insert(seq_id_dst);
+
+            cells[seq_id_dst].tail = tail_src.tail;
+            tail_src.tail = -1;
+        }
+    }
+
+    // the pending rollback snapshot belongs to the sequence and must travel with it;
+    // seq_cp never carried it and seq_rm would have zeroed it
+    const uint32_t idx_src = rs_idx[seq_id_src];
+    set_rs_idx(seq_id_dst, idx_src);
+    set_rs_idx(seq_id_src, 0);
+}
+
 void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
     uint32_t new_head = size;
 

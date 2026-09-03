@@ -109,6 +109,21 @@ struct llama_memory_i {
 
     virtual bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) = 0;
     virtual void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) = 0;
+    // Move a sequence to another id, vacating the source.
+    //
+    // The default is copy-then-clear, which is correct for memories that physically hold the
+    // data (the KV caches). It is NOT correct for llama_memory_recurrent, whose seq_cp aliases
+    // the destination onto the source's cell (fork semantics, for sharing a prefix) rather than
+    // relocating it, and whose per-sequence rs_idx is dropped by seq_cp and zeroed by seq_rm.
+    // Such memories must override this.
+    virtual void seq_mv(llama_seq_id seq_id_src, llama_seq_id seq_id_dst) {
+        if (seq_id_src == seq_id_dst) {
+            return;
+        }
+        seq_cp(seq_id_src, seq_id_dst, -1, -1);
+        seq_rm(seq_id_src, -1, -1);
+    }
+
     virtual void seq_keep(llama_seq_id seq_id) = 0;
     virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;
     virtual void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) = 0;

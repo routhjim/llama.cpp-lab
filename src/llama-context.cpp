@@ -4033,6 +4033,17 @@ bool llama_memory_seq_rm(
     return mem->seq_rm(seq_id, p0, p1);
 }
 
+void llama_memory_seq_mv(
+        llama_memory_t mem,
+        llama_seq_id seq_id_src,
+        llama_seq_id seq_id_dst) {
+    if (!mem) {
+        return;
+    }
+
+    mem->seq_mv(seq_id_src, seq_id_dst);
+}
+
 void llama_memory_seq_cp(
         llama_memory_t mem,
           llama_seq_id seq_id_src,

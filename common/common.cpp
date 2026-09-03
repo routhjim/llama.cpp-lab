@@ -1634,6 +1634,11 @@ static void common_context_seq_cp(llama_context * ctx, llama_seq_id seq_id_src, 
     llama_memory_seq_cp(mem, seq_id_src, seq_id_dst, p0, p1);
 }
 
+static void common_context_seq_mv(llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst) {
+    auto * mem = llama_get_memory(ctx);
+    llama_memory_seq_mv(mem, seq_id_src, seq_id_dst);
+}
+
 static void common_context_seq_add(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) {
     auto * mem = llama_get_memory(ctx);
     llama_memory_seq_add(mem, seq_id, p0, p1, delta);
@@ -1655,6 +1660,13 @@ void common_memory::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, lla
     common_context_seq_cp(ctx_tgt, seq_id_src, seq_id_dst, p0, p1);
     if (ctx_dft) {
         common_context_seq_cp(ctx_dft, seq_id_src, seq_id_dst, p0, p1);
+    }
+}
+
+void common_memory::seq_mv(llama_seq_id seq_id_src, llama_seq_id seq_id_dst) const {
+    common_context_seq_mv(ctx_tgt, seq_id_src, seq_id_dst);
+    if (ctx_dft) {
+        common_context_seq_mv(ctx_dft, seq_id_src, seq_id_dst);
     }
 }
 
@@ -1720,7 +1732,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     auto cparams = llama_context_default_params();
 
     cparams.n_ctx             = params.n_ctx;
-    cparams.n_seq_max         = params.n_parallel;
+    cparams.n_seq_max         = params.n_parallel + params.n_seq_extra;
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);

@@ -165,6 +165,14 @@ void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_i
     }
 }
 
+void llama_memory_hybrid_idx::seq_mv(llama_seq_id seq_id_src, llama_seq_id seq_id_dst) {
+    llama_memory_hybrid::seq_mv(seq_id_src, seq_id_dst);
+
+    if (mem_idx) {
+        mem_idx->seq_mv(seq_id_src, seq_id_dst);
+    }
+}
+
 void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
     llama_memory_hybrid::seq_keep(seq_id);
 

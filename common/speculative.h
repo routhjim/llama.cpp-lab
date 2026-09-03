@@ -85,6 +85,10 @@ void common_speculative_draft(common_speculative * spec);
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
 
+// exchange the per-sequence state of two sequences. Used by the server to relocate a live
+// sequence to another KV stream between decode steps (the KV/RS data moves via llama_memory_seq_mv)
+void common_speculative_seq_swap(common_speculative * spec, llama_seq_id a, llama_seq_id b);
+
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
