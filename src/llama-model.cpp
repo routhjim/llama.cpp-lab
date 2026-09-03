@@ -1681,7 +1681,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    // populating the whole mapping is a loss when most of it is read by pread() (sparse experts)
+    const bool prefetch = getenv("LLAMA_MMAP_NO_PREFETCH") == nullptr;
+    ml.init_mappings(prefetch, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
