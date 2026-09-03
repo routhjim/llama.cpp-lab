@@ -48,6 +48,7 @@
 #include <unordered_map>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/prctl.h>
 #include <signal.h>
 #include <climits>
 
@@ -869,6 +870,7 @@ struct vk_sparse_mgr {
         if (pipe(pfd) != 0) return;
         pid_t pid = fork();
         if (pid == 0) {
+            prctl(PR_SET_PDEATHSIG, SIGKILL);   // die with the parent: nothing else stops journalctl -f
             dup2(pfd[1], 1); close(pfd[0]); close(pfd[1]);
             int nul = open("/dev/null", O_WRONLY); if (nul >= 0) { dup2(nul, 2); close(nul); }
             execlp("journalctl", "journalctl", "-k", "-f", "-n", "0", "-o", "cat", (char *) nullptr);
@@ -881,14 +883,24 @@ struct vk_sparse_mgr {
             return;
         }
         kmsg_pid = pid; kmsg_fd = pfd[0];
-        FILE * f = fdopen(pfd[0], "r");
-        char line[512];
-        while (f && fgets(line, sizeof line, f)) {
-            if (strstr(line, "Couldn't update BO_VA") || strstr(line, "Not enough memory for command submission")) {
-                kmsg_errors++;
+        // raw read(), not stdio: a FILE blocked in fgets() holds its lock, and exit()'s
+        // _IO_flush_all would then deadlock on it since this thread is never joined at exit
+        std::string acc;
+        char buf[512];
+        for (;;) {
+            ssize_t n = read(pfd[0], buf, sizeof buf);
+            if (n <= 0) { if (n < 0 && errno == EINTR) continue; break; }
+            acc.append(buf, (size_t) n);
+            size_t nl;
+            while ((nl = acc.find('\n')) != std::string::npos) {
+                std::string line = acc.substr(0, nl);
+                acc.erase(0, nl + 1);
+                if (line.find("Couldn't update BO_VA") != std::string::npos || line.find("Not enough memory for command submission") != std::string::npos) {
+                    kmsg_errors++;
+                }
             }
         }
-        if (f) fclose(f);
+        close(pfd[0]);
     }
 
     // Re-issue the binding of every resident slab. Called at a stall (GPU idle) after the
