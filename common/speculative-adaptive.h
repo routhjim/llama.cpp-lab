@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdlib>
 
 // Adaptive draft depth controller for MTP speculative decoding (draft-mtp-adaptive).
 //
@@ -46,11 +47,112 @@ struct common_speculative_adaptive {
         return std::max(depth * 5, 20);
     }
 
+    // ---- ROI mode (LLAMA_ADAPTIVE_ROI=1) ---------------------------------------------
+    // The streak/pressure machine above assumes the verify step costs the same at every
+    // depth, which holds on dense models. On a MoE at np>1 every draft position widens
+    // the verify batch and the union of routed experts, so a position only pays when the
+    // tokens it adds outweigh the step cost it adds. This mode tracks the unconditional
+    // acceptance rate of each draft position as an EMA and picks the depth maximising
+    // expected tokens per step cost, with step cost modelled as 1 + r*depth
+    // (LLAMA_ADAPTIVE_COST_RATIO, default 0.33 = Flash-Next XL at np=4 measured 1->2).
+    // A position that is not being drafted cannot be observed, so the controller probes
+    // depth+1 for ROI_PROBE_LEN steps every ROI_PROBE_PERIOD steps and keeps it only if
+    // it measured better. Dropping needs no probe: depth-1's positions are observed at
+    // depth. EMAs survive reset() (a slot's conversation stays alike); depth restarts at
+    // the best warm depth.
+    static constexpr int   ROI_MAX          = 16;
+    static constexpr float ROI_ALPHA        = 1.0f / 16.0f;
+    static constexpr int   ROI_WARMUP       = 16;
+    static constexpr int   ROI_PROBE_PERIOD = 96;
+    static constexpr int   ROI_PROBE_LEN    = 24;
+    static constexpr float ROI_HYST         = 0.05f;
+
+    float p_acc[ROI_MAX + 1] = {}; // EMA of P(draft position k accepted), k = 1..ROI_MAX
+    int   n_obs[ROI_MAX + 1] = {}; // observations of position k
+    int   steps_at_depth = 0;
+    int   probe_left     = 0;      // >0 while probing depth probe_base+1
+    int   probe_base     = 0;
+
+    static bool roi_mode() {
+        static const bool v = [] { const char * e = getenv("LLAMA_ADAPTIVE_ROI"); return e && atoi(e) != 0; }();
+        return v;
+    }
+    static float cost_ratio() {
+        static const float r = [] { const char * e = getenv("LLAMA_ADAPTIVE_COST_RATIO"); return e ? (float) atof(e) : 0.33f; }();
+        return r;
+    }
+
+    // expected accepted draft tokens per step at depth d (positions are a prefix, so
+    // the unconditional rates already carry the dependency on earlier positions)
+    float roi_expected(int d) const {
+        float e = 0.0f;
+        for (int k = 1; k <= std::min(d, ROI_MAX); ++k) { e += p_acc[k]; }
+        return e;
+    }
+    // tokens per unit step cost at depth d, counting the target's own token
+    float roi_rate(int d) const {
+        return (1.0f + roi_expected(d)) / (1.0f + cost_ratio() * (float) d);
+    }
+    bool roi_warm(int d) const {
+        return d >= 1 && d <= ROI_MAX && n_obs[d] >= ROI_WARMUP;
+    }
+
+    void roi_reset(int cap, int floor) {
+        int best = floor;
+        for (int d = floor + 1; d <= cap && d <= ROI_MAX; ++d) {
+            if (roi_warm(d) && roi_rate(d) > roi_rate(best) * (1.0f + ROI_HYST)) { best = d; }
+        }
+        n_cur          = std::min(best, cap);
+        steps_at_depth = 0;
+        probe_left     = 0;
+    }
+
+    void roi_update(int n_draft, int n_accepted, int cap, int floor) {
+        for (int k = 1; k <= std::min(n_draft, ROI_MAX); ++k) {
+            const float x = n_accepted >= k ? 1.0f : 0.0f;
+            p_acc[k] += ROI_ALPHA * (x - p_acc[k]);
+            n_obs[k]++;
+        }
+        steps_at_depth++;
+
+        if (probe_left > 0) {
+            if (--probe_left == 0) {
+                // keep the probed depth only if it measured better than where we came from
+                if (!(roi_rate(n_cur) > roi_rate(probe_base) * (1.0f + ROI_HYST))) {
+                    n_cur = probe_base;
+                }
+                steps_at_depth = 0;
+            }
+            return;
+        }
+
+        // drop: one shallower is observable right now and pays better
+        if (n_cur > floor && roi_warm(n_cur) && roi_rate(n_cur - 1) > roi_rate(n_cur) * (1.0f + ROI_HYST)) {
+            n_cur--;
+            steps_at_depth = 0;
+            return;
+        }
+
+        // climb: only by probing, since position n_cur+1 is unobserved
+        if (n_cur < cap && steps_at_depth >= ROI_PROBE_PERIOD) {
+            probe_base     = n_cur;
+            n_cur++;
+            probe_left     = ROI_PROBE_LEN;
+            steps_at_depth = 0;
+        }
+    }
+    // ---------------------------------------------------------------------------------
+
     // reset to the floor max(1, n_min_adaptive), bounded by the ceiling n_max;
     // the controller climbs from there once acceptance feedback arrives
     void reset(int n_max, int n_min_adaptive) {
         const int cap   = std::max(1, n_max);
         const int floor = std::max(1, n_min_adaptive);
+
+        if (roi_mode()) {
+            roi_reset(cap, floor);
+            return;
+        }
 
         n_cur   = std::min(floor, cap);
         n_climb = 0;
@@ -66,6 +168,11 @@ struct common_speculative_adaptive {
 
         const int cap   = std::max(1, n_max);
         const int floor = std::max(1, n_min_adaptive);
+
+        if (roi_mode()) {
+            roi_update(n_draft, n_accepted, cap, floor);
+            return;
+        }
 
         if (n_accepted == n_draft) {
             n_drop = 0;
