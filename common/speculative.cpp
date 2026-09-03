@@ -172,6 +172,9 @@ struct common_speculative_impl {
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
 
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
+    // exchange all per-sequence state between two sequence ids (see common_speculative_seq_swap)
+    virtual void seq_swap(llama_seq_id /*a*/, llama_seq_id /*b*/) {}
+
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
 };
@@ -424,6 +427,14 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 //      in verify mode, have process() only stash features and let draft() seed run
 //      encoder+decoder on n_accepted+1 rows).
 struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
+    void seq_swap(llama_seq_id a, llama_seq_id b) override {
+        if (!pending_g_last.empty()) { std::swap(pending_g_last[a], pending_g_last[b]); }
+        if (!pending_pos_last.empty()) { std::swap(pending_pos_last[a], pending_pos_last[b]); }
+        if (!verify_g.empty()) { std::swap(verify_g[a], verify_g[b]); }
+        if (!verify_pos_first.empty()) { std::swap(verify_pos_first[a], verify_pos_first[b]); }
+        if (!verify_g_rows.empty()) { std::swap(verify_g_rows[a], verify_g_rows[b]); }
+    }
+
     common_params_speculative_draft params;
     llama_batch batch;
 
@@ -908,6 +919,9 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
 // DFlash: block-diffusion drafting with a draft-side KV cache injection
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+    void seq_swap(llama_seq_id a, llama_seq_id b) override {
+    }
+
     common_params_speculative_draft params;
 
     llama_batch batch;        // noise tokens
@@ -1322,6 +1336,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 };
 
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+    void seq_swap(llama_seq_id a, llama_seq_id b) override {
+        if (!pending_h.empty()) { std::swap(pending_h[a], pending_h[b]); }
+        if (!i_batch_beg.empty()) { std::swap(i_batch_beg[a], i_batch_beg[b]); }
+        if (!i_batch_end.empty()) { std::swap(i_batch_end[a], i_batch_end[b]); }
+        if (!verify_h.empty()) { std::swap(verify_h[a], verify_h[b]); }
+        if (!verify_h_rows.empty()) { std::swap(verify_h_rows[a], verify_h_rows[b]); }
+        if (!i_last.empty()) { std::swap(i_last[a], i_last[b]); }
+        if (!chain_h.empty()) { std::swap(chain_h[a], chain_h[b]); }
+    }
+
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
     llama_batch batch;
@@ -1807,6 +1831,10 @@ struct common_speculative_impl_ngram_simple : public common_speculative_impl {
 };
 
 struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
+    void seq_swap(llama_seq_id a, llama_seq_id b) override {
+        if (!config.empty()) { std::swap(config[a], config[b]); }
+    }
+
     // n_seq configs
     std::vector<common_ngram_map> config;
 
@@ -1861,6 +1889,10 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
 };
 
 struct common_speculative_impl_ngram_mod : public common_speculative_impl {
+    void seq_swap(llama_seq_id a, llama_seq_id b) override {
+        if (!sinfos.empty()) { std::swap(sinfos[a], sinfos[b]); }
+    }
+
     common_params_speculative_ngram_mod params;
 
     // shared across all sequences
@@ -2036,6 +2068,10 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 };
 
 struct common_speculative_impl_ngram_cache : public common_speculative_impl {
+    void seq_swap(llama_seq_id a, llama_seq_id b) override {
+        if (!sinfos.empty()) { std::swap(sinfos[a], sinfos[b]); }
+    }
+
     common_params_speculative_ngram_cache params;
 
     uint16_t n_draft;
@@ -2913,6 +2949,19 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
 }
 
 // TODO: support the case of more than one speculative implementations having a state
+void common_speculative_seq_swap(common_speculative * spec, llama_seq_id a, llama_seq_id b) {
+    if (spec == nullptr || a == b) {
+        return;
+    }
+
+    std::swap(spec->dparams[a],   spec->dparams[b]);
+    std::swap(spec->impl_last[a], spec->impl_last[b]);
+
+    for (auto & impl : spec->impls) {
+        impl->seq_swap(a, b);
+    }
+}
+
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data) {
     if (spec == nullptr) {
         return false;
