@@ -1146,6 +1146,7 @@ struct vk_device_struct {
     std::map<vk_fa_pipeline_state, vk_pipeline> pipeline_flash_attn_f32_f16;
 
     std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_mask_opt;
+    std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_kv_max;
 
     vk_pipeline pipeline_flash_attn_split_k_reduce;
     vk_pipeline pipeline_count_experts;
@@ -2125,6 +2126,17 @@ struct vk_op_flash_attn_mask_opt_push_constants {
     uint32_t nbd3;
 };
 
+struct vk_op_flash_attn_kv_max_push_constants {
+    uint32_t nem0;
+    uint32_t nem1;
+    uint32_t nem2;
+    uint32_t nbm1;
+    uint32_t nbm2;
+    uint32_t nbm3;
+    uint32_t nbd1;
+    uint32_t nbd2;
+};
+
 // Allow pre-recording command buffers
 struct vk_staging_memcpy {
     vk_staging_memcpy(void * _dst, const void * _src, size_t _n) : dst(_dst), src(_src), n(_n) {}
@@ -2333,6 +2345,22 @@ class vk_perf_logger {
         }
         if (node->op == GGML_OP_UNARY) {
             return fusion_str + ggml_unary_op_name(ggml_get_unary_op(node));
+        }
+        if (getenv("GGML_VK_PERF_LOGGER_SHAPES") != nullptr &&
+            node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID && node->op != GGML_OP_FLASH_ATTN_EXT) {
+            std::string name = fusion_str + ggml_op_name(node->op);
+            char buf[160];
+            snprintf(buf, sizeof(buf), " dst(%s %ld,%ld,%ld,%ld)", ggml_type_name(node->type), (long) node->ne[0], (long) node->ne[1], (long) node->ne[2], (long) node->ne[3]);
+            name += buf;
+            if (node->src[0]) {
+                snprintf(buf, sizeof(buf), " src0(%s %ld,%ld,%ld,%ld%s)", ggml_type_name(node->src[0]->type), (long) node->src[0]->ne[0], (long) node->src[0]->ne[1], (long) node->src[0]->ne[2], (long) node->src[0]->ne[3], ggml_is_contiguous(node->src[0]) ? "" : " strided");
+                name += buf;
+            }
+            if (node->src[1]) {
+                snprintf(buf, sizeof(buf), " src1(%s %ld,%ld,%ld,%ld)", ggml_type_name(node->src[1]->type), (long) node->src[1]->ne[0], (long) node->src[1]->ne[1], (long) node->src[1]->ne[2], (long) node->src[1]->ne[3]);
+                name += buf;
+            }
+            return name;
         }
         if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
             const uint64_t m     = node->ne[0];
@@ -3986,14 +4014,15 @@ static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_
 }
 
 static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool aligned, bool f32acc,
-                                                  bool use_mask, bool use_mask_opt, bool use_logit_softcap, ggml_type k_type, ggml_type v_type) {
+                                                  bool use_mask, bool use_mask_opt, bool use_logit_softcap, ggml_type k_type, ggml_type v_type, bool use_kv_max) {
     const bool old_amd_windows = device->vendor_id == VK_VENDOR_ID_AMD && device->driver_id == vk::DriverId::eAmdProprietary &&
                                  (device->architecture == AMD_GCN || device->architecture == AMD_RDNA1 || device->architecture == AMD_RDNA2);
 
     uint32_t flags = (use_mask_opt      ? 1 : 0) |
                      (use_mask          ? 2 : 0) |
                      (use_logit_softcap ? 4 : 0) |
-                     (old_amd_windows   ? 8 : 0);
+                     (old_amd_windows   ? 8 : 0) |
+                     (use_kv_max        ? 16 : 0);
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
@@ -4615,8 +4644,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             }
             name = aligned ? "flash_attn_f32_f16_aligned" : "flash_attn_f32_f16";
         }
-        ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 7,
-                                sizeof(vk_flash_attn_push_constants), {Br, 1, 1},
+        ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 8, sizeof(vk_flash_attn_push_constants), {Br, 1, 1},
                                 get_fa_spec_constants(fa.first), aligned ? Bc : 1, true,
                                 !fa_ds, !fa_ds ? fa_sgs : 0);
     }
@@ -4651,8 +4679,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 else        { spv_data = flash_attn_f32_f16_f16acc_cm1_data; spv_size = flash_attn_f32_f16_f16acc_cm1_len; }
                 name = aligned ? "flash_attn_f32_f16_aligned_cm1" : "flash_attn_f32_f16_cm1";
             }
-            ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 7,
-                                    sizeof(vk_flash_attn_push_constants), {Br, 1, 1},
+            ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 8, sizeof(vk_flash_attn_push_constants), {Br, 1, 1},
                                     get_fa_spec_constants(fa.first), aligned ? Bc : 1, true,
                                     !fa_ds, !fa_ds ? fa_sgs : 0);
         }
@@ -4688,8 +4715,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 if (f32acc) { spv_data = flash_attn_f32_f16_cm2_data;        spv_size = flash_attn_f32_f16_cm2_len;        name = "flash_attn_f32_f16_f32acc_cm2"; }
                 else        { spv_data = flash_attn_f32_f16_f16acc_cm2_data; spv_size = flash_attn_f32_f16_f16acc_cm2_len; name = "flash_attn_f32_f16_f16acc_cm2"; }
             }
-            ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 7,
-                                    sizeof(vk_flash_attn_push_constants), {Br, 1, 1},
+            ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 8, sizeof(vk_flash_attn_push_constants), {Br, 1, 1},
                                     get_fa_spec_constants(fa.first), aligned ? Bc : 1, true, false, 0);
         }
     }
@@ -5594,6 +5620,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     for (auto &it : device->pipeline_fa_mask_opt) {
         auto BrBc = it.first;
         ggml_vk_create_pipeline(device, it.second, "fa_mask_opt", fa_mask_opt_len, fa_mask_opt_data, "main", 2, sizeof(vk_op_flash_attn_mask_opt_push_constants), {1, 1, 1}, {128, 128 / device->subgroup_size, BrBc.first, BrBc.second}, 1, true, true, device->subgroup_size);
+    }
+
+    for (auto &it : device->pipeline_fa_kv_max) {
+        auto BrBc = it.first;
+        ggml_vk_create_pipeline(device, it.second, "fa_kv_max", fa_kv_max_len, fa_kv_max_data, "main", 2, sizeof(vk_op_flash_attn_kv_max_push_constants), {1, 1, 1}, {128, 128 / device->subgroup_size, BrBc.first, BrBc.second}, 1, true, true, device->subgroup_size);
     }
 
     if (device->subgroup_clustered && device->subgroup_require_full_support) {
@@ -10820,6 +10851,21 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
 // costs. On an integrated GPU with a very sparse MoE the GEMV path stays ahead well past
 // 8; on a discrete GPU with several times the bandwidth the crossover is lower and 8 may
 // be correct. Hence a knob rather than a new constant.
+// Per-stream KV bound for flash attention (see flash_attn_kv_max.comp). GGML_VK_FA_KV_MAX=0 disables.
+static bool ggml_vk_fa_kv_max_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char * e = getenv("GGML_VK_FA_KV_MAX");
+        // opt-in for now: the pre-pass + barrier per FA op costs ~0.8 ms/layer on RADV, which
+        // outweighs the bound's gain on models whose attention is a small share of the step
+        v = (e != nullptr && atoi(e) != 0) ? 1 : 0;
+        if (e != nullptr) {
+            GGML_LOG_INFO("%s: GGML_VK_FA_KV_MAX = %d\n", __func__, v);
+        }
+    }
+    return v != 0;
+}
+
 static uint32_t ggml_vk_mmvid_max() {
     static uint32_t v = 0;
     if (v == 0) {
@@ -11107,8 +11153,13 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     // Only use mask opt when the mask is fairly large. This hasn't been tuned extensively.
     bool use_mask_opt = mask && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
+    // Per-stream KV bound: in a batched decode (nem3 > 1) each stream's mask row is -inf past
+    // that stream's own KV length, so a pre-pass finds the last finite block per (plane, row
+    // tile) and the FA shaders stop there instead of at the batch-wide KV. Also worth it on
+    // multi-row causal masks, where early row tiles have long -inf tails.
+    const bool use_kv_max = mask && ggml_vk_fa_kv_max_enabled() && (nem3 > 1 || nem1 >= 32);
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
-                                                                   mask != nullptr, use_mask_opt, logit_softcap != 0, k_type_eff, v_type_eff);
+                                                                   mask != nullptr, use_mask_opt, logit_softcap != 0, k_type_eff, v_type_eff, use_kv_max);
 
     vk_pipeline pipeline = nullptr;
 
@@ -11175,6 +11226,12 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     const uint32_t mask_opt_num_dwords = CEIL_DIV(nem0, 16 * Bc);
     const uint64_t mask_opt_size = sizeof(uint32_t) * mask_opt_num_dwords * CEIL_DIV(nem1, Br) * nem2 * nem3;
 
+    // kv_max scratch lives in prealloc_y after the mask_opt bitmap (when both are live)
+    const uint32_t kv_max_num    = CEIL_DIV(nem1, Br) * nem2 * nem3;
+    const uint64_t kv_max_offset = use_mask_opt ? ROUNDUP_POW2(mask_opt_size, 16) : 0;
+    const uint64_t kv_max_size   = use_kv_max ? sizeof(uint32_t) * kv_max_num : 0;
+    const uint64_t prealloc_y_size = std::max<uint64_t>(use_mask_opt ? mask_opt_size : 0, kv_max_offset + kv_max_size);
+
     vk_pipeline pipeline_fa_mask_opt = nullptr;
     if (use_mask_opt) {
         {
@@ -11189,9 +11246,27 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         }
         assert(pipeline_fa_mask_opt);
         ggml_pipeline_request_descriptor_sets(ctx, pipeline_fa_mask_opt, 1);
+    }
 
-        if (ctx->prealloc_size_y < mask_opt_size) {
-            ctx->prealloc_size_y = mask_opt_size;
+    vk_pipeline pipeline_fa_kv_max = nullptr;
+    if (use_kv_max) {
+        {
+            std::lock_guard<std::mutex> guard(ctx->device->compile_mutex);
+            auto &pipelines = ctx->device->pipeline_fa_kv_max;
+            auto it = pipelines.find({Br, Bc});
+            if (it != pipelines.end()) {
+                pipeline_fa_kv_max = it->second;
+            } else {
+                pipelines[{Br, Bc}] = pipeline_fa_kv_max = std::make_shared<vk_pipeline_struct>();
+            }
+        }
+        assert(pipeline_fa_kv_max);
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline_fa_kv_max, 1);
+    }
+
+    if (use_mask_opt || use_kv_max) {
+        if (ctx->prealloc_size_y < prealloc_y_size) {
+            ctx->prealloc_size_y = prealloc_y_size;
             ggml_vk_preallocate_buffers(ctx, subctx);
         }
         if (ctx->prealloc_y_need_sync) {
@@ -11211,6 +11286,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     vk_subbuffer mask_buf = mask ? ggml_vk_tensor_subbuffer(ctx, mask) : q_buf;
     vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
     vk_subbuffer mask_opt_buf = use_mask_opt ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
+    vk_subbuffer kv_max_buf   = use_kv_max   ? vk_subbuffer{ctx->prealloc_y, kv_max_offset, kv_max_size} : q_buf;
 
     if (use_dequant_kv) {
         const uint64_t fp = sizeof(ggml_fp16_t);
@@ -11259,6 +11335,27 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_fa_mask_opt,
                                   { mask_buf, mask_opt_buf }, opt_pc,
                                   { mask_opt_num_dwords, CEIL_DIV(nem1, Br), nem2 * nem3 });
+    }
+
+    if (use_kv_max)
+    {
+        const vk_op_flash_attn_kv_max_push_constants kv_pc = {
+            nem0,
+            nem1,
+            nem2,
+            (uint32_t)(mask->nb[1] / sizeof(ggml_fp16_t)),
+            (uint32_t)(mask->nb[2] / sizeof(ggml_fp16_t)),
+            (uint32_t)(mask->nb[3] / sizeof(ggml_fp16_t)),
+            CEIL_DIV(nem1, Br),
+            CEIL_DIV(nem1, Br) * nem2,
+        };
+
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_fa_kv_max,
+                                  { mask_buf, kv_max_buf }, kv_pc,
+                                  { CEIL_DIV(nem1, Br), nem2 * nem3, 1 });
+    }
+
+    if (use_mask_opt || use_kv_max) {
         ggml_vk_sync_buffers(ctx, subctx);
     }
 
@@ -11294,7 +11391,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
 
         vk_subbuffer split_k_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-                                    {q_buf, k_buf, v_buf, mask_buf, sinks_buf, split_k_buf, mask_opt_buf},
+                                    {q_buf, k_buf, v_buf, mask_buf, sinks_buf, split_k_buf, mask_opt_buf, kv_max_buf},
                                     pc, { dispatch_x, workgroups_y, workgroups_z });
 
         ggml_vk_sync_buffers(ctx, subctx);
@@ -11309,12 +11406,15 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
             workgroups_x *= pipeline->wg_denoms[0];
         }
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-                                    {q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf, mask_opt_buf},
+                                    {q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf, mask_opt_buf, kv_max_buf},
                                     pc, { workgroups_x, workgroups_y, workgroups_z });
     }
 
     if (use_dequant_kv) {
         ctx->prealloc_x_need_sync = true;
+    }
+    if (use_mask_opt || use_kv_max) {
+        ctx->prealloc_y_need_sync = true;
     }
 }
 

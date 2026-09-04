@@ -1,0 +1,84 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_KHR_shader_subgroup_vote : enable
+
+// Per-(mask plane, Br-row tile) KV bound for flash attention: the number of Bc-wide
+// KV blocks, counted from the start, that contain at least one finite mask entry.
+// Blocks past the bound are all -inf for every row of the tile and contribute nothing
+// (exp(-inf) == 0), so the FA shaders can stop their KV loop there. In a batched
+// decode each plane is one sequence (ne3), so a short sequence no longer walks the
+// batch-wide KV length of its longest neighbour.
+//
+// One workgroup per (row tile, plane). Scans blocks from the end until a finite
+// value is found; most of the work is the -inf tail, which is what we want to skip.
+
+layout (constant_id = 0) const uint BLOCK_SIZE = 128;
+layout (constant_id = 1) const uint NUM_SUBGROUPS = 4;
+layout (constant_id = 2) const uint Br = 32;
+layout (constant_id = 3) const uint Bc = 32;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {float16_t data_a[];};
+layout (binding = 1) writeonly buffer D {uint data_d[];};
+
+layout (push_constant) uniform parameter {
+    uint nem0;
+    uint nem1;
+    uint nem2;
+    uint nbm1;
+    uint nbm2;
+    uint nbm3;
+    uint nbd1;
+    uint nbd2;
+};
+
+shared bool anysh[NUM_SUBGROUPS];
+
+// same finiteness test as the FA shaders' fully-masked block skip
+float NEG_FLT_MAX_OVER_2 = uintBitsToFloat(0xFEFFFFFF);
+
+void main() {
+    const uint tid = gl_LocalInvocationIndex;
+    const uint i1 = gl_WorkGroupID.x;          // Br-row tile
+    const uint i2 = gl_WorkGroupID.y % nem2;
+    const uint i3 = gl_WorkGroupID.y / nem2;   // stream
+    const uint base = i2 * nbm2 + i3 * nbm3;
+    const uint num_blocks = (nem0 + Bc - 1) / Bc;
+
+    uint result = 0;
+
+    [[dont_unroll]] for (uint jb = num_blocks; jb > 0; --jb) {
+        const uint j = jb - 1;
+        bool any_finite = false;
+        [[unroll]] for (uint idx = 0; idx < Br * Bc; idx += BLOCK_SIZE) {
+            if ((Br * Bc % BLOCK_SIZE) != 0 && idx + tid >= Br * Bc) {
+                continue;
+            }
+            const uint c = (idx + tid) % Bc + j * Bc;
+            const uint r = (idx + tid) / Bc + i1 * Br;
+            if (c < nem0 && r < nem1) {
+                any_finite = any_finite || (float(data_a[base + r * nbm1 + c]) > NEG_FLT_MAX_OVER_2);
+            }
+        }
+        any_finite = subgroupAny(any_finite);
+        if (gl_SubgroupInvocationID == 0) {
+            anysh[gl_SubgroupID] = any_finite;
+        }
+        barrier();
+        [[unroll]] for (uint s = 0; s < NUM_SUBGROUPS; ++s) {
+            any_finite = any_finite || anysh[s];
+        }
+        barrier();
+        if (any_finite) {
+            result = jb;
+            break;
+        }
+    }
+
+    if (tid == 0) {
+        data_d[i1 + i2 * nbd1 + i3 * nbd2] = result;
+    }
+}

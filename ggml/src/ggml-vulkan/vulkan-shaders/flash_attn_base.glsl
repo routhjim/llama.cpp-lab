@@ -24,6 +24,7 @@ const bool USE_MASK_OPT    = (Flags & 1) != 0;
 const bool MASK_ENABLE     = (Flags & 2) != 0;
 const bool LOGIT_SOFTCAP   = (Flags & 4) != 0;
 const bool OLD_AMD_WINDOWS = (Flags & 8) != 0;
+const bool USE_KV_MAX      = (Flags & 16) != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
@@ -81,6 +82,8 @@ layout (binding = 5) writeonly buffer O {D_TYPE data_o[];};
 layout (binding = 5) writeonly buffer OV4 {D_TYPEV4 data_ov4[];};
 
 layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
+// per-(mask plane, Br-row tile) KV bound in Bc blocks, see flash_attn_kv_max.comp
+layout (binding = 7) readonly buffer KVM {uint32_t data_kv_max[];};
 
 #define MASK_OPT_ALL_NEG_INF 1
 #define MASK_OPT_ALL_ZERO 2
@@ -208,6 +211,17 @@ void init_indices()
     // that prevents the compiler from folding the "&" through the select
     // and breaking the alignment detection.
     m_stride = (p.gqa_ratio > 1) ? (p.gqa_ratio >> 16) : KV;
+
+    // Per-stream KV bound: stop the KV loop at the last block with a finite mask
+    // entry for this (plane, row tile). With GQA folding every row is the same mask
+    // row gqa_iq1. A bound below start_j makes the loop empty, and the epilogue then
+    // writes the neutral partial (O = 0, L = 0, M = NEG_FLT_MAX_OVER_2) that the
+    // split_k reduce already tolerates.
+    if (USE_KV_MAX && MASK_ENABLE) {
+        const uint32_t row_tile = (p.gqa_ratio > 1) ? (gqa_iq1 / Br) : i;
+        const uint32_t plane    = (iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2);
+        end_j = min(end_j, data_kv_max[plane * CEIL_DIV(p.nem1, Br) + row_tile]);
+    }
 }
 
 // Bias applied to softmax to stay in fp16 range.
