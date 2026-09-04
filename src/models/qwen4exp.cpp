@@ -680,15 +680,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     ggml_tensor * members = ggml_get_rows(ctx0, k_all, inp->blk_cells);
     members = ggml_reshape_4d(ctx0, members, idx_dim, r, n_blocks, n_stream);
 
-    // mean over the block members; r is small, so summing slices beats a transpose plus sum_rows
-    ggml_tensor * pooled = nullptr;
-    for (int64_t i = 0; i < r; ++i) {
-        ggml_tensor * slice = ggml_cont(ctx0,
-                ggml_view_3d(ctx0, members, idx_dim, n_blocks, n_stream,
-                        members->nb[2], members->nb[3], i*members->nb[1]));
-        pooled = pooled ? ggml_add(ctx0, pooled, slice) : slice;
-    }
-    pooled = ggml_scale(ctx0, pooled, 1.0f/(float) r);
+    // mean over the r members of every block. A block's members are r consecutive rows of
+    // `members`, so this is 2D average pooling with a 1 x r kernel and stride over the row axis:
+    // one read of the gathered keys, one write of the pooled ones. The former r strided slice
+    // copies + adds were the most expensive op of a long-context decode step (14 ms/step at
+    // 30k KV x 3 streams; 8 ms as strided adds; a selection matmul was worse still on Vulkan).
+    ggml_tensor * pooled = ggml_pool_2d(ctx0, members, GGML_OP_POOL_AVG, 1, (int) r, 1, (int) r, 0, 0);
+    pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks, n_stream);
     cb(pooled, "indexer_k_pooled", il);
 
     // count blocks along ne1: rms_norm launches gridDim.y = ne2, capped at 65535, and 262144/4 = 65536

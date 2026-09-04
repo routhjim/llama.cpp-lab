@@ -2346,6 +2346,22 @@ class vk_perf_logger {
         if (node->op == GGML_OP_UNARY) {
             return fusion_str + ggml_unary_op_name(ggml_get_unary_op(node));
         }
+        if (getenv("GGML_VK_PERF_LOGGER_SHAPES") != nullptr &&
+            node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID && node->op != GGML_OP_FLASH_ATTN_EXT) {
+            std::string name = fusion_str + ggml_op_name(node->op);
+            char buf[160];
+            snprintf(buf, sizeof(buf), " dst(%s %ld,%ld,%ld,%ld)", ggml_type_name(node->type), (long) node->ne[0], (long) node->ne[1], (long) node->ne[2], (long) node->ne[3]);
+            name += buf;
+            if (node->src[0]) {
+                snprintf(buf, sizeof(buf), " src0(%s %ld,%ld,%ld,%ld%s)", ggml_type_name(node->src[0]->type), (long) node->src[0]->ne[0], (long) node->src[0]->ne[1], (long) node->src[0]->ne[2], (long) node->src[0]->ne[3], ggml_is_contiguous(node->src[0]) ? "" : " strided");
+                name += buf;
+            }
+            if (node->src[1]) {
+                snprintf(buf, sizeof(buf), " src1(%s %ld,%ld,%ld,%ld)", ggml_type_name(node->src[1]->type), (long) node->src[1]->ne[0], (long) node->src[1]->ne[1], (long) node->src[1]->ne[2], (long) node->src[1]->ne[3]);
+                name += buf;
+            }
+            return name;
+        }
         if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
             const uint64_t m     = node->ne[0];
             const uint64_t n     = node->ne[1];
@@ -10840,7 +10856,9 @@ static bool ggml_vk_fa_kv_max_enabled() {
     static int v = -1;
     if (v < 0) {
         const char * e = getenv("GGML_VK_FA_KV_MAX");
-        v = (e == nullptr || atoi(e) != 0) ? 1 : 0;
+        // opt-in for now: the pre-pass + barrier per FA op costs ~0.8 ms/layer on RADV, which
+        // outweighs the bound's gain on models whose attention is a small share of the step
+        v = (e != nullptr && atoi(e) != 0) ? 1 : 0;
         if (e != nullptr) {
             GGML_LOG_INFO("%s: GGML_VK_FA_KV_MAX = %d\n", __func__, v);
         }
