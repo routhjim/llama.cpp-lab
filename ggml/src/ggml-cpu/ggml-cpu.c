@@ -1539,6 +1539,13 @@ static struct {
     size_t   n_pf_bytes_dead;
     int32_t  prev_key;
     double   t_last;
+    // warm set: per-key touch counts, dumped at exit and replayed at startup so a fresh
+    // process does not have to re-discover the hot experts by faulting them in one by one.
+    uint32_t ref[EC_NKEY];
+    uint32_t warm[EC_NKEY];            // ranked keys read from GGML_EXPERT_CACHE_WARM
+    int      warm_n, warm_pending, last_layer;
+    const char * dump_path;
+    FILE   * stream;                   // GGML_EXPERT_CACHE_STREAM: raw per-call expert sets
 } ec;
 
 static size_t ec_slab_bytes(int layer) {
@@ -1608,6 +1615,50 @@ static void ec_admit(int32_t k, int via_trace) {
     ec.cur_bytes += need; ec.n_admit++;
 }
 
+// worker-thread only. Admit the persisted warm set COLDEST-FIRST: once the cap fills,
+// ec_admit evicts from the LRU tail, which is exactly the coldest entries just placed, so
+// the hottest keys are the ones left resident. Admitted as demand (via_trace 0) so the
+// warm set does not pollute the prefetch precision stat -- it is not a prediction.
+static void ec_warm_apply(void) {
+    ec.warm_pending = 0;
+    int admitted = 0;
+    for (int i = ec.warm_n - 1; i >= 0; i--) {
+        int32_t k = (int32_t) ec.warm[i];
+        if (k < 0 || k >= EC_NKEY) continue;
+        if (!ec.pk[k / EC_STRIDE].have) continue;   // pack never registered, skip
+        if (ec.slot[k].present) continue;
+        size_t before = ec.cur_bytes;
+        ec_admit(k, 0);
+        if (ec.cur_bytes > before) admitted++;
+    }
+    fprintf(stderr, "[expert-cache] warm: admitted %d of %d keys, resident %.1f/%.1f GiB\n",
+            admitted, ec.warm_n, ec.cur_bytes / 1073741824.0, ec.cap_bytes / 1073741824.0);
+}
+
+static int ec_ref_cmp(const void * a, const void * b) {
+    uint32_t ka = *(const uint32_t *) a, kb = *(const uint32_t *) b;
+    if (ec.ref[ka] != ec.ref[kb]) return ec.ref[ka] < ec.ref[kb] ? 1 : -1;   // descending
+    return ka < kb ? -1 : ka > kb;
+}
+
+// atexit handler. The worker thread is still running and owns ec.ref, so the counts read
+// here can be a few touches stale -- harmless, the file is advisory ranking only.
+static void ec_dump(void) {
+    if (ec.stream) { fflush(ec.stream); fclose(ec.stream); ec.stream = NULL; }
+    if (!ec.dump_path) return;
+    FILE * f = fopen(ec.dump_path, "w");
+    if (!f) { fprintf(stderr, "[expert-cache] warm dump: cannot open %s\n", ec.dump_path); return; }
+    static uint32_t ord[EC_NKEY];
+    int n = 0;
+    for (int i = 0; i < EC_NKEY; i++) if (ec.ref[i]) ord[n++] = (uint32_t) i;
+    qsort(ord, (size_t) n, sizeof(uint32_t), ec_ref_cmp);
+    fprintf(f, "# layer expert touches | GGML_EXPERT_CACHE_DUMP -> replay with GGML_EXPERT_CACHE_WARM\n");
+    for (int i = 0; i < n; i++)
+        fprintf(f, "%u %u %u\n", ord[i] / EC_STRIDE, ord[i] % EC_STRIDE, ec.ref[ord[i]]);
+    fclose(f);
+    fprintf(stderr, "[expert-cache] warm dump: %d keys -> %s\n", n, ec.dump_path);
+}
+
 static void ec_learn(int32_t a, int32_t b) {
     if (a < 0 || a >= EC_NKEY) return;
     ec_succ * row = ec.succ[a];
@@ -1626,6 +1677,15 @@ static void * ec_worker(void * arg) {
         uint32_t key = ec.ring[ec.q_tail % EC_QRING];
         ec.q_tail++;
         int32_t k = (int32_t) key;
+        if (ec.ref[k] != 0xFFFFFFFFu) ec.ref[k]++;
+        // Layers are walked in ascending order within one forward pass, so a layer index
+        // that goes DOWN means a new pass started and every pack has registered by now --
+        // the earliest point at which ec_admit can succeed for an arbitrary key.
+        if (ec.warm_pending) {
+            int wl = k / EC_STRIDE;
+            if (wl < ec.last_layer) ec_warm_apply();
+            ec.last_layer = wl;
+        }
         if (ec.slot[k].present) {
             ec.n_hit++;
             if (!ec.slot[k].used) {   // first touch decides who gets the credit
@@ -1637,8 +1697,17 @@ static void * ec_worker(void * arg) {
         if (ec.prev_key >= 0) ec_learn(ec.prev_key, k);
         if (ec.trace_k > 0) {
             ec_succ * row = ec.succ[k];
-            for (int i = 0; i < EC_SUCC && i < ec.trace_k; i++)
-                if (row[i].cnt) ec_admit((int32_t) row[i].key, 1);
+            // Top-trace_k by COUNT, not the first trace_k array slots. ec_learn inserts by
+            // replace-weakest, so the row is unordered and slot order carries no frequency
+            // information -- taking it as ranked prefetched arbitrary successors (measured
+            // 19.8% precision on glm5next). EC_SUCC is 4, so an insertion sort is free.
+            int idx[EC_SUCC], n = 0;
+            for (int i = 0; i < EC_SUCC; i++) if (row[i].cnt) idx[n++] = i;
+            for (int a = 1; a < n; a++)
+                for (int b = a; b > 0 && row[idx[b]].cnt > row[idx[b-1]].cnt; b--) {
+                    int t = idx[b]; idx[b] = idx[b-1]; idx[b-1] = t;
+                }
+            for (int a = 0; a < n && a < ec.trace_k; a++) ec_admit((int32_t) row[idx[a]].key, 1);
         }
         ec.prev_key = k;
         if (ec.stats) {
@@ -1690,6 +1759,41 @@ static void ec_init(void) {
     if (ec.cap_bytes == 0) return;
     ec.lru_head = ec.lru_tail = -1; ec.prev_key = -1;
     for (int i = 0; i < EC_NKEY; i++) { ec.slot[i].prev = ec.slot[i].next = -1; }
+    const char * sp = getenv("GGML_EXPERT_CACHE_STREAM");
+    if (sp) {
+        ec.stream = fopen(sp, "w");
+        if (ec.stream) {
+            setvbuf(ec.stream, NULL, _IOFBF, 1 << 20);
+            fprintf(ec.stream, "# layer e0 e1 ... : one line per MUL_MAT_ID(ffn_up) call.\n");
+            fprintf(ec.stream, "# layer index DECREASING marks a new forward pass.\n");
+        } else {
+            fprintf(stderr, "[expert-cache] stream: cannot open %s\n", sp);
+        }
+    }
+    ec.dump_path = getenv("GGML_EXPERT_CACHE_DUMP");
+    if (ec.dump_path) atexit(ec_dump);
+    ec.last_layer = -1;
+    const char * w = getenv("GGML_EXPERT_CACHE_WARM");
+    if (w) {
+        FILE * wf = fopen(w, "r");
+        if (!wf) {
+            fprintf(stderr, "[expert-cache] warm: cannot open %s\n", w);
+        } else {
+            const char * ns = getenv("GGML_EXPERT_CACHE_WARM_N");
+            int limit = ns ? atoi(ns) : EC_NKEY;
+            char line[128];
+            while (ec.warm_n < limit && ec.warm_n < EC_NKEY && fgets(line, sizeof line, wf)) {
+                unsigned L, E;
+                if (line[0] == '#') continue;
+                if (sscanf(line, "%u %u", &L, &E) != 2) continue;
+                if (L >= EC_MAX_LAYERS || E >= EC_STRIDE) continue;
+                ec.warm[ec.warm_n++] = L * EC_STRIDE + E;
+            }
+            fclose(wf);
+            ec.warm_pending = ec.warm_n > 0;
+            fprintf(stderr, "[expert-cache] warm: %d keys queued from %s\n", ec.warm_n, w);
+        }
+    }
     ec.enabled = 1;
     pthread_create(&ec.th, NULL, ec_worker, NULL);
     fprintf(stderr, "[expert-cache] enabled: %.1f GiB, trace-k %d\n", gib, ec.trace_k);
@@ -1727,6 +1831,34 @@ static inline void ec_note(int layer, int expert) {
 }
 #endif // __linux__
 // =================== end managed expert cache ===================
+
+
+#if defined(__linux__)
+// Decode and prefill want opposite things from the expert cache, so prefill opts out.
+//
+// Decode touches 8 of 288 experts per layer, so WHICH experts are resident matters and the
+// LRU is right. Prefill at ubatch >= ~256 touches essentially ALL of them -- a 100-token
+// prompt already reaches 94% of the pack -- so no subset is worth choosing. Running the LRU
+// there only churns: it mlocks a slab and munlocks it moments later to admit the next, and
+// munlock makes the page immediately reclaimable, destroying residency the page cache would
+// otherwise have kept. So during prefill the cache is frozen: what is pinned stays pinned.
+//
+// Prefetching was tried here and REMOVED. Four variants (per-slab slide, coalesced blocks,
+// layer-ahead madvise, mlock'd layer-ahead ring) all measured within run-to-run noise, for
+// three independent reasons: the reads are already at the theoretical minimum (measured
+// 109.46 GiB against 171.3 GiB of experts minus a 60 GiB cache = 111 predicted, i.e. nothing
+// is re-read); the drive is already at 85-100% of its ceiling for this access pattern
+// (2.87-2.96 GiB/s vs 2.59 random-QD1 / 3.45 large-block sequential); and each layer is
+// already read as three large sequential extents, because experts are contiguous within a
+// tensor and the loop below walks them in order. There is no idle bandwidth to fill and no
+// reordering left to do. The levers that DO work are ubatch size and cache size.
+static int mmid_freeze_prefill = -1;
+static void mmid_sched_init(void) {
+    if (mmid_freeze_prefill >= 0) return;
+    const char * f = getenv("GGML_MMID_FREEZE_PREFILL");
+    mmid_freeze_prefill = f ? atoi(f) : 1;   // on by default: churning the LRU here only hurts
+}
+#endif // __linux__
 
 static void ggml_compute_forward_mul_mat_id_one_chunk(
     struct ggml_tensor * dst,
@@ -1939,12 +2071,26 @@ static void ggml_compute_forward_mul_mat_id(
             strncmp(src0->name, "blk.", 4) == 0 && ec_name_eligible(src0->name)) {
             const int layer = atoi(src0->name + 4);
             ec_register(layer, src0->name, (const char *) src0->data, nb02);
-            for (int64_t i02 = 0; i02 < n_as; ++i02) {
-                if (matrix_row_counts[i02] > 0) {
-                    ec_note(layer, (int) i02);
+            // One line per layer per pass: keyed on the ffn_up node so gate/down do not
+            // triplicate it. Safe to do I/O here -- this whole block is under ith == 0.
+            const int streaming = ec.stream && strstr(src0->name, "ffn_up_") != NULL;
+            // A ubatch this wide selects essentially every expert, so this is prefill.
+            const int prefill    = ids->ne[1] >= 256;
+
+
+            if (!(prefill && mmid_freeze_prefill)) {
+                if (streaming) fprintf(ec.stream, "%d", layer);
+                for (int64_t i02 = 0; i02 < n_as; ++i02) {
+                    if (matrix_row_counts[i02] > 0) {
+                        ec_note(layer, (int) i02);
+                        if (streaming) fprintf(ec.stream, " %d", (int) i02);
+                    }
                 }
+                if (streaming) fputc('\n', ec.stream);
             }
         }
+
+        mmid_sched_init();
 #endif
     }
 

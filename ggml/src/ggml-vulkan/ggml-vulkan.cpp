@@ -20,6 +20,10 @@ DispatchLoaderDynamic & ggml_vk_default_dispatcher();
 #define VULKAN_HPP_DEFAULT_DISPATCHER ggml_vk_default_dispatcher()
 
 #include <vulkan/vulkan.hpp>
+#include <unordered_set>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 // Fallback definitions for VK_NV_cooperative_matrix_decode_vector in case the
 // installed Vulkan headers predate the extension.
@@ -277,6 +281,19 @@ typedef std::weak_ptr<vk_device_struct> vk_device_ref;
 
 struct vk_buffer_struct;
 typedef std::shared_ptr<vk_buffer_struct> vk_buffer;
+
+// GPU-resident MoE experts via sparse binding (ggml-vk-sparse.inc)
+struct vk_sparse_mgr;
+struct vk_sparse_buf;
+struct vk_device_struct;
+static void ggml_vk_sparse_init(std::shared_ptr<vk_device_struct> & device);
+static void ggml_vk_sparse_destroy(vk_device_struct * device);
+static void ggml_vk_sparse_buffer_destroyed(vk_buffer_struct * b);
+static bool ggml_vk_sparse_is_sparse_buffer(ggml_backend_buffer_t buffer);
+static void ggml_vk_sparse_begin_graph(vk_device_struct * device);
+static void ggml_vk_sparse_ensure(vk_device_struct * device, const ggml_tensor * t, const int32_t * ids, size_t n_ids, size_t n_tokens);
+static void ggml_vk_sparse_ensure_many(vk_device_struct * device, const ggml_tensor * const * ts, size_t n_t, const int32_t * ids, size_t n_ids, size_t n_tokens);
+static void ggml_vk_sparse_note_stall(vk_device_struct * device);
 typedef std::weak_ptr<vk_buffer_struct> vk_buffer_ref;
 
 struct ggml_backend_vk_buffer_type_context {
@@ -1164,6 +1181,11 @@ struct vk_device_struct {
 
     ggml_backend_buffer_type buffer_type;
 
+    // sparse expert residency (ggml-vk-sparse.inc); sparse == nullptr when unsupported
+    bool sparse_binding = false;
+    ggml_backend_buffer_type sparse_buffer_type;
+    vk_sparse_mgr * sparse = nullptr;
+
     bool disable_fusion;
     bool disable_host_visible_vidmem;
     bool allow_sysmem_fallback;
@@ -1173,6 +1195,8 @@ struct vk_device_struct {
 
     ~vk_device_struct() {
         VK_LOG_DEBUG("destroy device " << name);
+
+        ggml_vk_sparse_destroy(this);
 
         device.destroyFence(fence);
 
@@ -1279,12 +1303,17 @@ struct vk_buffer_struct {
 
     vk_device device;
 
+    vk_sparse_buf * sparse = nullptr;   // non-null: sparse buffer, physical pages managed by vk_sparse_mgr
+
     ~vk_buffer_struct() {
         if (size == 0) {
             return;
         }
         VK_LOG_DEBUG("~vk_buffer_struct(" << buffer << ", " << size << ")");
 
+        if (sparse) {
+            ggml_vk_sparse_buffer_destroyed(this);
+        }
         device->device.freeMemory(device_memory);
         device->device.destroyBuffer(buffer);
     }
@@ -2505,6 +2534,11 @@ struct ggml_backend_vk_context {
 
     vk_context_ref compute_ctx;
 
+    // expert ids already read back this graph, per ids tensor, and the weight tensors already
+    // ensured against them (sparse expert residency)
+    std::unordered_map<const ggml_tensor *, std::vector<int32_t>> sparse_ids;
+    std::unordered_set<const ggml_tensor *> sparse_done;
+
     vk_context_ref transfer_ctx;
     vk_semaphore transfer_semaphore;
     uint64_t transfer_semaphore_last_submitted {};
@@ -3532,10 +3566,33 @@ static void ggml_vk_queue_command_pools_cleanup(vk_device& device) {
     }
 }
 
+// GGML_VK_SKIP_MEMTYPES=a,b: never allocate from these memory type indices. On an APU with a
+// unified heap the real VRAM carve-out shows up as a normal device-local type; leaving it
+// empty keeps it for the GPU page tables (sparse bindings failed with BO_VA -12 when the
+// carve-out was full of evictable buffers).
+static bool ggml_vk_memtype_skipped(uint32_t i) {
+    static const uint64_t mask = [] {
+        uint64_t m = 0;
+        if (const char * e = getenv("GGML_VK_SKIP_MEMTYPES")) {
+            for (const char * p = e; *p; ) {
+                char * end; long v = strtol(p, &end, 10);
+                if (end == p) break;
+                if (v >= 0 && v < 64) m |= 1ull << v;
+                p = (*end == ',') ? end + 1 : end;
+            }
+        }
+        return m;
+    }();
+    return (mask >> i) & 1;
+}
+
 static std::vector<uint32_t> ggml_vk_find_memory_properties(const vk::PhysicalDeviceMemoryProperties* mem_props, vk::MemoryRequirements* mem_req, vk::MemoryPropertyFlags flags) {
     std::vector<uint32_t> indices;
 
     for (uint32_t i = 0; i < mem_props->memoryTypeCount; ++i) {
+        if (ggml_vk_memtype_skipped(i)) {
+            continue;
+        }
         vk::MemoryType memory_type = mem_props->memoryTypes[i];
         if ((mem_req->memoryTypeBits & ((uint64_t)1 << i)) &&
             (flags & memory_type.propertyFlags) == flags &&
@@ -3547,7 +3604,7 @@ static std::vector<uint32_t> ggml_vk_find_memory_properties(const vk::PhysicalDe
 }
 
 static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std::initializer_list<vk::MemoryPropertyFlags> & req_flags_list,
-                                       void *import_ptr = nullptr) {
+                                       void *import_ptr = nullptr, size_t import_offset = 0) {
     VK_LOG_DEBUG("ggml_vk_create_buffer(" << device->name << ", " << size << ", " << to_string(req_flags_list.begin()[0]) << ", " << to_string(req_flags_list.begin()[req_flags_list.size()-1]) << ")");
     if (size > device->max_buffer_size) {
         throw vk::OutOfDeviceMemoryError("Requested buffer size exceeds device buffer size limit");
@@ -3636,8 +3693,15 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
             import_info.handleType = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT;
             import_info.pHostPointer = import_ptr;
             import_info.setPNext(&mem_flags_info);
-            buf->device_memory = device->device.allocateMemory({ size, memory_type_idx, &import_info });
+            // VK_EXT_external_memory_host requires a page-aligned host pointer AND size, but
+            // the range ggml hands us starts at a GGUF tensor boundary (32-byte aligned) and
+            // has an arbitrary length. So we import the page-aligned SUPERSET and bind the
+            // buffer at import_offset into it, leaving the buffer's byte 0 on the real data.
+            const size_t align  = device->min_imported_host_pointer_alignment;
+            const size_t padded = (import_offset + size + align - 1) & ~(align - 1);
+            buf->device_memory = device->device.allocateMemory({ padded, memory_type_idx, &import_info });
         } catch (const vk::SystemError& e) {
+            GGML_LOG_WARN("ggml_vulkan: host pointer import failed (%s)\n", e.what());
         }
     } else {
         for (auto it = req_flags_list.begin(); it != req_flags_list.end(); it++) {
@@ -3681,14 +3745,20 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
     buf->ptr = nullptr;
 
     if (import_ptr) {
-        buf->ptr = import_ptr;
+        buf->ptr = (char *) import_ptr + import_offset;
     } else {
         if (buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
             buf->ptr = device->device.mapMemory(buf->device_memory, 0, VK_WHOLE_SIZE);
         }
     }
 
-    device->device.bindBufferMemory(buf->buffer, buf->device_memory, 0);
+    if (import_offset && (import_offset % mem_req.alignment) != 0) {
+        GGML_LOG_WARN("ggml_vulkan: host pointer import offset %zu is not a multiple of %zu\n", import_offset, (size_t) mem_req.alignment);
+        device->device.freeMemory(buf->device_memory);
+        device->device.destroyBuffer(buf->buffer);
+        return {};
+    }
+    device->device.bindBufferMemory(buf->buffer, buf->device_memory, import_offset);
 
     buf->device = device;
     buf->size = size;
@@ -6875,6 +6945,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
                             getenv("GGML_VK_DISABLE_MULTI_ADD") == nullptr;
 
         device->shader_int64 = device_features2.features.shaderInt64;
+        device->sparse_binding = device_features2.features.sparseBinding && device_features2.features.sparseResidencyBuffer;
         device->buffer_device_address = vk12_features.bufferDeviceAddress;
         device->vulkan_memory_model = vk12_features.vulkanMemoryModel;
 
@@ -7254,6 +7325,8 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->fence = device->device.createFence({});
 
         device->idx = idx;
+
+        ggml_vk_sparse_init(device);
 
         device->serialize_submissions = getenv("GGML_VK_SERIALIZE_SUBMISSIONS") != nullptr;
 
@@ -17800,6 +17873,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ctx->do_add_rms_partials = false;
     ctx->do_add_rms_partials_offset_calculation = false;
 
+    if (ctx->device->sparse) {
+        ctx->sparse_ids.clear();
+        ctx->sparse_done.clear();
+        ggml_vk_sparse_begin_graph(ctx->device.get());
+    }
+
     int last_node = cgraph->n_nodes - 1;
 
     // If the last op in the cgraph isn't backend GPU, the command buffer doesn't get closed properly
@@ -18151,6 +18230,76 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
                 ctx->fused_topk_moe_scale = false;
                 ctx->fused_topk_qsa = false;
+            }
+        }
+
+        // Sparse expert residency: a MUL_MAT_ID over a sparse buffer must not be recorded until
+        // every selected expert is bound, or the shader reads zeros. Flush and drain the GPU,
+        // read the ids back (once per ids tensor: gate/up/down share it), bind the misses.
+        if (ctx->device->sparse && cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID &&
+            ggml_vk_sparse_is_sparse_buffer(cgraph->nodes[i]->src[0]->buffer)) {
+            const ggml_tensor * ids = cgraph->nodes[i]->src[2];
+            auto it = ctx->sparse_ids.find(ids);
+            if (it == ctx->sparse_ids.end()) {
+                if (submitted_nodes > 0) {
+                    vk_context flush_ctx = ggml_vk_get_compute_ctx(ctx);
+                    ggml_vk_ctx_end(flush_ctx);
+                    flush_ctx->exit_tensor_idx = -1;
+                    ctx->compute_ctx.reset();
+                    ggml_vk_compute_forward(ctx, cgraph, cgraph->nodes[submit_node_idx], submit_node_idx, false);
+                    submit_after(submit_node_idx, i - 1);
+                    submit_node_idx = i;
+                }
+                if (ctx->submit_pending) {
+                    if (ctx->device->async_use_transfer_queue && ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value) {
+                        vk::TimelineSemaphoreSubmitInfo tl_info{ 1, &ctx->transfer_semaphore.value, 0, nullptr };
+                        vk::PipelineStageFlags stage = ctx->device->transfer_queue->stage_flags;
+                        vk::SubmitInfo si{ 1, &ctx->transfer_semaphore.s, &stage, 0, nullptr, 0, nullptr };
+                        si.setPNext(&tl_info);
+                        ctx->device->compute_queue->handle->submit({ si }, ctx->fence);
+                        ctx->transfer_semaphore_last_submitted = ctx->transfer_semaphore.value;
+                    } else {
+                        ctx->device->compute_queue->handle->submit({}, ctx->fence);
+                    }
+                    ggml_vk_wait_for_fence(ctx);
+                    ctx->submit_pending = false;
+                }
+                ggml_vk_sparse_note_stall(ctx->device.get());
+                // read the ids: [n_expert_used, n_tokens] i32, possibly a strided view
+                const size_t span = (ids->ne[1] - 1) * ids->nb[1] + ids->ne[0] * ids->nb[0];
+                std::vector<int32_t> vals(ids->ne[0] * ids->ne[1]);
+                if (ggml_backend_buffer_is_vk(ids->buffer)) {
+                    std::vector<uint8_t> raw(span);
+                    ggml_backend_vk_buffer_context * ids_ctx = (ggml_backend_vk_buffer_context *) ids->buffer->context;
+                    ggml_vk_buffer_read(ids_ctx->dev_buffer, vk_tensor_offset(ids) + ids->view_offs, raw.data(), span);
+                    for (int64_t r = 0; r < ids->ne[1]; r++) {
+                        for (int64_t c = 0; c < ids->ne[0]; c++) {
+                            vals[r * ids->ne[0] + c] = *(const int32_t *) (raw.data() + r * ids->nb[1] + c * ids->nb[0]);
+                        }
+                    }
+                } else {
+                    for (int64_t r = 0; r < ids->ne[1]; r++) {
+                        for (int64_t c = 0; c < ids->ne[0]; c++) {
+                            vals[r * ids->ne[0] + c] = *(const int32_t *) ((const uint8_t *) ids->data + r * ids->nb[1] + c * ids->nb[0]);
+                        }
+                    }
+                }
+                it = ctx->sparse_ids.emplace(ids, std::move(vals)).first;
+                // every MUL_MAT_ID that shares these ids (gate/up/down): one I/O wave for all
+                std::vector<const ggml_tensor *> ws;
+                for (int j = i; j < cgraph->n_nodes; j++) {
+                    const ggml_tensor * n = cgraph->nodes[j];
+                    if (n->op == GGML_OP_MUL_MAT_ID && n->src[2] == ids && ggml_vk_sparse_is_sparse_buffer(n->src[0]->buffer) &&
+                        std::find(ws.begin(), ws.end(), n->src[0]) == ws.end()) {
+                        ws.push_back(n->src[0]);
+                    }
+                }
+                ggml_vk_sparse_ensure_many(ctx->device.get(), ws.data(), ws.size(), it->second.data(), it->second.size(), (size_t) ids->ne[1]);
+                for (const ggml_tensor * w : ws) ctx->sparse_done.insert(w);
+            }
+            if (!ctx->sparse_done.count(cgraph->nodes[i]->src[0])) {
+                ggml_vk_sparse_ensure(ctx->device.get(), cgraph->nodes[i]->src[0], it->second.data(), it->second.size(), (size_t) ids->ne[1]);
+                ctx->sparse_done.insert(cgraph->nodes[i]->src[0]);
             }
         }
 
@@ -18850,12 +18999,20 @@ static void ggml_backend_vk_device_get_props(ggml_backend_dev_t dev, struct ggml
     props->type        = ggml_backend_vk_device_get_type(dev);
     props->device_id   = ctx->pci_bus_id.empty() ? nullptr : ctx->pci_bus_id.c_str();
     ggml_backend_vk_device_get_memory(dev, &props->memory_free, &props->memory_total);
+    // On a UMA integrated GPU host memory IS device memory, so the model's mmap can be
+    // imported (VK_EXT_external_memory_host) instead of copied: weights stay file-backed
+    // and reclaimable, and the GPU computes every expert with no CPU backend involved.
+    // That is the only way to run a model larger than RAM with the experts on the GPU.
+    // Off by default because the import is one VkDeviceMemory per mapping range, and a
+    // driver's maxMemoryAllocationSize / maxBufferSize may be far smaller than the model
+    // (RADV reports 4 GiB); raise them with GGML_VK_FORCE_MAX_{ALLOCATION,BUFFER}_SIZE.
+    static const bool host_ptr = getenv("GGML_VK_HOST_PTR") != nullptr && ctx->is_integrated_gpu;
     props->caps = {
         /* .async                 = */ true,
         /* .host_buffer           = */ true,
-        /* .buffer_from_host_ptr  = */ false,
+        /* .buffer_from_host_ptr  = */ host_ptr,
         /* .events                = */ true,
-        /* .mmap_support          = */ !ctx->is_integrated_gpu,
+        /* .mmap_support          = */ host_ptr || !ctx->is_integrated_gpu,
     };
 }
 
@@ -19606,18 +19763,15 @@ static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, si
     }
 
     uintptr_t uptr = reinterpret_cast<uintptr_t>(ptr);
-    if (uptr & (device->min_imported_host_pointer_alignment - 1)) {
-        return {};
-    }
-    if (size & (device->min_imported_host_pointer_alignment - 1)) {
-        return {};
-    }
+    const size_t hp_align = device->min_imported_host_pointer_alignment;
+    const size_t shift    = uptr & (hp_align - 1);
+    void * base           = (void *) (uptr - shift);
 
     const vk::MemoryPropertyFlags property_flags = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached;
 
     vk_buffer buf {};
     try {
-        buf = ggml_vk_create_buffer(device, size, { property_flags }, ptr);
+        buf = ggml_vk_create_buffer(device, size, { property_flags }, base, shift);
     } catch (vk::SystemError& e) {
         GGML_LOG_WARN("ggml_vulkan: Failed ggml_vk_create_buffer (%s)\n", e.what());
     }
@@ -19673,6 +19827,23 @@ static size_t ggml_backend_vk_reg_get_device_count(ggml_backend_reg_t reg) {
     return ggml_backend_vk_get_device_count();
 }
 
+#include "ggml-vk-sparse.inc"
+
+static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0) {
+        ggml_backend_dev_get_extra_bufts_t fct = ggml_backend_vk_device_get_extra_bufts;
+        return (void *) fct;
+    }
+    if (strcmp(name, "ggml_backend_sparse_set_source") == 0) {
+        return (void *) ggml_backend_vk_sparse_set_source;
+    }
+    if (strcmp(name, "ggml_backend_sparse_load_done") == 0) {
+        return (void *) ggml_backend_vk_sparse_load_done;
+    }
+    UNUSED(reg);
+    return nullptr;
+}
+
 static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg, size_t device) {
     static std::vector<ggml_backend_dev_t> devices;
 
@@ -19711,7 +19882,7 @@ static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_name         = */ ggml_backend_vk_reg_get_name,
     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
     /* .get_device       = */ ggml_backend_vk_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_vk_reg_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_vk_reg() {
