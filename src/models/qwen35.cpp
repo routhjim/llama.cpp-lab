@@ -453,7 +453,10 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
 
     // Final reshape: [head_dim, n_heads, n_tokens, n_seqs] -> [n_tokens, n_seqs, n_heads * head_dim]
-    ggml_tensor * final_output = ggml_reshape_3d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens, n_seqs);
+    // Flatten to 2-D before the output projection: a 3-D [dim, n_seq_tokens, n_seqs] input makes the Vulkan
+    // mat-vec take its batched (ne12 > 1) path, measured 9x slower per call (306 vs 34 us) at n_seqs = 2 on
+    // the RX 7900 XTX; ~11 ms/step, the whole np=2 penalty. The result is reshaped to 2-D below anyway.
+    ggml_tensor * final_output = ggml_reshape_2d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens * n_seqs);
     cb(final_output, "final_output", il);
 
     // Output projection
