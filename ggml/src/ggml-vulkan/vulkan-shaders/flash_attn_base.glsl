@@ -25,6 +25,7 @@ const bool MASK_ENABLE     = (Flags & 2) != 0;
 const bool LOGIT_SOFTCAP   = (Flags & 4) != 0;
 const bool OLD_AMD_WINDOWS = (Flags & 8) != 0;
 const bool USE_KV_MAX      = (Flags & 16) != 0;
+const bool USE_SPARSE      = (Flags & 32) != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
@@ -84,6 +85,9 @@ layout (binding = 5) writeonly buffer OV4 {D_TYPEV4 data_ov4[];};
 layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 // per-(mask plane, Br-row tile) KV bound in Bc blocks, see flash_attn_kv_max.comp
 layout (binding = 7) readonly buffer KVM {uint32_t data_kv_max[];};
+// sparse index lists (flash_attn_sparse_idx.comp): data_idx[0] = list length, then one list of
+// that many int32 KV row indices (-1 padded) per (mask plane, mask row)
+layout (binding = 8) readonly buffer IDX {int data_idx[];};
 
 #define MASK_OPT_ALL_NEG_INF 1
 #define MASK_OPT_ALL_ZERO 2
@@ -149,6 +153,9 @@ uint32_t i, N, KV, split_k_index, Tr, start_j, end_j,
          gqa_iq1, iq2, iq3, rk2, rk3, rv2, rv3, ik2, ik3, iv2, iv3,
          q_stride, k_stride, v_stride, m_stride;
 
+// sparse: the KV loop walks the index list instead of the KV width
+uint32_t KVL, sparse_base;
+
 void init_indices()
 {
     N = p.N;
@@ -177,13 +184,24 @@ void init_indices()
 
     Tr = CEIL_DIV(N, Br);
 
-    start_j = split_k_index * p.split_kv / Bc;
-    end_j = CEIL_DIV(min(KV, (split_k_index + 1) * p.split_kv), Bc);
-
     // When not using grouped query attention, all rows share the same iq2, equal to gl_WorkGroupID.y.
     // When using grouped query attention, each workgroup does gqa_ratio consecutive values of iq2.
     iq2 = gl_WorkGroupID.y * p.gqa_ratio;
     iq3 = gl_WorkGroupID.z;
+
+    // Sparse: every row of the tile shares one mask row (Br == 1, or GQA folding), so the
+    // tile walks that row's index list. KV stays the mask width for mask addressing.
+    KVL = KV;
+    sparse_base = 0;
+    if (USE_SPARSE) {
+        KVL = uint32_t(data_idx[0]);
+        const uint32_t mask_row = (p.gqa_ratio > 1) ? gqa_iq1 : i * Br;
+        const uint32_t plane    = (iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2);
+        sparse_base = 1 + (plane * p.nem1 + mask_row) * KVL;
+    }
+
+    start_j = split_k_index * p.split_kv / Bc;
+    end_j = CEIL_DIV(min(KVL, (split_k_index + 1) * p.split_kv), Bc);
 
     // broadcast factors
     rk2 = p.neq2/p.nek2;
