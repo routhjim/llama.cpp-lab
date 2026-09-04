@@ -218,8 +218,12 @@ void main() {
                     uint32_t c = (idx + tid) % Bc;
                     uint32_t r = (idx + tid) / Bc;
                     if (idx + tid < Bc * Br) {
-                        if ((!KV_bounds_check || j * Bc + c < KV) && (!nem1_bounds_check || i * Br + r < p.nem1)) {
-                            FLOAT_TYPE m = FLOAT_TYPE(data_m[m_offset + (i * Br + r) * m_stride + (j * Bc + c)]);
+                        // sparse: the column is the listed KV row; a -1 pad is fully masked
+                        const int kcol = USE_SPARSE ? data_idx[sparse_base + j * Bc + c] : int(j * Bc + c);
+                        if (USE_SPARSE && kcol < 0) {
+                            masksh[c * masksh_stride + r] = FLOAT_TYPE(NEG_FLT_MAX_OVER_2);
+                        } else if ((!KV_bounds_check || j * Bc + c < KV) && (!nem1_bounds_check || i * Br + r < p.nem1)) {
+                            FLOAT_TYPE m = FLOAT_TYPE(data_m[m_offset + (i * Br + r) * m_stride + uint32_t(kcol)]);
                             masksh[c * masksh_stride + r] = m;
                             max_mask = max(max_mask, float(m));
                         } else {
@@ -258,14 +262,16 @@ void main() {
                 uint32_t c = (idx + tid) / (HSK / 4);
                 if (idx + gl_WorkGroupSize.x <= Bc * HSK / 4 || c < Bc) {
                     FLOAT_TYPEV4 K_Tf = FLOAT_TYPEV4(0);
-                    if (!KV_bounds_check || j * Bc + c < KV) {
+                    // sparse: gather the listed row; a -1 pad stages zeros (its mask is -huge)
+                    const int krow = USE_SPARSE ? data_idx[sparse_base + j * Bc + c] : int(j * Bc + c);
+                    if ((USE_SPARSE && krow >= 0) || (!USE_SPARSE && (!KV_bounds_check || j * Bc + c < KV))) {
                         if (USE_DECODE_K) {
-                            uint coord = (j * Bc + c) * k_stride * BLOCK_SIZE_K + 4 * d;
+                            uint coord = uint32_t(krow) * k_stride * BLOCK_SIZE_K + 4 * d;
                             uint ib = coord / BLOCK_SIZE_K;
                             uint iqs = (coord % BLOCK_SIZE_K);
                             K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
                         } else {
-                            K_Tf = FLOAT_TYPEV4(data_kv4[k_offset / 4 + (j * Bc + c) * k_stride / 4 + d]);
+                            K_Tf = FLOAT_TYPEV4(data_kv4[k_offset / 4 + uint32_t(krow) * k_stride / 4 + d]);
                         }
                     }
 
@@ -489,14 +495,15 @@ void main() {
                 uint32_t c = (idx + tid) / (HSV / 4);
                 if (idx + gl_WorkGroupSize.x <= Bc * HSV / 4 || c < Bc) {
                     FLOAT_TYPEV4 V_Tf = FLOAT_TYPEV4(0);
-                    if (!KV_bounds_check || j * Bc + c < KV) {
+                    const int vrow = USE_SPARSE ? data_idx[sparse_base + j * Bc + c] : int(j * Bc + c);
+                    if ((USE_SPARSE && vrow >= 0) || (!USE_SPARSE && (!KV_bounds_check || j * Bc + c < KV))) {
                         if (USE_DECODE_V) {
-                            uint coord = (j * Bc + c) * v_stride * BLOCK_SIZE_V + 4 * d;
+                            uint coord = uint32_t(vrow) * v_stride * BLOCK_SIZE_V + 4 * d;
                             uint ib = coord / BLOCK_SIZE_V;
                             uint iqs = (coord % BLOCK_SIZE_V);
                             V_Tf = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
                         } else {
-                            V_Tf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + (j * Bc + c) * v_stride / 4 + d]);
+                            V_Tf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + uint32_t(vrow) * v_stride / 4 + d]);
                         }
                     }
 

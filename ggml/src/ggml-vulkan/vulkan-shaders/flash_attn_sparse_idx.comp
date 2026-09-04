@@ -1,0 +1,93 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// Sparse flash attention index lists: for every (mask plane, mask row) compact the columns
+// whose mask value is finite into an ascending list of n_kv_max_padded int32 entries,
+// padded with -1. The FA shader then walks the list, gathering K/V rows and mask values
+// by index, instead of the full KV width. Writes data_d[0] = n_kv_max_padded so the FA
+// shader learns the list length without a push constant (its block is at the 128-byte limit).
+//
+// One workgroup per (row, plane): each thread counts the finite entries of a contiguous
+// slice, an exclusive scan gives the write base, a second pass writes. Order is preserved.
+
+layout (constant_id = 0) const uint BLOCK_SIZE = 256;
+layout (constant_id = 1) const uint NUM_SUBGROUPS = 4;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {float16_t data_a[];};
+layout (binding = 1) writeonly buffer D {int data_d[];};
+
+layout (push_constant) uniform parameter {
+    uint nem0;
+    uint nem1;
+    uint nem2;
+    uint nbm1;
+    uint nbm2;
+    uint nbm3;
+    uint n_kv_max;
+    uint n_kv_max_padded;
+};
+
+shared uint sg_sums[NUM_SUBGROUPS];
+
+// same finiteness test as the FA shaders
+float NEG_FLT_MAX_OVER_2 = uintBitsToFloat(0xFEFFFFFF);
+
+void main() {
+    const uint tid   = gl_LocalInvocationIndex;
+    const uint row   = gl_WorkGroupID.x;
+    const uint plane = gl_WorkGroupID.y;
+    const uint i2    = plane % nem2;
+    const uint i3    = plane / nem2;
+    const uint base_m   = i3 * nbm3 + i2 * nbm2 + row * nbm1;
+    const uint out_base = 1 + (plane * nem1 + row) * n_kv_max_padded;
+
+    const uint chunk = (nem0 + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const uint lo = tid * chunk;
+    const uint hi = min(lo + chunk, nem0);
+
+    uint cnt = 0;
+    [[dont_unroll]] for (uint c = lo; c < hi; ++c) {
+        if (float(data_a[base_m + c]) > NEG_FLT_MAX_OVER_2) {
+            cnt++;
+        }
+    }
+
+    const uint incl = subgroupInclusiveAdd(cnt);
+    if (gl_SubgroupInvocationID == gl_SubgroupSize - 1) {
+        sg_sums[gl_SubgroupID] = incl;
+    }
+    barrier();
+
+    uint prefix = 0;
+    uint total  = 0;
+    [[unroll]] for (uint s = 0; s < NUM_SUBGROUPS; ++s) {
+        if (s < gl_SubgroupID) {
+            prefix += sg_sums[s];
+        }
+        total += sg_sums[s];
+    }
+
+    uint k = prefix + incl - cnt;
+    [[dont_unroll]] for (uint c = lo; c < hi; ++c) {
+        if (float(data_a[base_m + c]) > NEG_FLT_MAX_OVER_2) {
+            if (k < n_kv_max) {
+                data_d[out_base + k] = int(c);
+            }
+            k++;
+        }
+    }
+
+    const uint count = min(total, n_kv_max);
+    for (uint i = count + tid; i < n_kv_max_padded; i += BLOCK_SIZE) {
+        data_d[out_base + i] = -1;
+    }
+
+    if (row == 0 && plane == 0 && tid == 0) {
+        data_d[0] = int(n_kv_max_padded);
+    }
+}
