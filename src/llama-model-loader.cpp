@@ -1598,6 +1598,28 @@ bool llama_model_loader::load_all_data(
             ggml_backend_name(upload_backend));
     }
 
+    // sparse expert buffers (ggml-vulkan) take a file source instead of a copy of the data
+    typedef bool (*sparse_set_source_t)(ggml_tensor *, int, size_t);
+    typedef void (*sparse_load_done_t)(ggml_backend_dev_t);
+    std::map<ggml_backend_reg_t, sparse_set_source_t> sparse_fns;
+    std::set<ggml_backend_dev_t> sparse_devs;
+    auto sparse_set_source = [&](ggml_tensor * t, int fd, size_t offs) {
+        ggml_backend_dev_t dev = t->buffer ? ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer)) : nullptr;
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (!reg) {
+            return false;
+        }
+        auto it = sparse_fns.find(reg);
+        if (it == sparse_fns.end()) {
+            it = sparse_fns.emplace(reg, (sparse_set_source_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_sparse_set_source")).first;
+        }
+        if (!it->second || !it->second(t, fd, offs)) {
+            return false;
+        }
+        sparse_devs.insert(dev);
+        return true;
+    };
+
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
@@ -1612,6 +1634,11 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+
+        if (sparse_set_source(cur, files.at(weight->idx)->file_id(), weight->offs)) {
+            size_done += n_size;
+            continue;
+        }
 
         const bool from_mapping = use_mmap || lazy.has(cur);
 
@@ -1750,6 +1777,12 @@ bool llama_model_loader::load_all_data(
 
     // check if this is the last call and do final cleanup
     if (size_done >= size_data) {
+        for (ggml_backend_dev_t dev : sparse_devs) {
+            auto fn = (sparse_load_done_t) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_sparse_load_done");
+            if (fn) {
+                fn(dev);
+            }
+        }
         // unmap offloaded tensors and metadata
         if (use_mmap) {
             for (uint32_t idx = 0; idx < mappings.size(); idx++) {
