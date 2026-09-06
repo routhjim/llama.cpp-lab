@@ -156,6 +156,10 @@ private: // disallow accessing these members directly, risking out-of-sync
     // map_idx_to_media will contain: {5, img0}, {8, img1}
 
 public:
+    // true if the prompt carries media chunks (images/audio); such prompts cannot be drafted
+    bool has_media() const { return !map_idx_to_media.empty(); }
+
+
     server_tokens() = default;
     ~server_tokens() = default;
 

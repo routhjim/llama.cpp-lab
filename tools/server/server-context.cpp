@@ -481,7 +481,10 @@ struct server_slot {
     }
 
     bool can_speculate() const {
-        return !!spec;
+        // a prompt carrying media (image/audio chunks) cannot go through the draft model: the drafter
+        // ingests the target's token stream and fails on the non-token positions ("failed to initialize
+        // batch" in the DFlash prompt injection). Serve such requests without speculation.
+        return !!spec && !prompt.tokens.has_media() && !(task && task->tokens.has_media());
     }
 
     void add_token(const completion_token_output & token) {
@@ -763,10 +766,10 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
         if (mbatch) {
             float * embd = mtmd_batch_get_output_embd(mbatch.get(), chunk.get());
             if (embd) {
-                void * cb_data = slot.spec;
+                void * cb_data = slot.can_speculate() ? slot.spec : nullptr;   // media prompts are not drafted
                 static auto cb = [](llama_batch batch, void * user_data) {
                     common_speculative * spec = static_cast<common_speculative *>(user_data);
-                    if (!common_speculative_process(spec, batch)) {
+                    if (spec && !common_speculative_process(spec, batch)) {
                         return 1;
                     }
                     return 0;
@@ -3965,7 +3968,12 @@ private:
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
-        if (spec) {
+        // media-bearing prompts are not drafted: keep their tokens out of the drafter entirely
+        bool spec_ok = !!spec;
+        for (auto & slot : slots) {
+            if (slot.is_processing() && slot.prompt.tokens.has_media()) { spec_ok = false; break; }
+        }
+        if (spec_ok) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch_view);
