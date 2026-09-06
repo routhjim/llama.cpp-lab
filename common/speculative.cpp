@@ -1,4 +1,5 @@
 #include "speculative.h"
+#include "speculative-adaptive.h"
 
 #include "common.h"
 #include "ggml.h"
@@ -36,6 +37,7 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"draft-eagle3",  COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3},
     {"draft-mtp",     COMMON_SPECULATIVE_TYPE_DRAFT_MTP},
     {"draft-dflash",  COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH},
+    {"draft-dflash-adaptive", COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH_ADAPTIVE},
     {"draft-dspark",  COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK},
     {"ngram-simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
     {"ngram-map-k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
@@ -946,6 +948,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // draft-dspark: the draft carries a Markov head and uses an anchor-first block layout
     const bool is_dspark;
 
+    // adaptive draft depth (draft-dflash-adaptive), see common_speculative_adaptive
+    const bool adaptive;
+    std::vector<int> n_last; // [n_seq] tokens drafted in the most recent draft() call
+    std::vector<common_speculative_adaptive> adaptive_ctrl; // [n_seq] per-seq depth controller
+
+    // depth by occupancy: LLAMA_DFLASH_DEPTH_BY_OCC="5,3,2,2" = draft depth when 1,2,3,4+ sequences draft in the
+    // same step (the last entry covers any higher count). The verify batch is n_active*(depth+1) rows, and the
+    // Vulkan mat-vec path holds up to GGML_VULKAN_MMV_MAX_COLS rows, so the best depth falls with occupancy:
+    // measured on the RX 7900 XTX (16 cols) n5 alone = 53/86 t/s, n3 paired = 78/95 agg, n2 at four = 96/113.
+    std::vector<int> occ_depth;
+
     // dspark speculators
     bool sample_from_anchor = true;
 
@@ -960,6 +973,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         : common_speculative_impl(type, n_seq, params.draft.n_max)
         , params(params.draft)
         , is_dspark(type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)
+        , adaptive(type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH_ADAPTIVE)
     {
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
@@ -1020,6 +1034,34 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             this->params.n_min = std::min(this->params.n_min, n_draft_max);
         }
         this->n_max = this->params.n_max;
+
+        n_last.assign(n_seq, 0);
+        if (const char * e = getenv("LLAMA_DFLASH_DEPTH_BY_OCC")) {
+            std::string v(e); size_t pos = 0;
+            while (pos < v.size()) {
+                size_t next = v.find(',', pos); if (next == std::string::npos) { next = v.size(); }
+                const int d = std::atoi(v.substr(pos, next - pos).c_str());
+                if (d >= 1) { occ_depth.push_back(std::min(d, this->params.n_max)); }
+                pos = next + 1;
+            }
+            if (!occ_depth.empty()) {
+                std::string tbl; for (int d : occ_depth) { tbl += std::to_string(d) + ","; } tbl.pop_back();
+                LOG_INF("%s: draft depth by occupancy enabled: [%s] (ceiling n_max=%d)\n", __func__, tbl.c_str(), this->params.n_max);
+            }
+        }
+        if (adaptive) {
+            if (this->params.n_min_adaptive < 1 || this->params.n_min_adaptive > this->params.n_max) {
+                GGML_ABORT("%s: invalid adaptive draft range: n_min_adaptive=%d, n_max=%d (n_min_adaptive must be in [1, n_max]; n_max is capped by the trained block size)",
+                        __func__, this->params.n_min_adaptive, this->params.n_max);
+            }
+            adaptive_ctrl.assign(n_seq, common_speculative_adaptive());
+            for (uint32_t s = 0; s < n_seq; ++s) {
+                adaptive_ctrl[s].reset(this->params.n_max, this->params.n_min_adaptive);
+            }
+            LOG_INF("%s: adaptive draft depth enabled: floor=%d ceiling=%d roi=%d cost_ratio=%.2f\n", __func__,
+                    this->params.n_min_adaptive, this->params.n_max,
+                    common_speculative_adaptive::roi_mode() ? 1 : 0, common_speculative_adaptive::cost_ratio());
+        }
 
         batch        = llama_batch_init(llama_n_batch(ctx_dft), 0,          n_seq);
         batch_inject = llama_batch_init(llama_n_ubatch(ctx_dft), n_embd_enc, n_seq);
@@ -1084,6 +1126,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        if (adaptive && seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
+            adaptive_ctrl[seq_id].reset(this->params.n_max, this->params.n_min_adaptive);
+        }
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
@@ -1197,6 +1242,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         std::vector<int32_t> i_block_beg(n_seq, -1);
         std::vector<int32_t> n_block    (n_seq,  0);
 
+        int32_t n_active = 0;
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (dparams[seq_id].drafting) { n_active++; }
+        }
+        const int32_t occ = occ_depth.empty() ? 0 : occ_depth[std::min<size_t>(std::max(n_active, 1) - 1, occ_depth.size() - 1)];
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
             if (!dp.drafting) {
@@ -1207,7 +1258,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             const int32_t n = (int32_t) dp.n_past;
 
-            const int32_t n_draft = params.n_max;
+            // effective draft depth: adaptive controller (or the user n_max), clamped by the per-call bound
+            int32_t n_draft = occ > 0 ? occ : (adaptive ? adaptive_ctrl[seq_id].n_cur : params.n_max);
+            if (dp.n_max > 0 && dp.n_max < n_draft) {
+                n_draft = dp.n_max;
+            }
 
             const int32_t n_block_tokens = n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.n_tokens;
@@ -1265,7 +1320,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     result.push_back((llama_token) row[predecessor]);
                 }
 
-                if (result.size() < (size_t) params.n_min) {
+                n_last[seq_id] = (int32_t) result.size();
+                if (!adaptive && result.size() < (size_t) params.n_min) {
                     result.clear();
                 }
                 continue;
@@ -1324,14 +1380,25 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }
             }
 
-            if (result.size() < (size_t) params.n_min) {
+            n_last[seq_id] = (int32_t) result.size();
+            if (!adaptive && result.size() < (size_t) params.n_min) {
                 result.clear();
             }
         }
     }
 
-    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
-        // noop
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+        // feed the adaptive controller only when this implementation produced the accepted draft
+        if (adaptive && !is_other && seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
+            const int depth_before = adaptive_ctrl[seq_id].n_cur;
+            adaptive_ctrl[seq_id].update(n_last[seq_id], n_accepted, params.n_max, params.n_min_adaptive);
+            if (adaptive_ctrl[seq_id].n_cur != depth_before) {
+                const auto & c = adaptive_ctrl[seq_id];
+                SPC_INF("adaptive dflash depth seq %d: %d -> %d (n_draft=%d, n_accepted=%d%s, p1=%.2f p2=%.2f p3=%.2f)\n",
+                        (int) seq_id, depth_before, c.n_cur, n_last[seq_id], (int) n_accepted,
+                        c.probe_left > 0 ? ", probe" : "", c.p_acc[1], c.p_acc[2], c.p_acc[3]);
+            }
+        }
     }
 };
 
@@ -2280,6 +2347,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:  return "draft-eagle3";
         case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:     return "draft-mtp";
         case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:  return "draft-dflash";
+        case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH_ADAPTIVE: return "draft-dflash-adaptive";
         case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:  return "draft-dspark";
         case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return "ngram-simple";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:   return "ngram-map-k";
@@ -2371,6 +2439,7 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
             case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
+            case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH_ADAPTIVE:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
                 n_max = std::max(n_max, std::max(0, spec->draft.n_max));
                 break;
@@ -2529,7 +2598,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
     const bool has_block_draft = std::any_of(
         params.speculative.types.begin(), params.speculative.types.end(),
         [](common_speculative_type t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH_ADAPTIVE || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
     if (has_block_draft) {
         // per-seq output positions: DFlash decodes anchor + n_max masks (n_max + 1); DSpark n_max -> +1 covers both
@@ -2571,6 +2640,13 @@ common_speculative_init_result::common_speculative_init_result(
 
     // the draft context holds as many tokens per sequence as the target context
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
+
+    // optional smaller physical batch for the draft context: its compute buffers are sized by n_ubatch and the
+    // draft impls chunk their prompt injection by llama_n_ubatch(ctx_dft), so this only trades prompt-time
+    // draft throughput for VRAM (a DFlash drafter at -ub 2048 reserves ~2.7 GiB of compute buffer)
+    if (params.speculative.draft.n_ubatch > 0) {
+        cparams.n_ubatch = std::min<uint32_t>((uint32_t) params.speculative.draft.n_ubatch, cparams.n_batch);
+    }
 
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
     //       the extra memory for small models is likely negligible?
@@ -2652,7 +2728,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         };
 
         // when adding a new type - update here the logic above
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 11);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 12);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
@@ -2666,6 +2742,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP,    params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, params.draft.ctx_dft != nullptr);
+        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH_ADAPTIVE, params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, params.draft.ctx_dft != nullptr);
     }
 
@@ -2694,6 +2771,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
             case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK: {
                 impls.push_back(std::make_unique<common_speculative_impl_draft_dflash>(
                         config.params, n_seq, COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH_ADAPTIVE: {
+                impls.push_back(std::make_unique<common_speculative_impl_draft_dflash>(
+                        config.params, n_seq, COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH_ADAPTIVE));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE: {
