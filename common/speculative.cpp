@@ -1242,11 +1242,23 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         std::vector<int32_t> i_block_beg(n_seq, -1);
         std::vector<int32_t> n_block    (n_seq,  0);
 
+        // The DFlash graph requires every block in the batch to have the same size (build_dflash2_conv asserts
+        // n_tokens % n_blocks == 0), so one draft length is chosen for the whole step: the minimum over the
+        // drafting sequences of their depth (occupancy / adaptive / n_max) and their remaining-context bound.
         int32_t n_active = 0;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (dparams[seq_id].drafting) { n_active++; }
         }
         const int32_t occ = occ_depth.empty() ? 0 : occ_depth[std::min<size_t>(std::max(n_active, 1) - 1, occ_depth.size() - 1)];
+        int32_t n_draft_common = params.n_max;
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            const auto & dp = dparams[seq_id];
+            if (!dp.drafting) { continue; }
+            int32_t d = occ > 0 ? occ : (adaptive ? adaptive_ctrl[seq_id].n_cur : params.n_max);
+            if (dp.n_max > 0 && dp.n_max < d) { d = dp.n_max; }
+            n_draft_common = std::min(n_draft_common, d);
+        }
+        n_draft_common = std::max(n_draft_common, 1);
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
@@ -1258,11 +1270,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             const int32_t n = (int32_t) dp.n_past;
 
-            // effective draft depth: adaptive controller (or the user n_max), clamped by the per-call bound
-            int32_t n_draft = occ > 0 ? occ : (adaptive ? adaptive_ctrl[seq_id].n_cur : params.n_max);
-            if (dp.n_max > 0 && dp.n_max < n_draft) {
-                n_draft = dp.n_max;
-            }
+            const int32_t n_draft = n_draft_common;   // uniform block size across sequences (see above)
 
             const int32_t n_block_tokens = n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.n_tokens;
