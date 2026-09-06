@@ -596,10 +596,18 @@ struct server_prompt_data {
 
 struct server_prompt_cache_state {
     server_prompt prompt;
+
     server_prompt_data data;
 
+    // disk spill tier: when set, `data` is empty and the state lives in these files
+    std::string spill_main;
+    std::string spill_drft;
+    size_t      spill_size = 0;
+
+    bool spilled() const { return !spill_main.empty(); }
+
     size_t size() const {
-        size_t res = data.size();
+        size_t res = spilled() ? spill_size : data.size();
 
         for (const auto & ckpt : prompt.checkpoints) {
             res += ckpt.size();
@@ -610,10 +618,25 @@ struct server_prompt_cache_state {
 };
 
 struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
+    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, int32_t disk_limit_mib = 0, const std::string & disk_path = "") {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
+        this->disk_limit   = 1024ull*1024ull*(disk_limit_mib < 0 ? 0 : disk_limit_mib);
+        this->disk_path    = disk_path;
     }
+
+    // disk spill tier (0 = disabled): RAM evictions are written here instead of dropped
+    size_t      disk_limit = 0;
+    std::string disk_path;
+    uint64_t    spill_seq  = 0;
+
+    size_t ram_size()  const;   // bytes of states resident in RAM
+    size_t disk_size() const;   // bytes of states spilled to disk
+    bool   spill(server_prompt_cache_state & st);     // RAM -> disk
+    bool   unspill(server_prompt_cache_state & st);   // disk -> RAM
+    void   drop(std::list<server_prompt_cache_state>::iterator it);  // erase + delete files
+    void   evict_ram(size_t need);   // make `need` bytes of RAM room: spill (or drop) oldest resident entries
+    void   evict_disk();             // keep the disk tier under disk_limit
 
     std::list<server_prompt_cache_state> states;
 

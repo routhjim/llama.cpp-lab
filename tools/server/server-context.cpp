@@ -1373,7 +1373,14 @@ private:
             }
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            if (params_base.cache_disk_mib > 0 && params_base.cache_disk_path.empty()) {
+                SRV_WRN("%s", "--cache-disk set without --cache-disk-path, disk tier disabled\n");
+            }
+            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx,
+                    params_base.cache_disk_path.empty() ? 0 : params_base.cache_disk_mib, params_base.cache_disk_path);
+            if (params_base.cache_disk_mib > 0 && !params_base.cache_disk_path.empty()) {
+                SRV_INF("prompt cache disk tier: %d MiB at %s\n", params_base.cache_disk_mib, params_base.cache_disk_path.c_str());
+            }
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
