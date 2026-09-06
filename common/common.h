@@ -371,6 +371,7 @@ struct common_params_speculative_ngram_cache {
 };
 
 struct common_params_speculative {
+    bool coupled = false; // coupled sampling: drafter and target share one uniform per position (see --spec-coupled)
     std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
 
     double synth_len = -1.0;

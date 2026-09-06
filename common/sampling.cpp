@@ -1,5 +1,7 @@
 #include "sampling.h"
 
+#include <string>
+
 #include "common.h"
 #include "fit.h"
 #include "log.h"
@@ -166,6 +168,9 @@ struct common_sampler {
     }
 
     mutable int64_t t_total_us = 0;
+    // coupled sampling state for the next sample_and_accept_n (see common_sampler_set_coupled)
+    bool coupled = false; uint32_t coupled_seed = 0; llama_seq_id coupled_seq = 0; std::vector<llama_pos> coupled_pos;
+
 };
 
 std::string common_params_sampling::print() const {
@@ -681,8 +686,20 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     std::vector<llama_token> result;
     result.reserve(idxs.size());
 
+    // coupled sampling: hand the dist sampler the per-position uniform before each drafted position
+    struct llama_sampler * dist = nullptr;
+    if (gsmpl->coupled) {
+        const int n = llama_sampler_chain_n(gsmpl->chain);
+        for (int k = 0; k < n; ++k) {
+            auto * smp = llama_sampler_chain_get(gsmpl->chain, k);
+            if (std::string(llama_sampler_name(smp)) == "dist") { dist = smp; }
+        }
+    }
     size_t i = 0;
     for (; i < draft.size(); i++) {
+        if (dist && i < gsmpl->coupled_pos.size()) {
+            llama_sampler_dist_set_coupled(dist, gsmpl->coupled_seed, gsmpl->coupled_seq, gsmpl->coupled_pos[i]);
+        }
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
 
         common_sampler_accept(gsmpl, id, true);
@@ -694,6 +711,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
         }
     }
 
+    if (dist) { llama_sampler_dist_set_coupled(dist, 0, 0, -1); }
+    gsmpl->coupled = false; gsmpl->coupled_pos.clear();
+
     if (i == draft.size()) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
 
@@ -703,6 +723,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     }
 
     return result;
+}
+
+void common_sampler_set_coupled(struct common_sampler * gsmpl, uint32_t seed, llama_seq_id seq, const std::vector<llama_pos> & pos) {
+    gsmpl->coupled = true; gsmpl->coupled_seed = seed; gsmpl->coupled_seq = seq; gsmpl->coupled_pos = pos;
 }
 
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first) {

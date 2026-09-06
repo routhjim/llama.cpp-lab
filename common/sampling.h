@@ -90,6 +90,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
+// arm the next common_sampler_sample_and_accept_n() call to draw drafted position i with Gumbel-max coupled noise at pos[i];
+// cleared automatically afterwards
+void common_sampler_set_coupled(struct common_sampler * gsmpl, uint32_t seed, llama_seq_id seq, const std::vector<llama_pos> & pos);
+
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.
 bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl);
 

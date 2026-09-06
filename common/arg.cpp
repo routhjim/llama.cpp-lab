@@ -259,14 +259,6 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
         if (buft) {
             buft_list[ggml_backend_buft_name(buft)] = buft;
         }
-        // extra buffer types of the device (e.g. Vulkan0_Sparse)
-        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-        auto get_extra_bufts = reg ? (ggml_backend_dev_get_extra_bufts_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts") : nullptr;
-        if (get_extra_bufts) {
-            for (auto ** extra = get_extra_bufts(dev); extra && *extra; ++extra) {
-                buft_list[ggml_backend_buft_name(*extra)] = *extra;
-            }
-        }
     }
 
     for (const auto & override : string_split<std::string>(value, ',')) {
@@ -4206,6 +4198,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.n_ubatch = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_UBATCH"));
+    add_opt(common_arg(
+        {"--spec-coupled"},
+        "coupled sampling: the drafter and the target share one uniform per position (token-id-ordered CDF), so a "
+        "sampling target accepts a good draft instead of rejecting it on its own dice roll (default: off)",
+        [](common_params & params) {
+            params.speculative.coupled = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_COUPLED"));
     add_opt(common_arg(
         {"--spec-draft-n-min-adaptive"}, "N",
         string_format("floor of the adaptive draft depth range (draft-dflash-adaptive); the depth starts here and never drops below it (default: %d)", params.speculative.draft.n_min_adaptive),

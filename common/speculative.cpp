@@ -1313,8 +1313,43 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
                     const float * scores = row + selector_top_k + (size_t) predecessor * selector_top_k;
 
+                    if (dp.coupled) {
+                        // coupled draw: softmax(scores/temp) over the lattice candidates, top-k/top-p like the
+                        // target, then the shared uniform for this position over the CDF in token-id order
+                        const int K = selector_top_k;
+                        std::vector<std::pair<llama_token, float>> cand; cand.reserve(K);
+                        float mx = scores[0]; for (int k = 1; k < K; ++k) { mx = std::max(mx, scores[k]); }
+                        static const float tscale = [] { const char * e = getenv("LLAMA_COUPLED_DRAFT_TSCALE"); return e ? (float) atof(e) : 1.0f; }();
+                        const float t = (dp.temp > 0.0f ? dp.temp : 1.0f) * tscale;
+                        for (int k = 0; k < K; ++k) { cand.push_back({ (llama_token) row[k], std::exp((scores[k] - mx) / t) }); }
+                        std::sort(cand.begin(), cand.end(), [](const auto & a, const auto & b) { return a.second > b.second; });
+                        if (dp.top_k > 0 && (int) cand.size() > dp.top_k) { cand.resize(dp.top_k); }
+                        double sum = 0.0; for (auto & c : cand) { sum += c.second; }
+                        if (dp.top_p < 1.0f) {
+                            double acc = 0.0; size_t keep = cand.size();
+                            for (size_t k = 0; k < cand.size(); ++k) { acc += cand[k].second / sum; if (acc >= dp.top_p) { keep = k + 1; break; } }
+                            cand.resize(keep); sum = 0.0; for (auto & c : cand) { sum += c.second; }
+                        }
+                        // Gumbel-max with the shared per-(position, token) noise: exact sample from the drafter's
+                        // (truncated) distribution and the same rule the target applies when --spec-coupled
+                        llama_token pick = cand.front().first; double best = -1e300;
+                        for (auto & c : cand) {
+                            const double key = std::log((double) c.second / sum) + llama_sampler_coupled_noise(dp.seed, dp.seq, dp.n_past + i, c.first);
+                            if (key > best) { best = key; pick = c.first; }
+                        }
+                        predecessor = 0;
+                        for (int k = 0; k < K; ++k) { if ((llama_token) row[k] == pick) { predecessor = k; break; } }
+                        {
+                            // diagnostics: how often the coupled draw differs from the argmax pick
+                            static int n_draws = 0, n_diff = 0;
+                            const int amax = (int32_t) std::distance(scores, std::max_element(scores, scores + K));
+                            n_draws++; if (amax != predecessor) { n_diff++; }
+                            if (n_draws % 500 == 0) { SPC_INF("coupled draws: %d, differ from argmax: %d (%.1f%%), tscale %.2f\n", n_draws, n_diff, 100.0 * n_diff / n_draws, tscale); }
+                        }
+                    } else {
                     predecessor = (int32_t) std::distance(scores,
                             std::max_element(scores, scores + selector_top_k));
+                    }
                     if (params.p_min > 0.0f) {
                         // softmax(scores) at the argmax, i.e. 1 / sum(exp(s_k - s_max))
                         float sum = 0.0f;

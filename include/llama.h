@@ -1376,6 +1376,13 @@ extern "C" {
     /// seed == LLAMA_DEFAULT_SEED to use a random seed.
     LLAMA_API struct llama_sampler * llama_sampler_init_dist(uint32_t seed);
 
+    // coupled sampling (Gumbel-max with shared per-(position, token) noise): arm the NEXT draw of a dist sampler to
+    // pick argmax(log p_t + g_t) with g_t = llama_sampler_coupled_noise(seed, seq, pos, t). A drafter that applies the
+    // same rule to a similar distribution picks the same token, while the target's draw stays an exact sample.
+    // pos < 0 clears the arming. No-op on non-dist samplers.
+    LLAMA_API void  llama_sampler_dist_set_coupled(struct llama_sampler * smpl, uint32_t seed, int32_t seq, int32_t pos);
+    LLAMA_API float llama_sampler_coupled_noise(uint32_t seed, int32_t seq, int32_t pos, int32_t token);
+
     /// @details Top-K sampling described in academic paper "The Curious Case of Neural Text Degeneration" https://arxiv.org/abs/1904.09751
     /// Setting k <= 0 makes this a noop
     LLAMA_API struct llama_sampler * llama_sampler_init_top_k      (int32_t k);

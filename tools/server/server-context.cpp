@@ -3264,6 +3264,12 @@ private:
                             /* .n_max    = */ n_draft_max,
                             /* .n_past   = */ slot.prompt.n_tokens(),
                             /* .id_last  = */ slot.sampled,
+                            /* .coupled  = */ params_base.speculative.coupled,
+                            /* .seed     = */ common_sampler_get_seed(slot.smpl.get()),
+                            /* .seq      = */ slot.seq,
+                            /* .temp     = */ slot.task->params.sampling.temp,
+                            /* .top_k    = */ slot.task->params.sampling.top_k,
+                            /* .top_p    = */ slot.task->params.sampling.top_p,
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
                         };
@@ -4151,6 +4157,12 @@ private:
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
+                if (params_base.speculative.coupled) {
+                    // coupled sampling: the token predicted at batch index idx sits at position batch.pos[idx] + 1
+                    std::vector<llama_pos> pos; pos.reserve(n_draft);
+                    for (size_t k = 0; k < n_draft; ++k) { pos.push_back(batch.batch.pos[slot.spec_i_batch[k]] + 1); }
+                    common_sampler_set_coupled(slot.smpl.get(), common_sampler_get_seed(slot.smpl.get()), slot.seq, pos);
+                }
                 auto accepted = synth_probs.empty()
                     ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
                     : server_sample_and_accept_synth(
