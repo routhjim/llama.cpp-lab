@@ -64,6 +64,15 @@ struct common_speculative_draft_params {
     llama_pos   n_past;
     llama_token id_last;
 
+    // coupled sampling (filled by the server when --spec-coupled): the drafter draws each position with
+    // llama_sampler_coupled_noise(seed, seq, pos, token) Gumbel-max over its own distribution shaped by the target's sampling params
+    bool         coupled = false;
+    uint32_t     seed    = 0;
+    llama_seq_id seq     = 0;
+    float        temp    = 1.0f;
+    int32_t      top_k   = 0;
+    float        top_p   = 1.0f;
+
     // TODO: remove in the future by keeping track of the prompt from the _begin() call and the consecutive accept calls
     const llama_tokens * prompt;
 

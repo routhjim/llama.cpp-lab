@@ -1129,6 +1129,9 @@ struct llama_sampler_dist : public llama_sampler_backend {
     size_t n_backend_draws_generated;
     size_t n_backend_draws_committed;
 
+    // coupled sampling: one-shot Gumbel-max arming for the next CPU draw (cpl_pos < 0 = none)
+    uint32_t cpl_seed = 0; int32_t cpl_seq = 0; int32_t cpl_pos = -1;
+
     // inputs for the current sampling graph
     std::vector<ggml_tensor *> inp_uniforms;
 
@@ -1162,7 +1165,7 @@ static void llama_sampler_dist_apply(struct llama_sampler * smpl, llama_token_da
 
     if (cur_p->size == 1) {
         // keep the RNG state aligned with backend sampling, which draws once per output
-        dist(ctx->rng);
+        if (ctx->cpl_pos >= 0) { ctx->cpl_pos = -1; } else { dist(ctx->rng); }
         cur_p->data[0].p = 1.0f;
         return;
     }
@@ -1187,6 +1190,18 @@ static void llama_sampler_dist_apply(struct llama_sampler * smpl, llama_token_da
     // sample from the obtained probabilities and normalize the probs in a single pass
     // this is ~3x faster on Mac with full gpt-oss vocab than the version below
     //
+    if (ctx->cpl_pos >= 0) {
+        // coupled draw (Gumbel-max): argmax over log p_t + g_t with shared per-(pos, token) noise; exact sample from p
+        const uint32_t seed = ctx->cpl_seed; const int32_t seq = ctx->cpl_seq, pos = ctx->cpl_pos; ctx->cpl_pos = -1;
+        size_t sel = 0; double best = -1e300;
+        for (size_t i = 0; i < cur_p->size; ++i) {
+            const double key = std::log((double) cur_p->data[i].p) + llama_sampler_coupled_noise(seed, seq, pos, cur_p->data[i].id);
+            if (key > best) { best = key; sel = i; }
+        }
+        for (size_t i = 0; i < cur_p->size; ++i) { cur_p->data[i].p /= sum_cum; }
+        cur_p->selected = sel;
+        return;
+    }
     const double rnd = dist(ctx->rng);
 
           double sum_run = 0.0f;
@@ -1412,6 +1427,25 @@ struct llama_sampler * llama_sampler_init_dist(uint32_t seed) {
             /* .inp_uniforms              = */ {},
         }
     );
+}
+
+void llama_sampler_dist_set_coupled(struct llama_sampler * smpl, uint32_t seed, int32_t seq, int32_t pos) {
+    if (!smpl || !smpl->iface || smpl->iface->name != llama_sampler_dist_name) {
+        return;
+    }
+    auto * ctx = (llama_sampler_dist *) smpl->ctx;
+    ctx->cpl_seed = seed; ctx->cpl_seq = seq; ctx->cpl_pos = pos;
+}
+
+float llama_sampler_coupled_noise(uint32_t seed, int32_t seq, int32_t pos, int32_t token) {
+    // splitmix64 over (seed, seq, pos, token) -> uniform -> Gumbel(0,1) = -log(-log(u))
+    uint64_t z = ((uint64_t) seed << 32) ^ ((uint64_t) (uint32_t) seq << 40) ^ ((uint64_t) (uint32_t) pos << 20) ^ (uint64_t) (uint32_t) token;
+    z += 0x9E3779B97F4A7C15ull;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    z ^= z >> 31;
+    const double u = ((z >> 11) + 0.5) * (1.0 / 9007199254740992.0);
+    return (float) (-std::log(-std::log(u)));
 }
 
 void llama_sampler_backend_begin(llama_sampler * sampler) {
