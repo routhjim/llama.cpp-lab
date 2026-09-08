@@ -1190,6 +1190,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
 
+            // Drop any draft-region KV at or beyond the first position we are about to write.
+            // The draft pass writes speculative cells at [n_past, n_past + n_draft]; the target
+            // then accepts a prefix of them, so everything past the accepted prefix is stale.
+            // Nothing removed it, which is harmless only while n_draft never changes (the next
+            // draft rewrites the same cells). As soon as the depth shrinks -- adaptive/ROI
+            // depth, the occupancy table, or a remaining-context clamp -- the tail of the
+            // deeper draft outlives it and the next inject fails the memory module's
+            // consecutive-position check ("last position X, batch starts at Y, need Y = X+1"),
+            // which takes down every subsequent request on the slot. The sibling MTP
+            // implementation already does this for chained heads; DFlash needs it too.
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, batch_in.pos[i_batch_beg[seq_id]], -1);
+
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
 
