@@ -343,12 +343,22 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     // grouped RMSNorm: reduce over one stream, then scale all streams with the [hc_dim] gamma
     // the converter folded each gamma to (1 + w)
     ggml_tensor * xn = ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps);
+    // Scale BEFORE the reshape. The backend fuses RMS_NORM+MUL only when the two are adjacent
+    // nodes, and the reshape between them blocked it here -- this was the one norm in the model
+    // that ran unfused (profile: "RMS_NORM dst(f32 2560,4)" with no RMS_NORM_MUL prefix, while
+    // every 128/256-wide norm fused). w_norm is [hc_dim] = [n_embd*hc], so viewing it as
+    // [n_embd, hc] broadcasts over the token axis and the math is unchanged.
+    xn = ggml_mul(ctx0, xn, ggml_reshape_2d(ctx0, w_norm, n_embd, hc));
     xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
-    xn = ggml_mul(ctx0, xn, w_norm);
+    // Fold the three separate 1/hc scalings into ONE on xn. Every consumer of xn below wants the
+    // same factor: `lo` and `inject` are linear in xn so the scale commutes through their matmuls,
+    // and `gated`/`mixed` inherit it, which makes the old scale(mixed, 1/hc) the same mean. Costs
+    // one dispatch instead of three (scale(lo)[320], scale(mixed)[2560], scale(inject)[4]).
+    xn = ggml_scale(ctx0, xn, 1.0f / (float) hc);
     cb(xn, "hc_norm", il);
 
     ggml_tensor * lo = build_lora_mm(w_down, xn);
-    lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
+    lo = ggml_silu(ctx0, lo);
     ggml_tensor * gate = ggml_sigmoid(ctx0, build_lora_mm(w_up, lo));
     cb(gate, "hc_gate", il);
 
@@ -365,7 +375,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
                 ggml_row_size(gated->type, n_embd) * c);
         mixed = ggml_add(ctx0, mixed, s);
     }
-    mixed = ggml_scale(ctx0, mixed, 1.0f / (float) hc);
+    // (the 1/hc mean is already carried by the scale folded into xn above)
     cb(mixed, "hc_mixed", il);
 
     if (inject) {
@@ -385,7 +395,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
     const int64_t nt = residual->ne[2];
 
     // 2*sigmoid centres the scatter weights on 1, so a zero injection is a plain residual add
-    ggml_tensor * w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
+    // inject is built from the already-1/hc-scaled xn, so no scale is needed here
+    ggml_tensor * w = ggml_sigmoid(ctx0, inject);
     w = ggml_scale(ctx0, w, 2.0f);
     w = ggml_reshape_3d(ctx0, w, 1, hc, nt);
 
