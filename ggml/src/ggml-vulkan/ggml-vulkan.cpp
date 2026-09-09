@@ -5421,11 +5421,38 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         rm_stdq = 2;
         rm_stdq_int = 2;
     }
-    // RDNA3: above four columns, static 4 rows for all types bench faster than the default
+    // RDNA3 rows-per-workgroup as a function of the pipeline's COLUMN count.
+    //
+    // The mat-vec shader keeps `temp[NUM_COLS][NUM_ROWS]` in registers, so pressure scales as
+    // cols*rows. Upstream #27909 pins rows at 4 for every pipeline above 4 columns -- but that was
+    // written when GGML_VULKAN_MMV_MAX_COLS defaulted to 8, so it was only ever exercised at 5..8
+    // columns (8*4 = 32 accumulators). Raising the limit silently inherited "4 rows" for 9..MAX,
+    // where cols*rows runs away (16*4 = 64) and occupancy falls off a cliff.
+    //
+    // Hold the product near the 32 that works at 8 columns instead:
+    //   <=4 base | 5-8 -> 4 (32) | 9-10 -> 3 (27-30) | 11-16 -> 2 (22-32) | 17+ -> 1 (<=32)
     const bool is_rdna3 = device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA3;
-    auto const &rm_int_n = [&](uint32_t rows, uint32_t i) { return (is_rdna3 && i >= 4) ? 4u : rows; };
+    auto const &rm_int_n = [&](uint32_t rows, uint32_t i) -> uint32_t {
+        if (!is_rdna3) {
+            return rows;
+        }
+        const uint32_t cols = i + 1;
+        if (cols <=  4) { return rows; }
+        if (cols <=  8) { return 4; }
+        if (cols <= 10) { return 3; }
+        if (cols <= 16) { return 2; }
+        return 1;
+    };
     // RDNA3: Static 4 rows for all types bench faster than the default
-    auto const &rm_id = [&](uint32_t rows) { return is_rdna3 ? 4u : rows; };
+    // GGML_VK_RM_ID overrides the rows-per-workgroup for the mul_mat_vec_id (MoE) pipelines.
+    // Upstream #27909 hardcodes 4 for all of RDNA3, tuned on one Strix Halo machine "across types
+    // and batch sizes"; unlike its non-id sibling it has no shape gate, so it is worth sweeping
+    // per workload (cf. the GGML_VULKAN_MMV_MAX_COLS default-8 that was also not a hardware limit).
+    static const uint32_t rm_id_override = [] {
+        const char * e = getenv("GGML_VK_RM_ID");
+        return e ? (uint32_t) std::max(1, atoi(e)) : 0u;
+    }();
+    auto const &rm_id = [&](uint32_t rows) { return rm_id_override ? rm_id_override : (is_rdna3 ? 4u : rows); };
     uint32_t rm_iq = 2 * rm_kq;
 
     const bool use_subgroups = device->subgroup_arithmetic;
@@ -10926,7 +10953,13 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
 }
 
 // Token-count threshold for choosing the per-token GEMV path over the general matmul for
-// MUL_MAT_ID. Overridable with GGML_VK_MMVID_MAX; default 8, i.e. unchanged behaviour.
+// MUL_MAT_ID. Overridable with GGML_VK_MMVID_MAX; default 32.
+//
+// Measured on gfx1151 (Flash-Next, 512x10 MoE), llama-batched-bench TG t/s:
+//        B=8    B=9    B=12   B=16
+//   8:  71.18  55.58  62.87  66.63   <- 22% cliff at 9, never recovers
+//  32:  71.18  69.08  77.71  80.70   <- monotonic
+// At 8 every batch past 8 tokens fell off the GEMV path onto the general matmul.
 //
 // The stock 8 mirrors mul_mat_vec_max_cols, but that constant is the DENSE path's
 // column-batching limit and does not apply here: the _id pipelines have no column
@@ -10976,7 +11009,7 @@ static uint32_t ggml_vk_mmvid_max() {
         // std::max(1, ...) turns into a threshold of 1 -- silently disabling the
         // mat-vec-id path for every multi-token batch. Matches the idiom used by
         // GGML_VK_MAX_NODES_PER_SUBMIT elsewhere in this file.
-        v = 8;
+        v = 32;
         if (e != nullptr) {
             try {
                 v = std::max((uint32_t) std::stoul(e), 1u);
