@@ -281,6 +281,12 @@ int main(int argc, char ** argv) {
                 /* .n_max      = */ n_draft_max,
                 /* .n_past     = */ n_past,
                 /* .id_last    = */ id_last,
+                /* .coupled    = */ false,
+                /* .seed       = */ 0,
+                /* .seq        = */ seq_id,
+                /* .temp       = */ 1.0f,
+                /* .top_k      = */ 0,
+                /* .top_p      = */ 1.0f,
                 /* .prompt     = */ &prompt_tgt,
                 /* .result     = */ &draft, // output
             };
