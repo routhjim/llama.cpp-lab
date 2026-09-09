@@ -4198,8 +4198,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_UBATCH"));
     add_opt(common_arg(
         {"--spec-coupled"},
-        "coupled sampling: the drafter and the target share one uniform per position (token-id-ordered CDF), so a "
-        "sampling target accepts a good draft instead of rejecting it on its own dice roll (default: off)",
+        "coupled sampling: the drafter and the target share per-(position, token) Gumbel noise, so a sampling "
+        "target accepts a good draft instead of rejecting it on its own dice roll (default: off)",
         [](common_params & params) {
             params.speculative.coupled = true;
         }
