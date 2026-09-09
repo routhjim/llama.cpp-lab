@@ -286,7 +286,37 @@ static void llama_tensor_dequantize_impl(
 
 static bool tensor_allows_quantization(const llama_model_quantize_params * params, llm_arch arch, const ggml_tensor * tensor) {
     // trivial checks first -- no string ops needed
-    if (params->only_copy)       return false;
+    if (params->only_copy) {
+        // COPY skips quantization for every tensor. An EXPLICIT --tensor-type / --output-tensor-type
+        // override is a deliberate instruction though, so honour it even under COPY. That makes
+        // "copy everything EXCEPT the tensors I name" expressible, which is the only way to
+        // selectively requantize a model without dragging every other tensor through a lossy
+        // dequantize/requantize round-trip.
+        bool named = false;
+
+        if (params->output_tensor_type < GGML_TYPE_COUNT &&
+            std::string(ggml_get_name(tensor)) == "output.weight") {
+            named = true;
+        }
+
+        if (!named && params->tt_overrides) {
+            const std::string nm = ggml_get_name(tensor);
+            for (const auto * p = params->tt_overrides; p->pattern != nullptr && !named; p++) {
+                try {
+                    if (std::regex_search(nm, std::regex(p->pattern))) {
+                        named = true;
+                    }
+                } catch (const std::exception &) {
+                    // malformed pattern: leave it to the normal override path to report
+                }
+            }
+        }
+
+        if (!named) {
+            return false;
+        }
+        // named: fall through to the structural checks below (2D+, ends in .weight, not a norm)
+    }
 
     // quantize only 2D and 3D tensors (experts)
     if (ggml_n_dims(tensor) < 2) return false;
@@ -707,8 +737,15 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
 
     ggml_type new_type = default_type;
 
+    // Under COPY the ftype-derived default carries no information (it resolves to F32 for a mixed
+    // source model), which would skip the manual-override block below and silently promote a named
+    // tensor to F32. Start from the tensor's existing type instead, so an explicit override applies.
+    if (params->only_copy) {
+        new_type = tensor->type;
+    }
+
     // get more optimal quantization type based on the tensor shape, layer, etc.
-    if (ggml_is_quantized(default_type)) {
+    if (ggml_is_quantized(new_type)) {
         // if the user provided tensor types - use those
         bool manual = false;
         if (!qs.tensor_type_patterns.empty()) {
