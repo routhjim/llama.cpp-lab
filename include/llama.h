@@ -1382,6 +1382,8 @@ extern "C" {
     // pos < 0 clears the arming. No-op on non-dist samplers.
     LLAMA_API void  llama_sampler_dist_set_coupled(struct llama_sampler * smpl, uint32_t seed, int32_t seq, int32_t pos);
     LLAMA_API float llama_sampler_coupled_noise(uint32_t seed, int32_t seq, int32_t pos, int32_t token);
+    // Exp(1) form of the same shared randomness: argmax(p/E) == argmax(log p + Gumbel), 3x cheaper
+    LLAMA_API float llama_sampler_coupled_exp  (uint32_t seed, int32_t seq, int32_t pos, int32_t token);
 
     /// @details Top-K sampling described in academic paper "The Curious Case of Neural Text Degeneration" https://arxiv.org/abs/1904.09751
     /// Setting k <= 0 makes this a noop

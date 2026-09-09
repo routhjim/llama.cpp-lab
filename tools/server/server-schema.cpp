@@ -194,6 +194,13 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     // Speculative decoding params
     //
 
+    // Enabled (the rest of this section is still #if 0'd upstream): needed to A/B coupling with
+    // both arms in ONE server load. Without it the field is silently ignored -- requests look
+    // accepted, the drafter never couples, and an interleaved A/B compares two identical arms.
+    add((new field_bool("speculative.coupled", params.speculative.coupled))
+        ->set_desc("Coupled sampling: share per-(position, token) randomness between the drafter and the target so a sampling target accepts a good draft instead of rejecting it on its own dice roll"));
+
+
     // TODO: to keep things simple, we disable speculative parameter adjustments for now
 #if 0
     // TODO: for now, be able to adjust only the draft-model based speculative parameters
