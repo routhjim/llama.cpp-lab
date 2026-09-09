@@ -21,6 +21,58 @@
 #include <map>
 #include <cinttypes>
 
+// Drafter candidate-set width. Stock 10, but the TARGET runs top_k 20 (+ top_p): any token the
+// target draws that sits at drafter rank 11-20 is a GUARANTEED rejection -- the drafter could not
+// have proposed it, and no amount of shared coupling noise can recover it. Coupling only works over
+// shared support. Overridable to measure that loss; also a prerequisite for a proper
+// accept/reject (p/q) verifier, which needs q on the same support the target normalises over.
+// GATED NGRAM EXTENSION (LLAMA_NGRAM_EXT = required agreement prefix, 0/unset = off).
+//
+// Problem it solves: ngram-mod sits at priority 4 and draft-mtp at 8/9, so ngram gets FIRST REFUSAL
+// on every step it can match. It does not supplement the drafter, it REPLACES it -- substituting
+// ~0.30-acceptance string guesses for ~0.93-acceptance model predictions. Measured cost on
+// copy-heavy work: ROI-adaptive 45.98 t/s -> 23.72 t/s with ngram enabled.
+//
+// This inverts that. The MTP drafter runs FIRST and always owns the step. ngram then proposes into
+// a scratch buffer, and its draft is adopted ONLY IF its first N tokens agree exactly with what the
+// drafter independently predicted. Agreement between two independent mechanisms is a far stronger
+// signal than a string match alone, and it costs nothing: both drafts already exist in host memory
+// before the verify batch is built, so the comparison is an array compare -- no extra decode, and
+// none of the serialisation that sank the earlier "match the first token" attempt (that one compared
+// against the TARGET's accepted token, which needs a verify pass first).
+//
+// Economics on this MoE: expert reads scale with the UNION over the batch and SATURATE -- 64 tokens
+// touch 72% of the 512-expert pack, 256 touch 99%, and past that extra tokens add zero expert
+// traffic. So the efficient burst sizes are tiny or huge, and the stock 48-64 is the worst of both.
+// A burst that lands is processed at prefill rate (~255 t/s measured) rather than decode rate
+// (~47 t/s), so a 1024-token extension breaks even if ~19% of it is accepted.
+static int32_t spec_ngram_ext() {
+    static int32_t v = -1;
+    if (v < 0) {
+        const char * e = getenv("LLAMA_NGRAM_EXT");
+        v = 0;
+        if (e != nullptr) {
+            try { v = std::max(std::stoi(e), 0); }
+            catch (const std::exception &) { LOG_WRN("ignoring malformed LLAMA_NGRAM_EXT=\"%s\"\n", e); }
+        }
+    }
+    return v;
+}
+
+static int32_t spec_draft_top_k() {
+    static int32_t v = 0;
+    if (v == 0) {
+        const char * e = getenv("LLAMA_SPEC_DRAFT_TOP_K");
+        v = 10;
+        if (e != nullptr) {
+            try { v = std::max(std::stoi(e), 1); }
+            catch (const std::exception &) { LOG_WRN("ignoring malformed LLAMA_SPEC_DRAFT_TOP_K=\"%s\"\n", e); }
+        }
+    }
+    return v;
+}
+
+
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_TRC(fmt, ...) LOG_TRC("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_INF(fmt, ...) LOG_INF("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -36,6 +88,7 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"draft-simple",  COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE},
     {"draft-eagle3",  COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3},
     {"draft-mtp",     COMMON_SPECULATIVE_TYPE_DRAFT_MTP},
+    {"draft-mtp-adaptive", COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE},
     {"draft-dflash",  COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH},
     {"draft-dflash-adaptive", COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH_ADAPTIVE},
     {"draft-dspark",  COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK},
@@ -502,7 +555,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         for (auto & s : smpls) {
             common_params_sampling sparams;
             sparams.no_perf  = false;
-            sparams.top_k    = 10;
+            sparams.top_k    = spec_draft_top_k();
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
         }
@@ -512,7 +565,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         if (this->params.backend_sampling) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
-                llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
+                llama_sampler_chain_add(chain, llama_sampler_init_top_k(spec_draft_top_k()));
 
                 if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
                     SPC_WRN("backend offload failed for seq_id=%d; using CPU sampler\n", (int) seq_id);
@@ -1077,7 +1130,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         for (auto & s : smpls) {
             common_params_sampling sparams;
             sparams.no_perf  = false;
-            sparams.top_k    = 10;
+            sparams.top_k    = spec_draft_top_k();
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
             s.reset(common_sampler_init(model_dft, sparams));
         }
@@ -1087,7 +1140,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         if (this->params.backend_sampling && !is_dflash2) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
-                llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
+                llama_sampler_chain_add(chain, llama_sampler_init_top_k(spec_draft_top_k()));
 
                 if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
                     SPC_WRN("backend offload failed for seq_id=%d; using CPU sampler\n", (int) seq_id);
@@ -1332,10 +1385,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         }
                         // Gumbel-max with the shared per-(position, token) noise: exact sample from the drafter's
                         // (truncated) distribution and the same rule the target applies when --spec-coupled
-                        llama_token pick = cand.front().first; double best = -1e300;
+                        // argmax(p/E), matching llama_sampler_coupled_exp on the target side
+                        llama_token pick = cand.front().first;
+                        bool have = false; double best_p = 0.0, best_e = 1.0;
                         for (auto & c : cand) {
-                            const double key = std::log((double) c.second / sum) + llama_sampler_coupled_noise(dp.seed, dp.seq, dp.n_past + i, c.first);
-                            if (key > best) { best = key; pick = c.first; }
+                            const double e = llama_sampler_coupled_exp(dp.seed, dp.seq, dp.n_past + i, c.first);
+                            const double p = (double) c.second;
+                            if (!have || p * best_e > best_p * e) { best_p = p; best_e = e; pick = c.first; have = true; }
                         }
                         predecessor = 0;
                         for (int k = 0; k < K; ++k) { if ((llama_token) row[k] == pick) { predecessor = k; break; } }
@@ -1445,6 +1501,94 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 };
 
+// Coupled draw shared with the target (see --spec-coupled): build softmax(logit/temp) over the drafter's
+// candidates, truncate with the target's top-k/top-p, then pick argmax(log p_t + g_t) with the shared
+// per-(position, token) Gumbel noise g_t. The target applies the identical rule to its own distribution, so
+// where the two distributions agree the two picks agree, and a good draft is no longer lost to the target's
+// independent dice roll. Gumbel-max is support-invariant, which is why the earlier shared-uniform-over-a-CDF
+// attempt failed: a support mismatch shifts every later interval.
+// (The DFlash2 lattice path carries its own inline copy of this rule; it is deployed, so it is left alone.)
+static llama_token common_spec_coupled_pick(
+        const llama_token_data_array * cur_p,
+        float temp, int32_t top_k, float top_p,
+        uint32_t seed, llama_seq_id seq, llama_pos pos) {
+    const int K = (int) cur_p->size;
+    if (K <= 0) {
+        return 0;
+    }
+    if (K == 1) {
+        return cur_p->data[0].id;
+    }
+
+    static const float tscale = [] {
+        const char * e = getenv("LLAMA_COUPLED_DRAFT_TSCALE");
+        return e ? (float) atof(e) : 1.0f;
+    }();
+
+    const float t = (temp > 0.0f ? temp : 1.0f) * tscale;
+
+    float mx = cur_p->data[0].logit;
+    for (int k = 1; k < K; ++k) {
+        mx = std::max(mx, cur_p->data[k].logit);
+    }
+
+    std::vector<std::pair<llama_token, float>> cand;
+    cand.reserve(K);
+    for (int k = 0; k < K; ++k) {
+        cand.push_back({ cur_p->data[k].id, std::exp((cur_p->data[k].logit - mx) / t) });
+    }
+
+    std::sort(cand.begin(), cand.end(), [](const auto & a, const auto & b) { return a.second > b.second; });
+
+    if (top_k > 0 && (int) cand.size() > top_k) {
+        cand.resize(top_k);
+    }
+
+    double sum = 0.0;
+    for (const auto & c : cand) { sum += c.second; }
+
+    if (top_p < 1.0f && sum > 0.0) {
+        double acc  = 0.0;
+        size_t keep = cand.size();
+        for (size_t k = 0; k < cand.size(); ++k) {
+            acc += cand[k].second / sum;
+            if (acc >= top_p) { keep = k + 1; break; }
+        }
+        cand.resize(keep);
+        sum = 0.0;
+        for (const auto & c : cand) { sum += c.second; }
+    }
+
+    if (sum <= 0.0) {
+        return cand.front().first;
+    }
+
+    // argmax(p/E) -- exactly the target's rule (see llama_sampler_coupled_exp): both sides MUST use the
+    // same formulation or the shared dice roll no longer lines up. `sum` is a common positive factor and
+    // cancels in the comparison, so the unnormalised weight can be used directly.
+    llama_token pick = cand.front().first;
+    bool   have   = false;
+    double best_p = 0.0, best_e = 1.0;
+    for (const auto & c : cand) {
+        const double e = llama_sampler_coupled_exp(seed, seq, pos, c.first);
+        const double p = (double) c.second;
+        if (!have || p * best_e > best_p * e) { best_p = p; best_e = e; pick = c.first; have = true; }
+    }
+
+    {
+        // diagnostics: how often the coupled draw differs from the argmax the drafter would have proposed
+        static int n_draws = 0, n_diff = 0;
+        n_draws++;
+        if (pick != cur_p->data[0].id) { n_diff++; }
+        if (n_draws % 500 == 0) {
+            SPC_INF("coupled draws (mtp): %d, differ from argmax: %d (%.1f%%), tscale %.2f\n",
+                    n_draws, n_diff, 100.0 * n_diff / n_draws, tscale);
+        }
+    }
+
+    return pick;
+}
+
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void seq_swap(llama_seq_id a, llama_seq_id b) override {
         if (!pending_h.empty()) { std::swap(pending_h[a], pending_h[b]); }
@@ -1491,9 +1635,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
-    common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
-        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
+    // adaptive draft depth (draft-mtp-adaptive). The dflash impl has its own copy of this machinery;
+    // MTP is a SEPARATE class and had none -- which is why --spec-draft-n-min-adaptive was silently
+    // inert with draft-mtp.
+    //
+    // np1 ONLY. Depth is per-seq, so at np>1 slots drift to different depths, the verify batch goes
+    // ragged, and on a hybrid model split_equal fragments one decode into many tiny ubatches
+    // (~205 ms/step; `graphs reused` collapses 32 -> 1). Same failure that makes --spec-draft-p-min
+    // unusable at np>1. dflash-adaptive escapes it only because its n_draft_common takes the MIN
+    // depth across drafting seqs, forcing a uniform block; MTP has no such step.
+    const bool adaptive;
+    std::vector<common_speculative_adaptive> adaptive_ctrl; // [n_seq] per-seq depth controller
+    std::vector<int32_t>                     n_last;        // [n_seq] tokens drafted on the last pass
+
+    common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq,
+                                      common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_MTP)
+        : common_speculative_impl(type, n_seq, params.draft.n_max)
         , params(params.draft)
+        , adaptive(type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE)
     {
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
@@ -1524,7 +1683,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         for (auto & s : smpls) {
             common_params_sampling sparams;
             sparams.no_perf  = false;
-            sparams.top_k    = 10;
+            sparams.top_k    = spec_draft_top_k();
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
         }
@@ -1534,7 +1693,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (this->params.backend_sampling) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
-                llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
+                llama_sampler_chain_add(chain, llama_sampler_init_top_k(spec_draft_top_k()));
 
                 if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
                     SPC_WRN("backend offload failed for seq_id=%d; using CPU sampler\n", (int) seq_id);
@@ -1560,6 +1719,26 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
         this->n_max = this->params.n_max;
+
+        // after every clamp above: the controller's ceiling is the USABLE draft depth (MTP cannot
+        // draft deeper than the head has layers).
+        adaptive_ctrl.assign(n_seq, common_speculative_adaptive());
+        n_last.assign(n_seq, 0);
+        if (adaptive) {
+            for (uint32_t sq = 0; sq < n_seq; ++sq) {
+                adaptive_ctrl[sq].reset(this->params.n_max, this->params.n_min_adaptive);
+            }
+            if (n_seq > 1) {
+                LOG_WRN("%s: draft-mtp-adaptive with n_seq=%u -- depth is PER-SEQ, so slots drift to "
+                        "different depths and the verify batch goes ragged (split_equal then splits one "
+                        "decode into many tiny ubatches). Use np=1, or draft-mtp with a fixed n-max.\n",
+                        __func__, n_seq);
+            }
+            SPC_INF("adaptive mtp: depth range [%d, %d], roi=%d, cost_ratio=%.2f\n",
+                    this->params.n_min_adaptive, this->params.n_max,
+                    common_speculative_adaptive::roi_mode() ? 1 : 0,
+                    common_speculative_adaptive::cost_ratio());
+        }
 
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
 
@@ -1807,8 +1986,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                             common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
                 }
 
+                auto & dp     = dparams.at(seq_id);
+                auto & result = *dp.result;
+
                 // add drafted token for each sequence
-                const llama_token id = cur_p->data[0].id;
+                llama_token id = cur_p->data[0].id;
+
+                if (dp.coupled) {
+                    // the k-th drafted token occupies position n_past + 1 + k -- the same position the server
+                    // arms the target with (batch.pos[idx] + 1), so both sides index the same shared noise
+                    const llama_pos pos = dp.n_past + 1 + (llama_pos) result.size();
+
+                    id = common_spec_coupled_pick(cur_p, dp.temp, dp.top_k, dp.top_p, dp.seed, dp.seq, pos);
+                }
 
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
@@ -1820,12 +2010,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 common_sampler_accept(smpl, id, true);
 
-                auto & dp = dparams.at(seq_id);
-                auto & result = *dp.result;
-
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                const int n_draft_seq = adaptive ? adaptive_ctrl[seq_id].n_cur : params.n_max;
+                if (n_draft_seq <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -1872,13 +2060,27 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
-            if (dp.result->size() < (size_t) params.n_min) {
+            n_last[seq_id] = (int32_t) dp.result->size();
+            if (!adaptive && dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
             }
         }
     }
 
-    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+        // must precede the early-outs below: the controller has to observe every verify, including
+        // ones that produced no rows, or its statistics silently skip the bad outcomes.
+        if (adaptive && !is_other && seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
+            const int depth_before = adaptive_ctrl[seq_id].n_cur;
+            adaptive_ctrl[seq_id].update(n_last[seq_id], n_accepted, params.n_max, params.n_min_adaptive);
+            if (adaptive_ctrl[seq_id].n_cur != depth_before) {
+                const auto & c = adaptive_ctrl[seq_id];
+                SPC_INF("adaptive mtp depth seq %d: %d -> %d (n_draft=%d, n_accepted=%d%s, p1=%.2f p2=%.2f p3=%.2f)\n",
+                        (int) seq_id, depth_before, c.n_cur, n_last[seq_id], (int) n_accepted,
+                        c.probe_left > 0 ? ", probe" : "", c.p_acc[1], c.p_acc[2], c.p_acc[3]);
+            }
+        }
+
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
@@ -2156,6 +2358,34 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         auto & sinfo = sinfos[seq_id];
 
+        // Histogram of tokens accepted per ngram FIRING. A mean cannot distinguish the two shapes
+        // that matter here: "all-or-nothing" (mass piled at 0-1 and at n_draft) vs "runs a while
+        // then breaks" (a hump in the middle). They imply opposite configs -- if it is bimodal, a
+        // cheap 1-2 token check licenses a very large n_max; if it is a hump, n_max should be set
+        // near the typical run length and everything beyond it is waste.
+        if (sinfo.n_draft_last > 0) {
+            static std::vector<uint64_t> hist_abs(72, 0);   // tokens accepted, absolute
+            static std::vector<uint64_t> hist_frac(11, 0);  // accepted / drafted, decile
+            static uint64_t n_fire = 0, n_acc_tot = 0, n_drf_tot = 0;
+            const int a = std::min<int>(n_accepted, (int) hist_abs.size() - 1);
+            hist_abs[a]++;
+            hist_frac[std::min<int>(10, (int)(10.0 * n_accepted / sinfo.n_draft_last))]++;
+            n_fire++; n_acc_tot += n_accepted; n_drf_tot += sinfo.n_draft_last;
+            if (n_fire % 25 == 0) {   // 25, not 200: a 1200-token run produces only ~30-45 firings
+                std::string ab, fr;
+                for (size_t i = 0; i < hist_abs.size(); ++i) {
+                    if (hist_abs[i]) { ab += std::to_string(i) + ":" + std::to_string(hist_abs[i]) + " "; }
+                }
+                for (size_t i = 0; i < hist_frac.size(); ++i) {
+                    fr += std::to_string(i*10) + "%:" + std::to_string(hist_frac[i]) + " ";
+                }
+                SPC_INF("ngram_mod hist: fires=%llu mean_drafted=%.1f mean_accepted=%.1f\n",
+                        (unsigned long long) n_fire, (double) n_drf_tot / n_fire, (double) n_acc_tot / n_fire);
+                SPC_INF("ngram_mod hist ABS  %s\n", ab.c_str());
+                SPC_INF("ngram_mod hist FRAC %s\n", fr.c_str());
+            }
+        }
+
         // compute acceptance fraction if we have a recorded draft length
         if (sinfo.n_draft_last > 0) {
             const double f_acc = (double)n_accepted / (double)sinfo.n_draft_last;
@@ -2389,6 +2619,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:  return "draft-simple";
         case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:  return "draft-eagle3";
         case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:     return "draft-mtp";
+        case COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE: return "draft-mtp-adaptive";
         case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:  return "draft-dflash";
         case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH_ADAPTIVE: return "draft-dflash-adaptive";
         case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:  return "draft-dspark";
@@ -2481,6 +2712,7 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
             case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
             case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
+            case COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH_ADAPTIVE:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
@@ -2670,9 +2902,7 @@ common_speculative_init_result::common_speculative_init_result(
     llama_context * ctx_tgt) :
     pimpl(new impl{}) {
     const bool has_draft = params.speculative.has_dft();
-    const bool spec_mtp = std::find(params.speculative.types.begin(),
-                                    params.speculative.types.end(),
-                                    COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    const bool spec_mtp = params.speculative.has_mtp();
 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
@@ -2771,7 +3001,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         };
 
         // when adding a new type - update here the logic above
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 12);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 13);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
@@ -2784,6 +3014,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP,    params.draft.ctx_dft != nullptr);
+        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH_ADAPTIVE, params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, params.draft.ctx_dft != nullptr);
@@ -2805,6 +3036,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
                 impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(config.params, n_seq));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE: {
+                impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(
+                        config.params, n_seq, COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH: {
@@ -2976,6 +3212,10 @@ void common_speculative_draft(common_speculative * spec) {
     }
 
     for (auto & impl : spec->impls) {
+        // with the gate on, ngram must NOT pre-empt: it is applied below as an extension instead
+        if (spec_ngram_ext() > 0 && impl->type == COMMON_SPECULATIVE_TYPE_NGRAM_MOD) {
+            continue;
+        }
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
             impl->draft(dparams);
@@ -3024,6 +3264,54 @@ void common_speculative_draft(common_speculative * spec) {
 
         if (n_drafting == 0) {
             break;
+        }
+    }
+
+    // gated ngram extension: adopt ngram's (long) draft only where it agrees with the drafter's
+    // first N tokens. See spec_ngram_ext() above.
+    if (spec_ngram_ext() > 0) {
+        common_speculative_impl * ng = nullptr;
+        for (auto & impl : spec->impls) {
+            if (impl->type == COMMON_SPECULATIVE_TYPE_NGRAM_MOD) { ng = impl.get(); break; }
+        }
+        if (ng != nullptr) {
+            const size_t n_need = (size_t) spec_ngram_ext();
+            static uint64_t n_try = 0, n_hit = 0, n_ext_tok = 0;
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
+                auto & dp = dparams[seq_id];
+                if (dp.result == nullptr || dp.result->size() < n_need) { continue; }
+                if (spec->impl_last[seq_id] == ng) { continue; }
+
+                const llama_tokens base = *dp.result;   // the drafter's own draft
+
+                llama_tokens cand;
+                auto dp_save   = dp;
+                dp.result      = &cand;
+                dp.drafting    = true;
+                dp.n_max       = -1;                    // do not clamp the extension
+                {
+                    common_time_meas tm(ng->t_draft_us, !ng->gen_perf);
+                    ng->draft(dparams);
+                    ng->n_call_draft++;
+                }
+                dp = dp_save;                           // restore result ptr / flags
+
+                n_try++;
+                if (cand.size() > base.size() &&
+                    std::equal(base.begin(), base.begin() + n_need, cand.begin())) {
+                    n_hit++;
+                    n_ext_tok += cand.size() - base.size();
+                    *dp.result = cand;
+                    spec->impl_last[seq_id] = ng;
+                    ng->n_gen_drafts++;
+                    ng->n_gen_tokens += cand.size();
+                }
+                if (n_try % 100 == 0) {
+                    SPC_INF("ngram-ext: tries=%llu adopted=%llu (%.1f%%) mean_extension=%.1f tok\n",
+                            (unsigned long long) n_try, (unsigned long long) n_hit,
+                            100.0 * n_hit / n_try, n_hit ? (double) n_ext_tok / n_hit : 0.0);
+                }
+            }
         }
     }
 
