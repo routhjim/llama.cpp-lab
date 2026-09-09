@@ -3264,7 +3264,7 @@ private:
                             /* .n_max    = */ n_draft_max,
                             /* .n_past   = */ slot.prompt.n_tokens(),
                             /* .id_last  = */ slot.sampled,
-                            /* .coupled  = */ params_base.speculative.coupled,
+                            /* .coupled  = */ slot.task->params.speculative.coupled,
                             /* .seed     = */ common_sampler_get_seed(slot.smpl.get()),
                             /* .seq      = */ slot.seq,
                             /* .temp     = */ slot.task->params.sampling.temp,
@@ -4157,7 +4157,7 @@ private:
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
-                if (params_base.speculative.coupled) {
+                if (slot.task->params.speculative.coupled) {
                     // coupled sampling: the token predicted at batch index idx sits at position batch.pos[idx] + 1
                     std::vector<llama_pos> pos; pos.reserve(n_draft);
                     for (size_t k = 0; k < n_draft; ++k) { pos.push_back(batch.batch.pos[slot.spec_i_batch[k]] + 1); }

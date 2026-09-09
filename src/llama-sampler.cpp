@@ -1191,12 +1191,15 @@ static void llama_sampler_dist_apply(struct llama_sampler * smpl, llama_token_da
     // this is ~3x faster on Mac with full gpt-oss vocab than the version below
     //
     if (ctx->cpl_pos >= 0) {
-        // coupled draw (Gumbel-max): argmax over log p_t + g_t with shared per-(pos, token) noise; exact sample from p
+        // coupled draw (Gumbel-max), expressed as argmax(p_i / E_i) -- exactly equivalent to
+        // argmax(log p_i + Gumbel_i) but with one transcendental per candidate instead of three.
         const uint32_t seed = ctx->cpl_seed; const int32_t seq = ctx->cpl_seq, pos = ctx->cpl_pos; ctx->cpl_pos = -1;
-        size_t sel = 0; double best = -1e300;
+        size_t sel = 0; bool have = false; double best_p = 0.0, best_e = 1.0;
         for (size_t i = 0; i < cur_p->size; ++i) {
-            const double key = std::log((double) cur_p->data[i].p) + llama_sampler_coupled_noise(seed, seq, pos, cur_p->data[i].id);
-            if (key > best) { best = key; sel = i; }
+            // p_i / E_i > p_best / E_best  <=>  p_i * E_best > p_best * E_i   (all terms > 0)
+            const double e = llama_sampler_coupled_exp(seed, seq, pos, cur_p->data[i].id);
+            const double p = (double) cur_p->data[i].p;
+            if (!have || p * best_e > best_p * e) { best_p = p; best_e = e; sel = i; have = true; }
         }
         for (size_t i = 0; i < cur_p->size; ++i) { cur_p->data[i].p /= sum_cum; }
         cur_p->selected = sel;
@@ -1437,15 +1440,35 @@ void llama_sampler_dist_set_coupled(struct llama_sampler * smpl, uint32_t seed, 
     ctx->cpl_seed = seed; ctx->cpl_seq = seq; ctx->cpl_pos = pos;
 }
 
-float llama_sampler_coupled_noise(uint32_t seed, int32_t seq, int32_t pos, int32_t token) {
-    // splitmix64 over (seed, seq, pos, token) -> uniform -> Gumbel(0,1) = -log(-log(u))
+// shared uniform for coupled sampling: splitmix64 over (seed, seq, pos, token)
+static inline double llama_sampler_coupled_u(uint32_t seed, int32_t seq, int32_t pos, int32_t token) {
     uint64_t z = ((uint64_t) seed << 32) ^ ((uint64_t) (uint32_t) seq << 40) ^ ((uint64_t) (uint32_t) pos << 20) ^ (uint64_t) (uint32_t) token;
     z += 0x9E3779B97F4A7C15ull;
     z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
     z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
     z ^= z >> 31;
-    const double u = ((z >> 11) + 0.5) * (1.0 / 9007199254740992.0);
-    return (float) (-std::log(-std::log(u)));
+    return ((z >> 11) + 0.5) * (1.0 / 9007199254740992.0);
+}
+
+float llama_sampler_coupled_noise(uint32_t seed, int32_t seq, int32_t pos, int32_t token) {
+    // Gumbel(0,1) = -log(-log(u)). Kept for API compatibility; prefer llama_sampler_coupled_exp,
+    // which is exactly equivalent under the Gumbel-max rule at a third of the transcendental cost.
+    return (float) (-std::log(-std::log(llama_sampler_coupled_u(seed, seq, pos, token))));
+}
+
+float llama_sampler_coupled_exp(uint32_t seed, int32_t seq, int32_t pos, int32_t token) {
+    // Exp(1) = -log(u), the SAME shared randomness expressed differently.
+    //
+    //   argmax_i [ log p_i + Gumbel_i ]  ==  argmax_i [ p_i / E_i ],   E_i = -log(u_i)
+    //
+    // because log p_i - log(-log u_i) = log(p_i / E_i) and log is monotonic. Exact, not an
+    // approximation. This drops 3 transcendentals per candidate (log p, and the two in the Gumbel)
+    // to 1, which is what made coupling unaffordable at np > 1: the draw loops over the whole
+    // top-k candidate set, per token, per stream, in the CPU sampler.
+    const double u = llama_sampler_coupled_u(seed, seq, pos, token);
+    const double e = -std::log(u);
+    // u is in (0,1) by construction so e > 0; clamp anyway so the p/E compare can never divide by 0
+    return (float) (e > 1e-30 ? e : 1e-30);
 }
 
 void llama_sampler_backend_begin(llama_sampler * sampler) {
