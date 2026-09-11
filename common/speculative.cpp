@@ -1919,6 +1919,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        // MUST be first. Every override that touches ctx_dft or the reserve has to join the
+        // prefetch worker before it does, and this one was the single gap: it reads the drafter's
+        // memory module via llama_memory_seq_pos_max() while the worker may be inside
+        // llama_decode(ctx_dft) / llama_memory_seq_rm() on that same module.
+        //
+        // The server calls begin() on EVERY slot launch, so the race fires whenever the previous
+        // round's worker is still live when the next request arrives -- i.e. under back-to-back
+        // agent traffic, but never under synthetic benchmarks, which pause between requests long
+        // enough for the worker to finish. MEASURED: the server dies a couple of minutes into the
+        // real TB2.1 git task, always immediately after "launch_slot_: task N | processing task",
+        // presenting variously as `free(): unaligned chunk detected in tcache 2`, a silent stop, or
+        // a clean exit(0) -- heap corruption landing wherever the next allocator touch happens.
+        join_prefetch();
+
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -2003,6 +2017,27 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             auto * mem_dft = llama_get_memory(ctx_dft);
+
+            // Growing-KV path (Flash-Next MTP, chain_heads == false): drop any draft cells at or
+            // beyond the first position this catch-up decode is about to write. The previous
+            // round's draft pass wrote [n_past, n_past+depth] into ctx_dft; the target may have
+            // rejected some or all of it, and process() then re-decodes the ACCEPTED prefix at
+            // those same positions. Without this the memory module sees its stored position
+            // running ahead of the incoming batch and refuses it:
+            //   "for M-RoPE, it is required that the position satisfies: X < Y"  (X=2955, Y=2951)
+            // The chain_heads branch below has always done this per head; the growing-KV path
+            // never did. Invisible at constant depth, fatal once --spec-draft-lookahead or
+            // draft-mtp-adaptive make the depth vary between rounds -- MEASURED: dies after two
+            // consecutive full rejections that each moved the depth (6->5->4).
+            // Only ever removes cells the target did not accept, so it is safe unconditionally.
+            if (!chain_heads) {
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (i_batch_beg[seq_id] < 0) {
+                        continue;
+                    }
+                    llama_memory_seq_rm(mem_dft, seq_id, batch_in.pos[i_batch_beg[seq_id]], -1);
+                }
+            }
 
             bool ok = true;
             for (int head = 0; head < n_mtp_layers; ++head) {
