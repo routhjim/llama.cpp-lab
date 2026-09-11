@@ -1979,6 +1979,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // Both, not either -- a partial accept can coincidentally match the check token.
             if (params.n_lookahead > 0 && !adaptive) {
                 auto & rsv = reserve[seq_id];
+                // CONTROL ARM (LLAMA_LOOKAHEAD_NOSERVE=1): over-draft exactly as normal, but never
+                // serve from the reserve. The served tokens are then the first n_max of the same
+                // chain the baseline would have drafted, so the whole trajectory stays
+                // token-identical to the baseline -- which is what makes fresh-round acceptance
+                // comparable at all. Isolates "does over-drafting perturb the drafter" from
+                // "does serving reserve tokens cost acceptance".
+                static const bool noserve = getenv("LLAMA_LOOKAHEAD_NOSERVE") != nullptr;
+                if (noserve) { rsv.clear(); n_reserve_miss++; served_from_reserve[seq_id] = false; }
+                else
                 if (full_accept[seq_id] && rsv.size() >= (size_t) params.n_max + 1 && rsv[0] == dp.id_last) {
                     rsv.erase(rsv.begin());                                  // consume the check token
                     dp.result->assign(rsv.begin(), rsv.begin() + params.n_max);
