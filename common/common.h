@@ -333,6 +333,11 @@ struct common_params_speculative_draft {
     // equals the target's bonus token, the rest of the reserve is validly conditioned and that round
     // needs no drafter forward at all. 0 = off.
     int32_t n_lookahead = 0;
+    // Order of the n-gram table used to fill the lookahead reserve from the CONTEXT instead of the
+    // drafter chain (0 = off). An n-gram continuation costs ZERO drafter forwards, so this is the
+    // source to use when the drafter cannot be hidden -- i.e. when there is no second GPU to run it
+    // on concurrently. Small order on purpose: the reserve needs only n_max+1 tokens, not a burst.
+    int32_t n_lookahead_ngram = 0;
     int32_t n_ubatch = 0;       // physical batch size of the draft context (0 = inherit the target's -ub)
 
     float p_split = 0.1f; // speculative decoding split probability

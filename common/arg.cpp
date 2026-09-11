@@ -4203,6 +4203,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_LOOKAHEAD"));
     add_opt(common_arg(
+        {"--spec-draft-lookahead-ngram"}, "N",
+        string_format("fill the lookahead reserve from an N-order n-gram table over the context "
+                      "instead of the drafter chain, when it matches (default: %d, 0 = off). Costs no "
+                      "drafter forward, so this is the source to use when the drafter cannot be run "
+                      "concurrently on a second GPU. Falls back to the drafter on a miss.",
+                      params.speculative.draft.n_lookahead_ngram),
+        [](common_params & params, int value) {
+            if (value < 0 || value == 1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.n_lookahead_ngram = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_LOOKAHEAD_NGRAM"));
+    add_opt(common_arg(
         {"--spec-draft-n-min"}, "N",
         string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.draft.n_min),
         [](common_params & params, int value) {

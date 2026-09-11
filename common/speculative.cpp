@@ -12,6 +12,7 @@
 #include "sampling.h"
 
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
+#include <thread>
 
 #include <algorithm>
 #include <cassert>
@@ -1603,6 +1604,7 @@ static llama_token common_spec_coupled_pick(
 
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void seq_swap(llama_seq_id a, llama_seq_id b) override {
+        join_prefetch();
         if (!pending_h.empty()) { std::swap(pending_h[a], pending_h[b]); }
         if (!i_batch_beg.empty()) { std::swap(i_batch_beg[a], i_batch_beg[b]); }
         if (!i_batch_end.empty()) { std::swap(i_batch_end[a], i_batch_end[b]); }
@@ -1672,6 +1674,49 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // Positions are preserved across the handover -- reserve token k was drafted at
     // n_past + 1 + (n_max + k), which is exactly where it lands next round -- so coupled sampling's
     // per-(pos,token) noise indexing stays correct.
+    // --- async prefetch (the reserve is filled DURING the target's verify) ----------------------
+    // Safe window: draft() returns -> the server verifies on ctx_tgt (which never touches ctx_dft)
+    // -> accept() -> process() (which DOES decode into ctx_dft). So the worker owns ctx_dft for the
+    // duration of the verify and must be joined before accept()/process(). On the eGPU a drafter
+    // forward is ~1.5 ms, so n_lookahead extra drafts finish well inside a ~66 ms verify.
+    // dparams is caller-owned and may dangle after draft() returns, so snapshot what the chain needs.
+    struct la_snap {
+        bool        drafting = false;
+        int32_t     n_past   = 0;
+        int32_t     n_done   = 0;   // tokens already drafted this round (the served ones)
+        bool        coupled  = false;
+        float       temp = 1.0f, top_p = 1.0f;
+        int32_t     top_k = 0;
+        uint32_t    seed = 0;
+        llama_seq_id seq = 0;
+    };
+    // --- ngram source for the reserve (LLAMA_LOOKAHEAD_NGRAM=<order>, 0/unset = off) ----------
+    // The reserve does not care WHERE its tokens came from -- only that they are a plausible
+    // continuation, because the target verifies everything and the check token guards the
+    // conditioning. An ngram continuation costs ZERO drafter forwards, so when it is available it
+    // is strictly cheaper than the MTP prefetch: no worker, no eGPU, no bus traffic.
+    // Deliberately a SMALL order (default 8, not ngram-mod's 24) and no abandon threshold: we need
+    // only n_max+1 tokens, not a 48-token burst, so the trigger can be far looser. Feeding narrowly
+    // also avoids both recorded ngram failure modes -- the verify batch never exceeds n_max (so the
+    // expert union stays ~8% of the pack, not 72%) and MTP keeps the step (no priority pre-emption).
+    std::unique_ptr<common_ngram_mod> la_mod;
+    std::vector<size_t>               ng_i_last;   // [n_seq] prompt index already hashed
+    int64_t n_ng_hit = 0, n_ng_try = 0;
+
+    std::vector<la_snap>            snaps;
+    std::vector<llama_token>        la_tok;   // [n_seq] last served token (chain handoff)
+    std::vector<std::vector<float>> la_h;     // [n_seq] its hidden row
+    std::thread          prefetch_thr;
+    bool                 prefetch_active = false;
+
+    // Must be called before ANY use of ctx_dft or the reserve from the main thread.
+    void join_prefetch() {
+        if (prefetch_active) {
+            prefetch_thr.join();
+            prefetch_active = false;
+        }
+    }
+
     std::vector<llama_tokens> reserve;      // [n_seq]
     std::vector<bool>         full_accept;  // [n_seq] last verify accepted every drafted token
     int64_t n_reserve_hit  = 0;             // rounds served from the reserve (zero drafter forwards)
@@ -1698,6 +1743,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         GGML_ASSERT(n_embd == llama_model_n_embd_out(llama_get_model(ctx_tgt)) &&
                 "MTP input row width must match the target h_nextn width");
         n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
+
+        if (this->params.n_lookahead > 0) {
+            const int32_t need = this->params.n_max + 1;
+            if (this->params.n_lookahead < need) {
+                SPC_INF("lookahead: raising n_lookahead %d -> %d (need n_max+1: one match-check "
+                        "token plus n_max drafts, or the reserve can never serve a round)\n",
+                        this->params.n_lookahead, need);
+                this->params.n_lookahead = need;
+            }
+        }
 
         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
@@ -1761,6 +1816,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         adaptive_ctrl.assign(n_seq, common_speculative_adaptive());
         n_last.assign(n_seq, 0);
         reserve.assign(n_seq, llama_tokens());
+        snaps.assign(n_seq, la_snap());
+        ng_i_last.assign(n_seq, 0);
+        {
+            int order = this->params.n_lookahead_ngram;
+            if (const char * e = getenv("LLAMA_LOOKAHEAD_NGRAM")) order = atoi(e);  // override for sweeps
+            if (order > 1) {
+                la_mod = std::make_unique<common_ngram_mod>((uint16_t) order, 4*1024*1024);
+                SPC_INF("lookahead: ngram reserve source enabled, order %d\n", order);
+            }
+        }
+        la_tok.assign(n_seq, 0);
+        la_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
         full_accept.assign(n_seq, false);
         served_from_reserve.assign(n_seq, false);
         if (adaptive) {
@@ -1790,7 +1857,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     ~common_speculative_impl_draft_mtp() override {
+        join_prefetch();
         if (params.n_lookahead > 0 && (n_reserve_hit + n_reserve_miss) > 0) {
+            if (n_ng_try > 0) {
+                SPC_INF("lookahead ngram: %lld/%lld reserves filled from ngram (%.1f%%), order %d\n",
+                        (long long) n_ng_hit, (long long) n_ng_try, 100.0*n_ng_hit/n_ng_try,
+                        la_mod ? (int) la_mod->get_n() : 0);
+            }
             SPC_INF("lookahead acceptance: reserve %lld/%lld = %.3f | fresh %lld/%lld = %.3f\n",
                     (long long) acc_res_ok, (long long) acc_res_n,
                     acc_res_n ? (double) acc_res_ok/acc_res_n : 0.0,
@@ -1838,6 +1911,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     bool process(const llama_batch & batch_in) override {
+        join_prefetch();   // the worker owns ctx_dft; process() decodes into it
         if (batch_in.n_tokens <= 0) {
             return true;
         }
@@ -1956,6 +2030,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
+        join_prefetch();
         auto & ctx_dft = params.ctx_dft;
 
         common_batch_clear(batch);
@@ -2111,9 +2186,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
-                const int n_draft_seq = adaptive ? adaptive_ctrl[seq_id].n_cur
-                                                 : params.n_max + params.n_lookahead;
+                // sync pass drafts only what the server will be handed; the lookahead tail is
+                // produced by the prefetch worker below, concurrently with the target's verify.
+                const int n_draft_seq = adaptive ? adaptive_ctrl[seq_id].n_cur : params.n_max;
                 if (n_draft_seq <= (int) result.size()) {
+                    // Handoff point for the prefetch worker: the chain continues from THIS token
+                    // paired with the h row the drafter just produced for it -- the same
+                    // (token, h) pairing the normal setup path uses with id_last + pending_h.
+                    if (params.n_lookahead > 0 && !adaptive) {
+                        la_tok[seq_id] = id;
+                        la_h[seq_id].assign(h_row, h_row + n_embd);
+                        snaps[seq_id] = la_snap{ true, dp.n_past, (int32_t) result.size(),
+                                                 dp.coupled, dp.temp, dp.top_p, dp.top_k,
+                                                 dp.seed, dp.seq };
+                    }
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -2160,21 +2246,142 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
-            // Split the over-draft: the server only ever sees n_max; the tail becomes the reserve.
-            if (params.n_lookahead > 0 && !adaptive && dp.result->size() > (size_t) params.n_max) {
-                auto & r = *dp.result;
-                reserve[seq_id].assign(r.begin() + params.n_max, r.end());
-                r.resize(params.n_max);
-            }
-
             n_last[seq_id] = (int32_t) dp.result->size();
             if (!adaptive && dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
             }
         }
+
+        // Fill the reserve CONCURRENTLY with the target's verify. ctx_dft is untouched by the
+        // target's decode, so the worker owns it until join_prefetch() -- which every public
+        // method calls before using ctx_dft or the reserve.
+        if (params.n_lookahead > 0 && !adaptive) {
+            // Free source first. Only sequences ngram could not serve pay for a drafter prefetch.
+            for (llama_seq_id sq = 0; sq < (llama_seq_id) n_seq; ++sq) {
+                if (snaps[sq].drafting && reserve[sq].empty() && dparams[sq].drafting) {
+                    fill_reserve_from_ngram(sq, dparams[sq]);
+                }
+            }
+            bool any = false;
+            for (llama_seq_id sq = 0; sq < (llama_seq_id) n_seq; ++sq) {
+                if (snaps[sq].drafting && reserve[sq].empty()) { any = true; } else { snaps[sq].drafting = false; }
+            }
+            if (any) {
+                prefetch_active = true;
+                prefetch_thr = std::thread([this]() { this->prefetch_chain(); });
+            }
+        }
+    }
+
+    // Fill reserve[seq] from the ngram table instead of the drafter. Returns true on success.
+    // Key construction mirrors ngram-mod: a sliding window of `order` tokens over
+    //   [ last order-1 prompt tokens | id_last | the n_max drafts just served ]
+    // so the first lookup predicts what follows the LAST served draft -- exactly the position the
+    // reserve's check token occupies.
+    bool fill_reserve_from_ngram(llama_seq_id seq_id, const common_speculative_draft_params & dp) {
+        if (!la_mod) return false;
+        const auto & prompt = *dp.prompt;
+        const size_t n      = la_mod->get_n();
+        const auto & drafts = *dp.result;
+        if (prompt.size() < n || drafts.empty()) return false;
+
+        // incremental hash build, same chunking as ngram-mod
+        const size_t cur_len = prompt.size();
+        if (ng_i_last[seq_id] + 32 < cur_len) {
+            for (size_t i = ng_i_last[seq_id]; i + n <= cur_len; ++i) {
+                la_mod->add(prompt.data() + i);
+            }
+            ng_i_last[seq_id] = cur_len - n;
+        }
+
+        std::vector<common_ngram_mod::entry_t> buf;
+        buf.reserve(n + drafts.size() + params.n_lookahead);
+        for (size_t i = 0; i + 1 < n; ++i) buf.push_back(prompt.at(cur_len - n + 1 + i));
+        buf.push_back(dp.id_last);
+        for (auto t : drafts) buf.push_back(t);
+
+        const size_t need  = (size_t) params.n_max + 1;   // check token + n_max drafts
+        const size_t start = buf.size() - n;              // window ending at the last served draft
+        ++n_ng_try;
+        llama_tokens out;
+        for (size_t k = 0; k < need; ++k) {
+            const auto tok = la_mod->get(buf.data() + start + k);
+            if (tok == common_ngram_mod::EMPTY) return false;   // all-or-nothing: a short chain
+            out.push_back((llama_token) tok);                   // cannot serve a whole round
+            buf.push_back(tok);
+        }
+        reserve[seq_id] = std::move(out);
+        ++n_ng_hit;
+        return true;
+    }
+
+    // Continue each sequence's MTP chain for n_lookahead more tokens, appending to reserve[].
+    // A fresh mini-chain from (la_tok, la_h) -- the last served token and the h row the drafter
+    // produced for it -- which is the same pairing the normal setup path uses with id_last and
+    // pending_h. Positions continue unbroken (n_past + 1 + n_done + k), so a coupled draw here
+    // indexes exactly the noise the server will arm the target with next round.
+    void prefetch_chain() {
+        auto * ctx_dft = params.ctx_dft;
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+
+        common_batch_clear(batch);
+        int n_live = 0;
+        std::vector<bool> live(n_seq, false);
+        for (llama_seq_id sq = 0; sq < (llama_seq_id) n_seq; ++sq) {
+            if (!snaps[sq].drafting) continue;
+            live[sq] = true; ++n_live;
+            common_sampler_reset(smpls[sq].get());
+            common_batch_add(batch, la_tok[sq], snaps[sq].n_past + snaps[sq].n_done, { sq }, true);
+            std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, la_h[sq].data(), row_bytes);
+            i_last[sq] = batch.n_tokens - 1;
+        }
+        if (n_live == 0) return;
+
+        for (int k = 0; k < params.n_lookahead && n_live > 0; ++k) {
+            if (llama_decode(ctx_dft, batch) != 0) { break; }
+            common_batch_clear(batch);
+            for (llama_seq_id sq = 0; sq < (llama_seq_id) n_seq; ++sq) {
+                if (!live[sq]) continue;
+                auto * smpl = smpls[sq].get();
+                common_sampler_sample(smpl, ctx_dft, i_last[sq], true);
+                const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[sq]);
+                const auto * cur_p  = common_sampler_get_candidates(smpl, true);
+
+                llama_token id = cur_p->data[0].id;
+                const auto & sn = snaps[sq];
+                if (sn.coupled) {
+                    const llama_pos pos = sn.n_past + 1 + (llama_pos) (sn.n_done + (int32_t) reserve[sq].size());
+                    id = common_spec_coupled_pick(cur_p, sn.temp, sn.top_k, sn.top_p, sn.seed, sn.seq, pos);
+                }
+                common_sampler_accept(smpl, id, true);
+                reserve[sq].push_back(id);
+
+                if ((int) reserve[sq].size() >= params.n_lookahead) { live[sq] = false; --n_live; continue; }
+                common_batch_add(batch, id, sn.n_past + sn.n_done + (llama_pos) reserve[sq].size(), { sq }, true);
+                std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
+                i_last[sq] = batch.n_tokens - 1;
+            }
+            if (batch.n_tokens == 0) break;
+        }
+
+        // Leave ctx_dft exactly as the synchronous pass left it. The worker rewrote the handoff
+        // position and appended beyond it; if those cells survive, the drafter's stored position
+        // runs ahead of where process() decodes the accepted tokens next, and the memory module
+        // rejects the batch ("for M-RoPE, it is required that the position satisfies: X < Y").
+        // Only the token IDs matter for the reserve -- their KV is re-established by process()
+        // if and when the target actually accepts them.
+        {
+            auto * mem_dft = llama_get_memory(ctx_dft);
+            for (llama_seq_id sq = 0; sq < (llama_seq_id) n_seq; ++sq) {
+                if (snaps[sq].drafting) {
+                    llama_memory_seq_rm(mem_dft, sq, snaps[sq].n_past, -1);
+                }
+            }
+        }
     }
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+        join_prefetch();    // the worker writes reserve[]
         // Lookahead bookkeeping. The reserve is only validly conditioned if the target emitted
         // exactly the prefix the chain was built on -- i.e. every drafted token was accepted.
         // is_other means another impl produced this draft, so our chain's conditioning is moot.
