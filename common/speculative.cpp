@@ -1676,6 +1676,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<bool>         full_accept;  // [n_seq] last verify accepted every drafted token
     int64_t n_reserve_hit  = 0;             // rounds served from the reserve (zero drafter forwards)
     int64_t n_reserve_miss = 0;             // rounds that had to draft
+    // Split acceptance by round type. A reserve round is CORRECTLY CONDITIONED by construction
+    // (we checked the prefix and the bonus token), so if its acceptance still collapses, the cost
+    // is drafter accuracy at depth -- not a conditioning bug. Distinguishing those two is the
+    // whole question, and the aggregate number cannot.
+    int64_t acc_res_ok = 0, acc_res_n = 0;  // accepted / drafted on reserve-served rounds
+    int64_t acc_fsh_ok = 0, acc_fsh_n = 0;  // accepted / drafted on freshly-drafted rounds
+    std::vector<bool> served_from_reserve;  // [n_seq] how the CURRENT outstanding draft was produced
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq,
                                       common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_MTP)
@@ -1755,6 +1762,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         n_last.assign(n_seq, 0);
         reserve.assign(n_seq, llama_tokens());
         full_accept.assign(n_seq, false);
+        served_from_reserve.assign(n_seq, false);
         if (adaptive) {
             for (uint32_t sq = 0; sq < n_seq; ++sq) {
                 adaptive_ctrl[sq].reset(this->params.n_max, this->params.n_min_adaptive);
@@ -1783,6 +1791,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     ~common_speculative_impl_draft_mtp() override {
         if (params.n_lookahead > 0 && (n_reserve_hit + n_reserve_miss) > 0) {
+            SPC_INF("lookahead acceptance: reserve %lld/%lld = %.3f | fresh %lld/%lld = %.3f\n",
+                    (long long) acc_res_ok, (long long) acc_res_n,
+                    acc_res_n ? (double) acc_res_ok/acc_res_n : 0.0,
+                    (long long) acc_fsh_ok, (long long) acc_fsh_n,
+                    acc_fsh_n ? (double) acc_fsh_ok/acc_fsh_n : 0.0);
             SPC_INF("lookahead: %lld/%lld rounds served from the reserve (%.1f%%), n_lookahead=%d\n",
                     (long long) n_reserve_hit, (long long) (n_reserve_hit + n_reserve_miss),
                     100.0 * n_reserve_hit / (n_reserve_hit + n_reserve_miss), params.n_lookahead);
@@ -1971,10 +1984,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     dp.result->assign(rsv.begin(), rsv.begin() + params.n_max);
                     rsv.erase(rsv.begin(), rsv.begin() + params.n_max);
                     n_last[seq_id] = params.n_max;
+                    served_from_reserve[seq_id] = true;
                     n_reserve_hit++;
                     continue;                                                // no drafter forward at all
                 }
                 rsv.clear();
+                served_from_reserve[seq_id] = false;
                 n_reserve_miss++;
             }
 
@@ -1994,13 +2009,34 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         int i = 0;
 
+        // ONCE, before the first decode: drop draft KV at or beyond the first position this pass
+        // will write. Only ever removes cells the target did not accept.
+        //
+        // The growing-KV path needs this and never had it: a pass fills [n_past, n_past + n_draft]
+        // and nothing cleaned up the tail the target did not accept. INVISIBLE at constant depth
+        // (the next pass rewrites the same cells), visible the moment the depth varies -- which
+        // --spec-draft-lookahead makes it do (n_max+N on a drafting round, 0 on a reserve round).
+        // Same class as #27 (drop stale DFlash draft KV before re-injecting).
+        //
+        // It must NOT be inside the step loop for this path: step i writes at n_past+i+1 and the
+        // batch re-adds only the NEW token, so clearing from n_past every step deletes what the
+        // previous steps just wrote. MEASURED cost of getting that wrong: fresh-round acceptance
+        // 0.778 -> 0.692, because every draft token after the first lost its predecessors' KV.
+        {
+            auto * mem_dft = llama_get_memory(ctx_dft);
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (drafting[seq_id]) {
+                    llama_memory_seq_rm(mem_dft, seq_id, dparams[seq_id].n_past, -1);
+                }
+            }
+        }
+
         while (n_drafting > 0) {
-            // each step decodes under a different head, i.e. a different decoder layer, and
-            // KV is per layer. process() filled this layer's KV only for positions < n_past
-            // (prompt + accepted prefix) — nothing in the draft region yet. so reset the
-            // draft region (the seq_rm lower bound is n_past, leaving the prompt KV intact)
-            // and select head i so it rebuilds its own layer's KV there; decoding just the
-            // latest token would leave its attention reading cells only another head wrote.
+            // chain_heads decodes each step under a DIFFERENT head, i.e. a different decoder layer,
+            // and KV is per layer; its batch re-adds the whole prefix each step. So it must reset
+            // the draft region every step and select head i, or the new head's attention would read
+            // cells only another head wrote. The growing-KV path does the opposite: it keeps what
+            // earlier steps wrote (cleared once, above).
             if (chain_heads) {
                 auto * mem_dft = llama_get_memory(ctx_dft);
                 for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -2134,6 +2170,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // exactly the prefix the chain was built on -- i.e. every drafted token was accepted.
         // is_other means another impl produced this draft, so our chain's conditioning is moot.
         if (params.n_lookahead > 0 && seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
+            if (!is_other && n_last[seq_id] > 0) {
+                if (served_from_reserve[seq_id]) { acc_res_ok += n_accepted; acc_res_n += n_last[seq_id]; }
+                else                             { acc_fsh_ok += n_accepted; acc_fsh_n += n_last[seq_id]; }
+            }
             const bool full = !is_other && n_last[seq_id] > 0 && (int32_t) n_accepted >= n_last[seq_id];
             full_accept[seq_id] = full;
             if (!full) {
