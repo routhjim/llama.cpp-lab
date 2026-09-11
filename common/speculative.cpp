@@ -1705,6 +1705,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // hidden, so the sequences ngram misses would each pay ~n_max forwards for nothing
     // (MEASURED -2.3% for the drafter prefetch on the iGPU vs +3.2% for ngram).
     bool ngram_only = false;
+    // The drafter prefetch is excluded under adaptive because per-seq depth makes the verify batch
+    // RAGGED -- and on this hybrid model split_equal then fragments one decode into many tiny
+    // ubatches. That hazard needs MORE THAN ONE sequence: at np1 there is a single depth, so
+    // adaptive + prefetch is safe and is allowed.
+    bool prefetch_allowed() const { return !adaptive || la_mod || n_seq == 1; }
     std::vector<size_t>               ng_i_last;   // [n_seq] prompt index already hashed
     int64_t n_ng_hit = 0, n_ng_try = 0;
 
@@ -1760,7 +1765,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // --spec-draft-lookahead-ngram on its own means "reserve from n-grams, opportunistically".
         // The reserve machinery still needs a depth, so derive it; nothing will run the drafter.
         if (this->params.n_lookahead_ngram > 1 && this->params.n_lookahead == 0) {
-            this->params.n_lookahead = this->params.n_max + 1;
+            this->params.n_lookahead = this->params.n_max + 1;   // n_max is the CEILING under adaptive
             ngram_only = true;
             SPC_INF("lookahead: ngram-ONLY reserve (no drafter prefetch), depth %d\n",
                     this->params.n_lookahead);
@@ -2060,6 +2065,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         int n_drafting = 0;
         std::vector<bool> drafting(n_seq);
 
+        // A handoff snapshot is only valid for the round that produced it. A round served ENTIRELY
+        // from the reserve `continue`s past the sync draft loop below, so it never refreshes
+        // snaps[] -- yet snaps[].drafting is still set from an earlier round, which is exactly what
+        // the prefetch launch keys on. The worker then re-drafts at that stale round's positions,
+        // which the drafter KV has long since passed, and the memory module rejects the batch:
+        // "for M-RoPE, it is required that the position satisfies: X < Y". The worker swallows the
+        // llama_decode failure (it only breaks), so this is SILENT apart from the server-side
+        // error -- 66 failed prefetch decodes in one candidate run, every one after a
+        // reserve-served round. Only a chain that actually ran this pass may hand off.
+        for (auto & s : snaps) { s.drafting = false; }
+
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -2073,7 +2089,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // verify to have accepted EVERY draft (so the chain's conditioning prefix is the one the
             // target actually emitted) and the reserve's check token to equal the new id_last.
             // Both, not either -- a partial accept can coincidentally match the check token.
-            if (params.n_lookahead > 0 && !adaptive) {
+            if (params.n_lookahead > 0 && prefetch_allowed()) {
                 auto & rsv = reserve[seq_id];
                 // CONTROL ARM (LLAMA_LOOKAHEAD_NOSERVE=1): over-draft exactly as normal, but never
                 // serve from the reserve. The served tokens are then the first n_max of the same
@@ -2082,13 +2098,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 // comparable at all. Isolates "does over-drafting perturb the drafter" from
                 // "does serving reserve tokens cost acceptance".
                 static const bool noserve = getenv("LLAMA_LOOKAHEAD_NOSERVE") != nullptr;
+                // depth in force for THIS round: adaptive moves it, static is fixed
+                const int want = adaptive ? adaptive_ctrl[seq_id].n_cur : params.n_max;
                 if (noserve) { rsv.clear(); n_reserve_miss++; served_from_reserve[seq_id] = false; }
-                else
-                if (full_accept[seq_id] && rsv.size() >= (size_t) params.n_max + 1 && rsv[0] == dp.id_last) {
+                else if (full_accept[seq_id] && rsv.size() >= (size_t) want + 1 && rsv[0] == dp.id_last) {
                     rsv.erase(rsv.begin());                                  // consume the check token
-                    dp.result->assign(rsv.begin(), rsv.begin() + params.n_max);
-                    rsv.erase(rsv.begin(), rsv.begin() + params.n_max);
-                    n_last[seq_id] = params.n_max;
+                    dp.result->assign(rsv.begin(), rsv.begin() + want);
+                    rsv.erase(rsv.begin(), rsv.begin() + want);
+                    n_last[seq_id] = want;
                     served_from_reserve[seq_id] = true;
                     n_reserve_hit++;
                     continue;                                                // no drafter forward at all
@@ -2214,7 +2231,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     // Handoff point for the prefetch worker: the chain continues from THIS token
                     // paired with the h row the drafter just produced for it -- the same
                     // (token, h) pairing the normal setup path uses with id_last + pending_h.
-                    if (params.n_lookahead > 0 && !adaptive) {
+                    // `la_tok`/`la_h` are only needed by the drafter worker, which never runs under
+                    // adaptive -- but snaps[].drafting is also the marker the NGRAM fill keys on, so
+                    // it has to be set in both modes or ngram silently never engages.
+                    if (params.n_lookahead > 0 && prefetch_allowed()) {
                         la_tok[seq_id] = id;
                         la_h[seq_id].assign(h_row, h_row + n_embd);
                         snaps[seq_id] = la_snap{ true, dp.n_past, (int32_t) result.size(),
@@ -2276,12 +2296,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // Fill the reserve CONCURRENTLY with the target's verify. ctx_dft is untouched by the
         // target's decode, so the worker owns it until join_prefetch() -- which every public
         // method calls before using ctx_dft or the reserve.
-        if (params.n_lookahead > 0 && !adaptive) {
-            // Free source first. Only sequences ngram could not serve pay for a drafter prefetch.
+        if (params.n_lookahead > 0 && prefetch_allowed()) {
+            // Free source first. Only sequences ngram could not serve pay for a drafter prefetch
+            // -- and with adaptive the drafter prefetch is disabled entirely (per-seq depth would
+            // make the verify batch ragged), so ngram is the ONLY source there.
             for (llama_seq_id sq = 0; sq < (llama_seq_id) n_seq; ++sq) {
                 if (snaps[sq].drafting && reserve[sq].empty() && dparams[sq].drafting) {
                     fill_reserve_from_ngram(sq, dparams[sq]);
                 }
+            }
+            // ngram already filled what it could; the worker covers the rest, but only where a
+            // ragged batch cannot arise (np1) -- at np>1 under adaptive, ngram is the only source.
+            if (adaptive && n_seq > 1) {
+                for (llama_seq_id sq = 0; sq < (llama_seq_id) n_seq; ++sq) snaps[sq].drafting = false;
             }
             bool any = false;
             for (llama_seq_id sq = 0; sq < (llama_seq_id) n_seq; ++sq) {
@@ -2322,7 +2349,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         buf.push_back(dp.id_last);
         for (auto t : drafts) buf.push_back(t);
 
-        const size_t need  = (size_t) params.n_max + 1;   // check token + n_max drafts
+        // Target the depth in force for THIS sequence: adaptive moves it per round, and the reserve
+        // must cover check-token + that many drafts or it cannot serve a round.
+        const int cur_depth = adaptive ? adaptive_ctrl[seq_id].n_cur : params.n_max;
+        const size_t need   = (size_t) cur_depth + 1;
         const size_t start = buf.size() - n;              // window ending at the last served draft
         ++n_ng_try;
         llama_tokens out;
@@ -2360,7 +2390,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (n_live == 0) return;
 
         for (int k = 0; k < params.n_lookahead && n_live > 0; ++k) {
-            if (llama_decode(ctx_dft, batch) != 0) { break; }
+            // never swallow this: a silent break here cost a whole candidate benchmark run, which
+            // reported throughput while 66 prefetch decodes were failing.
+            const int pret = llama_decode(ctx_dft, batch);
+            if (pret != 0) { SPC_ERR("prefetch llama_decode[%d] returned %d\n", k, pret); break; }
             common_batch_clear(batch);
             for (llama_seq_id sq = 0; sq < (llama_seq_id) n_seq; ++sq) {
                 if (!live[sq]) continue;
