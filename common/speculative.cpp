@@ -2296,6 +2296,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // Fill the reserve CONCURRENTLY with the target's verify. ctx_dft is untouched by the
         // target's decode, so the worker owns it until join_prefetch() -- which every public
         // method calls before using ctx_dft or the reserve.
+        // ============================ DO NOT DEPLOY =============================================
+        // The drafter prefetch worker CORRUPTS THE HEAP. Under the real TB2.1 git task (np1, 85/15
+        // split, drafter on the eGPU) the server dies with
+        //     free(): unaligned chunk detected in tcache 2
+        // after a couple of minutes of agent traffic -- no OOM, no Vulkan error, no device fault.
+        // This is NOT device-placement-dependent: an iGPU-drafter run dies the same way.
+        //
+        // It was masked until 2026-09-11 by the stale-snapshot bug fixed above: the worker's first
+        // decode failed and it broke out before doing real work, so earlier lookahead measurements
+        // never exercised this path to completion.
+        //
+        // Suspect: this worker shares `batch`, `smpls[]`, `i_last[]` and `reserve[]` with the main
+        // thread while llama_decode runs on the target, and concurrent llama_decode on two contexts
+        // may not be supported at all. Batch capacity is llama_n_batch, so it is not an overflow.
+        // NOT ROOT-CAUSED. The ngram reserve source (no worker) is unaffected.
+        // ========================================================================================
         if (params.n_lookahead > 0 && prefetch_allowed()) {
             // Free source first. Only sequences ngram could not serve pay for a drafter prefetch
             // -- and with adaptive the drafter prefetch is disabled entirely (per-seq depth would
