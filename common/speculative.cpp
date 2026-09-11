@@ -1700,6 +1700,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // also avoids both recorded ngram failure modes -- the verify batch never exceeds n_max (so the
     // expert union stays ~8% of the pack, not 72%) and MTP keeps the step (no priority pre-emption).
     std::unique_ptr<common_ngram_mod> la_mod;
+    // ngram-ONLY: fill the reserve opportunistically from n-grams and NEVER fall back to a drafter
+    // prefetch. This is the right default without a second GPU: there the prefetch cannot be
+    // hidden, so the sequences ngram misses would each pay ~n_max forwards for nothing
+    // (MEASURED -2.3% for the drafter prefetch on the iGPU vs +3.2% for ngram).
+    bool ngram_only = false;
     std::vector<size_t>               ng_i_last;   // [n_seq] prompt index already hashed
     int64_t n_ng_hit = 0, n_ng_try = 0;
 
@@ -1743,6 +1748,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         GGML_ASSERT(n_embd == llama_model_n_embd_out(llama_get_model(ctx_tgt)) &&
                 "MTP input row width must match the target h_nextn width");
         n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
+
+        // Resolve the n-gram order ONCE, from the flag or the env override, BEFORE anything keys
+        // off it -- otherwise a run configured by env gets the table but not the ngram-only mode.
+        {
+            int order = this->params.n_lookahead_ngram;
+            if (const char * e = getenv("LLAMA_LOOKAHEAD_NGRAM")) order = atoi(e);
+            this->params.n_lookahead_ngram = order;
+        }
+
+        // --spec-draft-lookahead-ngram on its own means "reserve from n-grams, opportunistically".
+        // The reserve machinery still needs a depth, so derive it; nothing will run the drafter.
+        if (this->params.n_lookahead_ngram > 1 && this->params.n_lookahead == 0) {
+            this->params.n_lookahead = this->params.n_max + 1;
+            ngram_only = true;
+            SPC_INF("lookahead: ngram-ONLY reserve (no drafter prefetch), depth %d\n",
+                    this->params.n_lookahead);
+        }
 
         if (this->params.n_lookahead > 0) {
             const int32_t need = this->params.n_max + 1;
@@ -1819,8 +1841,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         snaps.assign(n_seq, la_snap());
         ng_i_last.assign(n_seq, 0);
         {
-            int order = this->params.n_lookahead_ngram;
-            if (const char * e = getenv("LLAMA_LOOKAHEAD_NGRAM")) order = atoi(e);  // override for sweeps
+            const int order = this->params.n_lookahead_ngram;   // already resolved above
             if (order > 1) {
                 la_mod = std::make_unique<common_ngram_mod>((uint16_t) order, 4*1024*1024);
                 SPC_INF("lookahead: ngram reserve source enabled, order %d\n", order);
@@ -2264,7 +2285,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
             bool any = false;
             for (llama_seq_id sq = 0; sq < (llama_seq_id) n_seq; ++sq) {
-                if (snaps[sq].drafting && reserve[sq].empty()) { any = true; } else { snaps[sq].drafting = false; }
+                if (!ngram_only && snaps[sq].drafting && reserve[sq].empty()) { any = true; }
+                else { snaps[sq].drafting = false; }
             }
             if (any) {
                 prefetch_active = true;
