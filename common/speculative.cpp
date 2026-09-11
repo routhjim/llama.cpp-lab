@@ -227,6 +227,13 @@ struct common_speculative_impl {
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
 
+    // Quiesce any background work owned by this implementation so that the CALLER may safely
+    // touch ctx_dft. The server manipulates the drafter context directly in several places that
+    // are not part of this API at all -- prompt-cache save/load, context checkpoint update/load,
+    // and a bare llama_memory_seq_rm -- so joining inside our own entry points is not sufficient.
+    // Default is a no-op; only the MTP prefetch worker needs it.
+    virtual void sync() {}
+
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     // exchange all per-sequence state between two sequence ids (see common_speculative_seq_swap)
     virtual void seq_swap(llama_seq_id /*a*/, llama_seq_id /*b*/) {}
@@ -1718,6 +1725,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<std::vector<float>> la_h;     // [n_seq] its hidden row
     std::thread          prefetch_thr;
     bool                 prefetch_active = false;
+
+    void sync() override { join_prefetch(); }
 
     // Must be called before ANY use of ctx_dft or the reserve from the main thread.
     void join_prefetch() {
@@ -3793,6 +3802,17 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
         if (impl_other.get() != impl) {
             impl_other->accept(seq_id, n_accepted, true);
         }
+    }
+}
+
+// Join any background worker so the caller can touch ctx_dft safely. MUST be called before every
+// direct manipulation of the drafter context from outside this API.
+void common_speculative_sync(common_speculative * spec) {
+    if (spec == nullptr) {
+        return;
+    }
+    for (auto & impl : spec->impls) {
+        impl->sync();
     }
 }
 

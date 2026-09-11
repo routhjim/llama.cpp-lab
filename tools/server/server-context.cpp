@@ -313,6 +313,9 @@ struct server_slot {
             return false;
         }
 
+        // the lookahead prefetch worker may be decoding into ctx_dft right now
+        common_speculative_sync(spec);
+
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, seq, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, seq, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
@@ -335,6 +338,7 @@ struct server_slot {
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
+        common_speculative_sync(spec);
         bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, seq);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
@@ -2459,6 +2463,7 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
+        common_speculative_sync(spec.get());
         cur.update_tgt(ctx_tgt, slot.seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         cur.update_dft(ctx_dft, slot.seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
@@ -3268,6 +3273,7 @@ private:
                                 llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.seq));
 
                         if (use_ckpt_dft) {
+                            common_speculative_sync(slot.spec);
                             slot.spec_ckpt.update_dft(ctx_dft, slot.seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
@@ -3312,6 +3318,12 @@ private:
             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
             if (ctx_dft) {
+                // CRASH SITE (2026-09-11): load_dft -> llama_state_seq_set_data -> kv_cache::seq_rm
+                // segfaulted in _Rb_tree_rebalance_for_erase because the lookahead prefetch worker
+                // was concurrently decoding into this same context. The server owns ctx_dft and
+                // manipulates it outside the speculative API, so the worker must be joined HERE.
+                common_speculative_sync(slot.spec);
+
                 if (use_ckpt_dft) {
                     ckpt.load_dft(ctx_dft, slot.seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
@@ -3344,6 +3356,7 @@ private:
                 }
 
                 if (use_ckpt_dft) {
+                    common_speculative_sync(slot.spec);
                     ckpt.update_dft(ctx_dft, slot.seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
             }
@@ -3621,6 +3634,7 @@ private:
                                     if (!do_reset) {
                                         // restore the context checkpoint
                                         it->load_tgt(ctx_tgt, slot.seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        common_speculative_sync(slot.spec);
                                         it->load_dft(ctx_dft, slot.seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         // restore the draft's speculative state
                                         common_speculative_set_state(spec.get(), slot.seq, it->data_spec);
@@ -4210,6 +4224,7 @@ private:
                         ckpt.load_tgt(slot.ctx_tgt, slot.seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                         if (slot.ctx_dft) {
+                            common_speculative_sync(slot.spec);
                             ckpt.load_dft(slot.ctx_dft, slot.seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 

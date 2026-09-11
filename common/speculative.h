@@ -96,6 +96,10 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t
 
 // exchange the per-sequence state of two sequences. Used by the server to relocate a live
 // sequence to another KV stream between decode steps (the KV/RS data moves via llama_memory_seq_mv)
+// join any background work owned by the speculator (e.g. the MTP lookahead prefetch worker) so
+// that the caller may safely touch the drafter context directly. no-op for most implementations.
+void common_speculative_sync(common_speculative * spec);
+
 void common_speculative_seq_swap(common_speculative * spec, llama_seq_id a, llama_seq_id b);
 
 // (optional) get/set internal state
