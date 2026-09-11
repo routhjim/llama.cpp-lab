@@ -328,6 +328,11 @@ struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
     int32_t n_min_adaptive = 2; // floor (and starting depth) of the adaptive draft depth range
+    // Lookahead (MTP only): draft n_max + n_lookahead tokens, hand the server only n_max and keep the
+    // tail as a RESERVE. If the next round's verify accepted every draft AND the reserve's first token
+    // equals the target's bonus token, the rest of the reserve is validly conditioned and that round
+    // needs no drafter forward at all. 0 = off.
+    int32_t n_lookahead = 0;
     int32_t n_ubatch = 0;       // physical batch size of the draft context (0 = inherit the target's -ub)
 
     float p_split = 0.1f; // speculative decoding split probability

@@ -1610,6 +1610,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (!verify_h_rows.empty()) { std::swap(verify_h_rows[a], verify_h_rows[b]); }
         if (!i_last.empty()) { std::swap(i_last[a], i_last[b]); }
         if (!chain_h.empty()) { std::swap(chain_h[a], chain_h[b]); }
+        if (!reserve.empty()) { std::swap(reserve[a], reserve[b]); }
+        if (!full_accept.empty()) { std::vector<bool>::swap(full_accept[a], full_accept[b]); }
     }
 
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
@@ -1659,6 +1661,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     const bool adaptive;
     std::vector<common_speculative_adaptive> adaptive_ctrl; // [n_seq] per-seq depth controller
     std::vector<int32_t>                     n_last;        // [n_seq] tokens drafted on the last pass
+
+    // --- lookahead reserve (--spec-draft-lookahead) ---------------------------------------------
+    // Draft n_max + n_lookahead, serve n_max, keep the tail. reserve[seq][0] is the MATCH-CHECK
+    // token: it is the drafter's prediction of the target's bonus token. The tail is validly
+    // conditioned only if the previous verify accepted EVERY draft (so the prefix the chain was
+    // built on is the prefix the target actually emitted) AND that check token equals the new
+    // id_last. Both conditions are required: a partial accept can still coincidentally match the
+    // check token while the context behind it differs.
+    // Positions are preserved across the handover -- reserve token k was drafted at
+    // n_past + 1 + (n_max + k), which is exactly where it lands next round -- so coupled sampling's
+    // per-(pos,token) noise indexing stays correct.
+    std::vector<llama_tokens> reserve;      // [n_seq]
+    std::vector<bool>         full_accept;  // [n_seq] last verify accepted every drafted token
+    int64_t n_reserve_hit  = 0;             // rounds served from the reserve (zero drafter forwards)
+    int64_t n_reserve_miss = 0;             // rounds that had to draft
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq,
                                       common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_MTP)
@@ -1736,6 +1753,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // draft deeper than the head has layers).
         adaptive_ctrl.assign(n_seq, common_speculative_adaptive());
         n_last.assign(n_seq, 0);
+        reserve.assign(n_seq, llama_tokens());
+        full_accept.assign(n_seq, false);
         if (adaptive) {
             for (uint32_t sq = 0; sq < n_seq; ++sq) {
                 adaptive_ctrl[sq].reset(this->params.n_max, this->params.n_min_adaptive);
@@ -1763,6 +1782,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     ~common_speculative_impl_draft_mtp() override {
+        if (params.n_lookahead > 0 && (n_reserve_hit + n_reserve_miss) > 0) {
+            SPC_INF("lookahead: %lld/%lld rounds served from the reserve (%.1f%%), n_lookahead=%d\n",
+                    (long long) n_reserve_hit, (long long) (n_reserve_hit + n_reserve_miss),
+                    100.0 * n_reserve_hit / (n_reserve_hit + n_reserve_miss), params.n_lookahead);
+        }
         auto * ctx_dft = this->params.ctx_dft;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
@@ -1936,6 +1960,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
+            // Lookahead: can this round be served entirely from the reserve? Requires the previous
+            // verify to have accepted EVERY draft (so the chain's conditioning prefix is the one the
+            // target actually emitted) and the reserve's check token to equal the new id_last.
+            // Both, not either -- a partial accept can coincidentally match the check token.
+            if (params.n_lookahead > 0 && !adaptive) {
+                auto & rsv = reserve[seq_id];
+                if (full_accept[seq_id] && rsv.size() >= (size_t) params.n_max + 1 && rsv[0] == dp.id_last) {
+                    rsv.erase(rsv.begin());                                  // consume the check token
+                    dp.result->assign(rsv.begin(), rsv.begin() + params.n_max);
+                    rsv.erase(rsv.begin(), rsv.begin() + params.n_max);
+                    n_last[seq_id] = params.n_max;
+                    n_reserve_hit++;
+                    continue;                                                // no drafter forward at all
+                }
+                rsv.clear();
+                n_reserve_miss++;
+            }
+
             n_drafting++;
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
@@ -2024,7 +2066,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
-                const int n_draft_seq = adaptive ? adaptive_ctrl[seq_id].n_cur : params.n_max;
+                const int n_draft_seq = adaptive ? adaptive_ctrl[seq_id].n_cur
+                                                 : params.n_max + params.n_lookahead;
                 if (n_draft_seq <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
@@ -2072,6 +2115,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
+            // Split the over-draft: the server only ever sees n_max; the tail becomes the reserve.
+            if (params.n_lookahead > 0 && !adaptive && dp.result->size() > (size_t) params.n_max) {
+                auto & r = *dp.result;
+                reserve[seq_id].assign(r.begin() + params.n_max, r.end());
+                r.resize(params.n_max);
+            }
+
             n_last[seq_id] = (int32_t) dp.result->size();
             if (!adaptive && dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
@@ -2080,6 +2130,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+        // Lookahead bookkeeping. The reserve is only validly conditioned if the target emitted
+        // exactly the prefix the chain was built on -- i.e. every drafted token was accepted.
+        // is_other means another impl produced this draft, so our chain's conditioning is moot.
+        if (params.n_lookahead > 0 && seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
+            const bool full = !is_other && n_last[seq_id] > 0 && (int32_t) n_accepted >= n_last[seq_id];
+            full_accept[seq_id] = full;
+            if (!full) {
+                reserve[seq_id].clear();
+            }
+        }
+
         // must precede the early-outs below: the controller has to observe every verify, including
         // ones that produced no rows, or its statistics silently skip the bad outcomes.
         if (adaptive && !is_other && seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
