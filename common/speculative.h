@@ -100,6 +100,10 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t
 // that the caller may safely touch the drafter context directly. no-op for most implementations.
 void common_speculative_sync(common_speculative * spec);
 
+// launch the deferred prefetch armed by the last common_speculative_draft(); call immediately
+// before the target's decode so the worker overlaps the verify
+void common_speculative_prefetch_start(common_speculative * spec);
+
 void common_speculative_seq_swap(common_speculative * spec, llama_seq_id a, llama_seq_id b);
 
 // (optional) get/set internal state

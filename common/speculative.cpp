@@ -234,6 +234,10 @@ struct common_speculative_impl {
     // Default is a no-op; only the MTP prefetch worker needs it.
     virtual void sync() {}
 
+    // (optional) launch any deferred background work armed by draft(). Split from draft() so the
+    // caller decides when it runs -- see prefetch_start() in the MTP impl.
+    virtual void prefetch_start() {}
+
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     // exchange all per-sequence state between two sequence ids (see common_speculative_seq_swap)
     virtual void seq_swap(llama_seq_id /*a*/, llama_seq_id /*b*/) {}
@@ -1725,6 +1729,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<std::vector<float>> la_h;     // [n_seq] its hidden row
     std::thread          prefetch_thr;
     bool                 prefetch_active = false;
+    bool                 prefetch_pending = false;   // draft() armed it; prefetch_start() launches
 
     void sync() override { join_prefetch(); }
 
@@ -2375,11 +2380,30 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 if (!ngram_only && snaps[sq].drafting && reserve[sq].empty()) { any = true; }
                 else { snaps[sq].drafting = false; }
             }
-            if (any) {
-                prefetch_active = true;
-                prefetch_thr = std::thread([this]() { this->prefetch_chain(); });
-            }
+            // DO NOT launch here. The server does checkpoint work on ctx_dft immediately after
+            // draft() returns (load_dft / llama_memory_seq_rm / update_dft in pre_decode), every
+            // one of which must join the worker -- so a thread started here is joined within
+            // microseconds and overlaps NOTHING. It then pays its full cost inside the critical
+            // path, which is the entire reason the prefetch measured -7.1% on real traffic.
+            // The server calls prefetch_start() once it is finished with ctx_dft, immediately
+            // before llama_decode(ctx_tgt), so the chain actually hides behind the verify.
+            prefetch_pending = any;
         }
+    }
+
+    // Launch the deferred prefetch. Separated from draft() so the caller controls WHEN the worker
+    // runs: it must start after the server has finished touching ctx_dft and before the target's
+    // verify, or it provides no overlap at all.
+    void prefetch_start() override {
+        if (!prefetch_pending) {
+            return;
+        }
+        prefetch_pending = false;
+        if (prefetch_active) {   // never overwrite a joinable thread
+            return;
+        }
+        prefetch_active = true;
+        prefetch_thr = std::thread([this]() { this->prefetch_chain(); });
     }
 
     // Fill reserve[seq] from the ngram table instead of the drafter. Returns true on success.
@@ -3802,6 +3826,18 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
         if (impl_other.get() != impl) {
             impl_other->accept(seq_id, n_accepted, true);
         }
+    }
+}
+
+// Launch background work armed by the last common_speculative_draft(). Call this AFTER the caller
+// has finished touching ctx_dft and immediately BEFORE the target's decode, so the worker overlaps
+// the verify instead of running in the critical path.
+void common_speculative_prefetch_start(common_speculative * spec) {
+    if (spec == nullptr) {
+        return;
+    }
+    for (auto & impl : spec->impls) {
+        impl->prefetch_start();
     }
 }
 

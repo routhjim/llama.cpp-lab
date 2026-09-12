@@ -3943,6 +3943,16 @@ private:
             has_output |= batch.tokens[i].output;
         }
 
+        // Launch the deferred MTP lookahead prefetch HERE, not in draft(). pre_decode() does
+        // checkpoint work on ctx_dft right after drafting (load_dft / seq_rm / update_dft), and
+        // every one of those must join the worker -- so launching inside draft() meant the thread
+        // was joined within microseconds and overlapped NOTHING, paying its full cost inside the
+        // critical path. That is why the prefetch measured -7.1% on real traffic. Started here it
+        // runs concurrently with the target's verify below (~25-40 ms) while its chain needs
+        // ~11 ms, on a device that is otherwise idle. Safe because every later ctx_dft access --
+        // process(), accept(), the checkpoint paths -- joins via common_speculative_sync().
+        common_speculative_prefetch_start(spec.get());
+
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
