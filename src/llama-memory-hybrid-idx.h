@@ -116,8 +116,11 @@ public:
 
 private:
     // [TAG_QSA_POOLED_CACHE]
-    ggml_context_ptr        pooled_ctx;
-    ggml_backend_buffer_ptr pooled_buf;
+    // One context+buffer PER BUFFER TYPE. The pooled store for layer il must live on the same
+    // device as that layer, exactly as llama_kv_cache does via model.dev_layer(il) -- otherwise a
+    // --tensor-split ships it across the bus every decode step. See [TAG_QSA_POOLED_CACHE].
+    std::vector<ggml_context_ptr>        pooled_ctxs;
+    std::vector<ggml_backend_buffer_ptr> pooled_bufs;
     std::map<int32_t, ggml_tensor *> pooled_k;
     std::map<int32_t, uint32_t>      pooled_rows;
     mutable std::map<uint32_t, std::vector<int64_t>> pooled_w;   // [ratio][stream]
