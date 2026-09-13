@@ -1859,6 +1859,19 @@ void server_prompt_cache::evict_disk() {
     }
 }
 
+void server_prompt_cache::on_saved(server_prompt_cache_state * st) {
+    // Called once the caller has filled the state buffers. When a disk tier is
+    // configured the cache is NVMe-resident: write the entry out immediately and
+    // release its RAM, so the RAM budget only ever holds transient buffers and a
+    // long-context entry is never refused for being larger than --cache-ram.
+    if (st == nullptr || disk_limit == 0 || disk_path.empty()) {
+        return;
+    }
+    if (spill(*st)) {
+        evict_disk();
+    }
+}
+
 void server_prompt_cache::clear_disk() {
     if (disk_path.empty()) {
         return;
@@ -1907,10 +1920,16 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 
     const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
 
-    // skip over-limit entries to avoid disturbing the cache
-    if (limit_size > 0 && state_size_new > limit_size) {
-        SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
-                state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
+    // The RAM limit governs RETENTION, not admission. An entry larger than the RAM
+    // budget can still be cached when a disk tier is configured: the state bytes are
+    // materialized in RAM only transiently and written straight to NVMe (see on_saved).
+    // Reloading such an entry costs ~1 s of NVMe read versus minutes of re-prefill, so
+    // refusing it is always the worse trade. Only refuse when it fits in neither tier.
+    const bool fits_disk = disk_limit > 0 && !disk_path.empty() && state_size_new <= disk_limit;
+
+    if (limit_size > 0 && state_size_new > limit_size && !fits_disk) {
+        SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB and disk tier %.3f MiB, skipping\n",
+                state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), disk_limit / (1024.0 * 1024.0));
         return nullptr;
     }
 

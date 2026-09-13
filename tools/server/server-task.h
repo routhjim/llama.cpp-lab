@@ -645,6 +645,7 @@ struct server_prompt_cache {
     void   evict_ram(size_t need);   // make `need` bytes of RAM room: spill (or drop) oldest resident entries
     void   evict_disk();             // keep the disk tier under disk_limit
     void   clear_disk();             // remove orphaned spill files left on disk by a prior run
+    void   on_saved(server_prompt_cache_state * st);  // caller filled the buffers: push to disk tier
 
     std::list<server_prompt_cache_state> states;
 
