@@ -13,6 +13,7 @@
 #include "server-common.h"
 
 #include <sstream>
+#include <filesystem>
 
 //
 // task_params
@@ -1855,6 +1856,35 @@ void server_prompt_cache::evict_disk() {
         }
         SRV_WRN(" - prompt cache disk tier over limit, removing oldest spilled entry (size = %.3f MiB)\n", it->size() / (1024.0 * 1024.0));
         drop(it);
+    }
+}
+
+void server_prompt_cache::clear_disk() {
+    if (disk_path.empty()) {
+        return;
+    }
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (!fs::is_directory(disk_path, ec)) {
+        return;
+    }
+    int n = 0;
+    for (fs::directory_iterator it(disk_path, ec), end; !ec && it != end; it.increment(ec)) {
+        const std::string name = it->path().filename().string();
+        // match only our own spill artifacts: "pc-<seq>.main" / "pc-<seq>.drft"
+        const bool is_spill = name.rfind("pc-", 0) == 0 && name.size() >= 5 &&
+            (name.compare(name.size() - 5, 5, ".main") == 0 ||
+             name.compare(name.size() - 5, 5, ".drft") == 0);
+        if (is_spill) {
+            std::error_code rec;
+            if (fs::remove(it->path(), rec)) {
+                ++n;
+            }
+        }
+    }
+    if (n > 0) {
+        SRV_INF(" - prompt cache: cleared %d orphaned disk entr%s from %s\n",
+                n, n == 1 ? "y" : "ies", disk_path.c_str());
     }
 }
 
