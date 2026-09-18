@@ -1366,13 +1366,23 @@ private:
             batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
         }
 
-        if (params_base.cache_ram_mib != 0) {
-            if (params_base.cache_ram_mib < 0) {
+        // --cache-ram is a RETENTION budget, not a master switch. With a disk tier configured,
+        // on_saved() writes each entry straight to NVMe and frees its RAM, and alloc() admits
+        // regardless of the RAM budget (limit_size 0 never trips its refusal), so
+        // `--cache-ram 0 --cache-disk N` is the fully NVMe-resident configuration. Gating
+        // construction on cache_ram_mib != 0 silently turned that into "no cache at all" -- the
+        // disk tier became unreachable for exactly the setup that asks for it.
+        const bool cache_disk_on = params_base.cache_disk_mib > 0 && !params_base.cache_disk_path.empty();
+
+        if (params_base.cache_ram_mib != 0 || cache_disk_on) {
+            if (params_base.cache_ram_mib == 0) {
+                SRV_TRC("%s", "prompt cache is enabled, RAM retention disabled (NVMe-resident)\n");
+            } else if (params_base.cache_ram_mib < 0) {
                 SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
             } else {
                 SRV_TRC("prompt cache is enabled, size limit: %d MiB\n", params_base.cache_ram_mib);
             }
-            SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
+            SRV_TRC("%s", "use `--cache-ram 0` WITHOUT `--cache-disk` to disable the prompt cache\n");
 
             if (params_base.cache_disk_mib > 0 && params_base.cache_disk_path.empty()) {
                 SRV_WRN("%s", "--cache-disk set without --cache-disk-path, disk tier disabled\n");
@@ -1443,8 +1453,8 @@ private:
         metrics.init();
 
         if (params_base.cache_idle_slots) {
-            if (params_base.cache_ram_mib == 0) {
-                SRV_WRN("%s", "--cache-idle-slots requires --cache-ram, disabling\n");
+            if (!prompt_cache) {
+                SRV_WRN("%s", "--cache-idle-slots requires a prompt cache (--cache-ram or --cache-disk), disabling\n");
                 params_base.cache_idle_slots = false;
             } else {
                 if (params_base.kv_unified) {

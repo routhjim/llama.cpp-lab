@@ -1736,7 +1736,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_SLOT_PACK").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
-        string_format("set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)"
+        string_format("prompt-cache RAM RETENTION budget in MiB (default: %d, -1 - no limit, 0 - keep nothing in RAM; with --cache-disk that is the fully NVMe-resident setup, without it the cache is disabled)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),
         [](common_params & params, int value) {
             params.cache_ram_mib = value;
