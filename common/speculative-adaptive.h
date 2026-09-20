@@ -77,6 +77,11 @@ struct common_speculative_adaptive {
         static const bool v = [] { const char * e = getenv("LLAMA_ADAPTIVE_ROI"); return e && atoi(e) != 0; }();
         return v;
     }
+    // start a cold controller at the ceiling and let it drop: all positions are observed at once, no probe needed
+    static bool roi_topdown() {
+        static const bool v = [] { const char * e = getenv("LLAMA_ADAPTIVE_ROI_TOPDOWN"); return e && atoi(e) != 0; }();
+        return v;
+    }
     static float cost_ratio() {
         static const float r = [] { const char * e = getenv("LLAMA_ADAPTIVE_COST_RATIO"); return e ? (float) atof(e) : 0.33f; }();
         return r;
@@ -98,6 +103,13 @@ struct common_speculative_adaptive {
     }
 
     void roi_reset(int cap, int floor) {
+        if (roi_topdown() && !roi_warm(std::min(cap, ROI_MAX))) {
+            n_cur          = std::min(cap, ROI_MAX);
+            steps_at_depth = 0;
+            probe_left     = 0;
+            return;
+        }
+
         int best = floor;
         for (int d = floor + 1; d <= cap && d <= ROI_MAX; ++d) {
             if (roi_warm(d) && roi_rate(d) > roi_rate(best) * (1.0f + ROI_HYST)) { best = d; }
@@ -110,7 +122,9 @@ struct common_speculative_adaptive {
     void roi_update(int n_draft, int n_accepted, int cap, int floor) {
         for (int k = 1; k <= std::min(n_draft, ROI_MAX); ++k) {
             const float x = n_accepted >= k ? 1.0f : 0.0f;
-            p_acc[k] += ROI_ALPHA * (x - p_acc[k]);
+            // running mean until the EMA window is full, else a new position reads low for its first probe
+            const float a = std::max(ROI_ALPHA, 1.0f / (float) (n_obs[k] + 1));
+            p_acc[k] += a * (x - p_acc[k]);
             n_obs[k]++;
         }
         steps_at_depth++;
@@ -126,11 +140,18 @@ struct common_speculative_adaptive {
             return;
         }
 
-        // drop: one shallower is observable right now and pays better
-        if (n_cur > floor && roi_warm(n_cur) && roi_rate(n_cur - 1) > roi_rate(n_cur) * (1.0f + ROI_HYST)) {
-            n_cur--;
-            steps_at_depth = 0;
-            return;
+        // drop: all shallower depths are observed right now, go to the best one
+        // note: a one-step compare stalls at depth, where adjacent rates differ by less than ROI_HYST
+        if (n_cur > floor && roi_warm(n_cur)) {
+            int best = n_cur;
+            for (int d = n_cur - 1; d >= floor; --d) {
+                if (roi_rate(d) > roi_rate(best)) { best = d; }
+            }
+            if (best < n_cur && roi_rate(best) > roi_rate(n_cur) * (1.0f + ROI_HYST)) {
+                n_cur          = best;
+                steps_at_depth = 0;
+                return;
+            }
         }
 
         // climb: only by probing, since position n_cur+1 is unobserved

@@ -409,7 +409,15 @@ struct common_params_speculative {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH_ADAPTIVE || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        uint32_t n = needs_rs_seq ? (uint32_t) std::max(0, draft.n_max) : 0u;
+
+        // a short ngram-mod draft must fit the rollback window too, else each ngram round takes the checkpoint path
+        const bool has_ngram_mod = std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_NGRAM_MOD) != types.end();
+        if (needs_rs_seq && has_ngram_mod && ngram_mod.n_max <= 32) {
+            n = std::max(n, (uint32_t) std::max(0, ngram_mod.n_max));
+        }
+
+        return n;
     }
 };
 
