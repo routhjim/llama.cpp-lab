@@ -3249,7 +3249,13 @@ private:
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                const int n_draft_max = slot.get_n_draft_max();
+                int n_draft_max = slot.get_n_draft_max();
+
+                // a request can lower the draft depth, never raise it: the draft context is sized from the CLI value
+                const int n_draft_req = slot.task->params.speculative.draft.n_max;
+                if (n_draft_req > 0 && n_draft_req < params_base.speculative.draft.n_max) {
+                    n_draft_max = std::min(n_draft_max, n_draft_req);
+                }
 
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());

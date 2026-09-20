@@ -201,12 +201,17 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_desc("Coupled sampling: share per-(position, token) randomness between the drafter and the target so a sampling target accepts a good draft instead of rejecting it on its own dice roll"));
 
 
-    // TODO: to keep things simple, we disable speculative parameter adjustments for now
-#if 0
-    // TODO: for now, be able to adjust only the draft-model based speculative parameters
+    // Per-request draft depth. Lifted above the #if 0 (as speculative.coupled already was) so an
+    // n_max ladder can be swept inside ONE server load: the draft context is sized once from the
+    // CLI --spec-draft-n-max, so every depth shares identical buffers and VRAM, and there is no
+    // cross-load drift between arms. Requests may only lower the depth, never raise it past what
+    // the draft context was allocated for.
     add((new field_num("speculative.n_max", params.speculative.draft.n_max))
         ->set_hard_limits(0, INT32_MAX)
         ->set_desc("Maximum number of tokens to draft during speculative decoding"));
+
+    // TODO: to keep things simple, we disable speculative parameter adjustments for now
+#if 0
 
     add((new field_num("speculative.n_min", params.speculative.draft.n_min))
         ->set_hard_limits(0, INT32_MAX)
