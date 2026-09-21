@@ -1700,6 +1700,16 @@ size_t server_prompt_cache::ram_size() const {
     for (const auto & state : states) {
         if (!state.spilled()) {
             res += state.size();
+        } else {
+            // A spilled entry's `data` is on disk, but spill() does NOT spill the context
+            // checkpoints -- those stay in host RAM. Skipping spilled entries entirely made that
+            // memory invisible to the --cache-ram budget, so it grew without bound: every
+            // completed task leaves a spilled entry behind, and nothing ever counted or freed
+            // its checkpoints. Measured 2026-09-09 on a TB2.1 run: 19 spilled entries at
+            // -ctxcp 4 held ~9.7 GiB of anonymous RAM against a --cache-ram budget of 2 GiB.
+            for (const auto & ckpt : state.prompt.checkpoints) {
+                res += ckpt.size();
+            }
         }
     }
     return res;
@@ -1831,7 +1841,25 @@ void server_prompt_cache::evict_ram(size_t need) {
             ++it;
         }
         if (it == states.end()) {
-            break;
+            // Everything is already spilled, so the only RAM left to reclaim is the checkpoints
+            // those entries still hold. Drop the oldest entry's: a checkpoint is a resume point,
+            // not state, so losing it costs that entry a re-prefill on its next hit and never
+            // correctness. Without this the loop just gave up and the budget stayed breached.
+            auto ck = states.begin();
+            while (ck != states.end() && ck->prompt.checkpoints.empty()) {
+                ++ck;
+            }
+            if (ck == states.end()) {
+                break; // nothing left that can be freed
+            }
+            size_t freed = 0;
+            for (const auto & c : ck->prompt.checkpoints) {
+                freed += c.size();
+            }
+            SRV_WRN(" - prompt cache over --cache-ram, dropping %zu context checkpoint(s) from a spilled entry (%.3f MiB)\n",
+                    ck->prompt.checkpoints.size(), freed / (1024.0 * 1024.0));
+            ck->prompt.checkpoints.clear();
+            continue;
         }
         if (spill(*it)) {
             evict_disk();
