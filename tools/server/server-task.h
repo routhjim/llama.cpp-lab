@@ -623,6 +623,13 @@ struct server_prompt_cache {
         this->limit_tokens = limit_tokens;
         this->disk_limit   = 1024ull*1024ull*(disk_limit_mib < 0 ? 0 : disk_limit_mib);
         this->disk_path    = disk_path;
+        // A fresh instance cannot reload spill blobs left on disk by a prior run: the
+        // prompt token metadata that maps a blob back to a prefix is never persisted,
+        // so orphaned pc-* files are unreloadable and sit outside this instance's LRU
+        // budget forever. Purge them up front so the disk tier does not leak across runs.
+        if (disk_limit != 0 && !this->disk_path.empty()) {
+            clear_disk();
+        }
     }
 
     // disk spill tier (0 = disabled): RAM evictions are written here instead of dropped
@@ -637,6 +644,8 @@ struct server_prompt_cache {
     void   drop(std::list<server_prompt_cache_state>::iterator it);  // erase + delete files
     void   evict_ram(size_t need);   // make `need` bytes of RAM room: spill (or drop) oldest resident entries
     void   evict_disk();             // keep the disk tier under disk_limit
+    void   clear_disk();             // remove orphaned spill files left on disk by a prior run
+    void   on_saved(server_prompt_cache_state * st);  // caller filled the buffers: push to disk tier
 
     std::list<server_prompt_cache_state> states;
 
