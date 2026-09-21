@@ -8594,6 +8594,29 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // FA_DECODE_TEST=1: only folded decode tiles (several tokens x gqa_ratio rows per tile), incl. a partial last tile,
+    // odd KV sizes, split_k-sized KV, quantized KV and sinks
+    if (getenv("FA_DECODE_TEST")) {
+        for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+            for (int64_t gqa : {2, 3, 6, 8}) {
+                for (int64_t kv : {113, 512, 4096, 20000}) {
+                    for (int64_t nb : {2, 3, 4, 5, 7, 8}) {
+                        for (bool sinks : {false, true}) {
+                            for (int64_t hs : {64, 128, 256}) {
+                                test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {gqa, 1}, kv, nb, true, sinks, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+                            }
+                        }
+                        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {gqa, 1}, kv, nb, false, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+                        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {gqa, 1}, kv, nb, true, false, 8.0f, 0, GGML_PREC_F32, type_KV, type_KV));
+                        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {gqa, 1}, kv, nb, true, false, 0, 10.0f, GGML_PREC_DEFAULT, type_KV, type_KV));
+                        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {gqa, 3}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+                    }
+                }
+            }
+        }
+        return test_cases;
+    }
     std::default_random_engine rng(0);
 
     // unary ops
@@ -10575,6 +10598,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // FA_DECODE_PERF=1: only decode-shaped FA at Qwen3.8-27B dims (24 q heads / 4 kv heads, head 256), small batches at depth
+    if (getenv("FA_DECODE_PERF")) {
+        for (ggml_type type_KV : {GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
+            for (int64_t kv : {8192, 32768, 65536}) {
+                for (int64_t nb : {1, 2, 4, 8, 16}) {
+                    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+                }
+            }
+        }
+        return test_cases;
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

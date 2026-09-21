@@ -97,7 +97,13 @@ void main() {
         uint32_t r = (idx + tid) / (HSK / 4);
         if (r < Br && d < HSK / 4 &&
             i * Br + r < N) {
-            Qf[r * qstride + d] = FLOAT_TYPEV4(data_qv4[q_offset / 4 + (i * Br + r) * q_stride / 4 + d] * p.scale);
+            if (p.gqa_ratio > 1) {
+                // folded tile: row G is (token G / gqa_ratio, head G % gqa_ratio)
+                const uint32_t G = i * Br + r;
+                Qf[r * qstride + d] = FLOAT_TYPEV4(data_qv4[(q_offset + (G / p.gqa_ratio) * p.nb01) / 4 + (G % p.gqa_ratio) * q_stride / 4 + d] * p.scale);
+            } else {
+                Qf[r * qstride + d] = FLOAT_TYPEV4(data_qv4[q_offset / 4 + (i * Br + r) * q_stride / 4 + d] * p.scale);
+            }
         }
     }
     barrier();
@@ -123,7 +129,7 @@ void main() {
     if (p.max_bias > 0.0f) {
         if (tid < Br) {
             uint r = tid;
-            slope[r] = perElemOpComputeSlope(r, col_tid, ACC_TYPE(0), iq2);
+            slope[r] = perElemOpComputeSlope(i * Br + r, col_tid, ACC_TYPE(0), iq2);
         }
     } else {
         if (tid < Br) {
@@ -144,6 +150,9 @@ void main() {
         m_offset += ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * p.nem1 * KV;
         mo_offset += ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * CEIL_DIV(p.nem1, Br) * mo_stride;
     }
+
+    // mask row of tile row rr, relative to m_offset. With GQA folding each token of the tile has its own mask row.
+#define MTOK(rr) ((p.gqa_ratio > 1) ? (min(i * Br + (rr), N - 1) / p.gqa_ratio) * KV : 0u)
 
     uint32_t mask_opt = 0;
     uint32_t mask_opt_idx = ~0;
@@ -179,25 +188,25 @@ void main() {
                         if ((!KV_bounds_check || j * Bc + c < KV)) {
                             f16vec4 m;
                             if (!nem1_bounds_check || i * Br + r * 4 + 3 < p.nem1) {
-                                m = f16vec4(data_m[m_offset + (i * Br + r * 4    ) * m_stride + (j * Bc + c)],
-                                            data_m[m_offset + (i * Br + r * 4 + 1) * m_stride + (j * Bc + c)],
-                                            data_m[m_offset + (i * Br + r * 4 + 2) * m_stride + (j * Bc + c)],
-                                            data_m[m_offset + (i * Br + r * 4 + 3) * m_stride + (j * Bc + c)]);
+                                m = f16vec4(data_m[m_offset + (i * Br + r * 4    ) * m_stride + MTOK(r * 4) + (j * Bc + c)],
+                                            data_m[m_offset + (i * Br + r * 4 + 1) * m_stride + MTOK(r * 4 + 1) + (j * Bc + c)],
+                                            data_m[m_offset + (i * Br + r * 4 + 2) * m_stride + MTOK(r * 4 + 2) + (j * Bc + c)],
+                                            data_m[m_offset + (i * Br + r * 4 + 3) * m_stride + MTOK(r * 4 + 3) + (j * Bc + c)]);
                                 max_mask = max(max(max(max(max_mask, float(m[0])), float(m[1])), float(m[2])), float(m[3]));
                             } else if (i * Br + r * 4 + 2 < p.nem1) {
-                                m = f16vec4(data_m[m_offset + (i * Br + r * 4    ) * m_stride + (j * Bc + c)],
-                                            data_m[m_offset + (i * Br + r * 4 + 1) * m_stride + (j * Bc + c)],
-                                            data_m[m_offset + (i * Br + r * 4 + 2) * m_stride + (j * Bc + c)],
+                                m = f16vec4(data_m[m_offset + (i * Br + r * 4    ) * m_stride + MTOK(r * 4) + (j * Bc + c)],
+                                            data_m[m_offset + (i * Br + r * 4 + 1) * m_stride + MTOK(r * 4 + 1) + (j * Bc + c)],
+                                            data_m[m_offset + (i * Br + r * 4 + 2) * m_stride + MTOK(r * 4 + 2) + (j * Bc + c)],
                                             0.0);
                                 max_mask = max(max(max(max_mask, float(m[0])), float(m[1])), float(m[2]));
                             } else if (i * Br + r * 4 + 1 < p.nem1) {
-                                m = f16vec4(data_m[m_offset + (i * Br + r * 4    ) * m_stride + (j * Bc + c)],
-                                            data_m[m_offset + (i * Br + r * 4 + 1) * m_stride + (j * Bc + c)],
+                                m = f16vec4(data_m[m_offset + (i * Br + r * 4    ) * m_stride + MTOK(r * 4) + (j * Bc + c)],
+                                            data_m[m_offset + (i * Br + r * 4 + 1) * m_stride + MTOK(r * 4 + 1) + (j * Bc + c)],
                                             0.0,
                                             0.0);
                                 max_mask = max(max(max_mask, float(m[0])), float(m[1]));
                             } else if (i * Br + r * 4 < p.nem1) {
-                                m = f16vec4(data_m[m_offset + (i * Br + r * 4    ) * m_stride + (j * Bc + c)],
+                                m = f16vec4(data_m[m_offset + (i * Br + r * 4    ) * m_stride + MTOK(r * 4) + (j * Bc + c)],
                                             0.0,
                                             0.0,
                                             0.0);
@@ -539,21 +548,25 @@ void main() {
             uint32_t o_offset = HSV * p.ne1 * (split_k_index + p.k_num * (gqa_iq1 + p.ne2 * iq3)) / 4;
 
             [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-                if (tile_row(r) < N) {
+                const uint32_t G  = i * Br + tile_row(r);
+                const uint32_t tk = G / p.gqa_ratio;
+                if (G < N) {
                     [[unroll]] for (uint32_t d0 = 0; d0 < HSV / 4; d0 += threads_per_rowgroup) {
                         const uint d = d0 + col_tid;
                         if (d >= HSV/4) break;
                         const uint d_local = d0 / threads_per_rowgroup;
-                        gqaStore(tile_row(r), d, Of[r][d_local], o_offset, iq2, N);
+                        gqaStore(G, d, Of[r][d_local], o_offset + tk * (HSV * p.ne1 * p.k_num / 4), iq2, N);
                     }
                 }
             }
 
             o_offset = HSV * p.ne1 * p.k_num * p.ne2 * p.ne3 + p.ne1 * 2 * (split_k_index + p.k_num * (gqa_iq1 + p.ne2 * iq3));
             [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-                if (tile_row(r) < N) {
-                    perElemOpStoreCol0(tile_row(r), 0u, ACC_TYPE(Lf[r]), o_offset, iq2, N);
-                    perElemOpStoreCol0(tile_row(r), 0u, ACC_TYPE(Mf[r]), o_offset + p.ne1, iq2, N);
+                const uint32_t G = i * Br + tile_row(r);
+                if (G < N) {
+                    const uint32_t lm_offset = o_offset + (G / p.gqa_ratio) * (p.ne1 * 2 * p.k_num);
+                    perElemOpStoreCol0(G, 0u, ACC_TYPE(Lf[r]), lm_offset, iq2, N);
+                    perElemOpStoreCol0(G, 0u, ACC_TYPE(Mf[r]), lm_offset + p.ne1, iq2, N);
                 }
             }
         } else {
@@ -584,7 +597,7 @@ void main() {
 
     if ((p.mask_n_head_log2 & SINK_ENABLE_BIT) != 0) {
         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-            float sink = perElemOpGetSink(tile_row(r), 0u, ACC_TYPE(0), iq2);
+            float sink = perElemOpGetSink(i * Br + tile_row(r), 0u, ACC_TYPE(0), iq2);
 
             float ms = 1.0f;
             float vs = 1.0f;
@@ -623,12 +636,14 @@ void main() {
 
     if (p.gqa_ratio > 1) {
         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-            if (tile_row(r) < N) {
+            const uint32_t G  = i * Br + tile_row(r);
+            const uint32_t tk = G / p.gqa_ratio;
+            if (G < N) {
                 [[unroll]] for (uint32_t d0 = 0; d0 < HSV / 4; d0 += threads_per_rowgroup) {
                     const uint d = d0 + col_tid;
                     if (d >= HSV / 4) break;
                     const uint d_local = d0 / threads_per_rowgroup;
-                    gqaStore(tile_row(r), d, Of[r][d_local], o_offset, iq2, N);
+                    gqaStore(G, d, Of[r][d_local], o_offset + tk * (p.ne1 * HSV / 4), iq2, N);
                 }
             }
         }

@@ -122,7 +122,8 @@ layout (binding = 8) readonly buffer IDX {int data_idx[];};
 ACC_TYPE perElemOpStoreCol0(const in uint32_t r, const in uint32_t c, const in ACC_TYPE elem, const in uint32_t o_offset, const in uint32_t iq2, const in uint32_t N)
 {
     if (r < N && c == 0) {
-        uint32_t offset = iq2 + r;
+        // with GQA folding, row r is head r % gqa_ratio
+        uint32_t offset = iq2 + ((p.gqa_ratio > 1) ? r % p.gqa_ratio : r);
         data_o[o_offset + offset] = D_TYPE(elem);
     }
     return elem;
@@ -149,6 +150,11 @@ ACC_TYPE perElemOpGetSink(const in uint32_t r, const in uint32_t c, const in ACC
     return ACC_TYPE(data_s[h]);
 }
 
+// GQA folding: the rows of one KV head are the flat list G = token * gqa_ratio + head, and tile i holds rows
+// i * Br .. i * Br + Br - 1. Row G is (token gqa_iq1 + G / gqa_ratio, head iq2 + G % gqa_ratio), valid if G < N.
+// With one token per dispatch (N == gqa_ratio) the token is gqa_iq1 and i is 0. With packed tiles
+// (N == n_tokens * gqa_ratio) gqa_iq1 is 0 and tiles cross token boundaries, so every tile is full.
+
 uint32_t i, N, KV, split_k_index, Tr, start_j, end_j,
          gqa_iq1, iq2, iq3, rk2, rk3, rv2, rv3, ik2, ik3, iv2, iv3,
          q_stride, k_stride, v_stride, m_stride;
@@ -161,11 +167,13 @@ void init_indices()
     N = p.N;
     KV = p.KV;
 
+    const bool gqa_packed = p.gqa_ratio > 1 && N > p.gqa_ratio;
+
     if (p.k_num > 1) {
         if (p.gqa_ratio > 1) {
-            i = 0;
             // batch and split_k share gl_WorkGroupID.x
-            gqa_iq1 = gl_WorkGroupID.x / p.k_num;
+            i       = gqa_packed ? gl_WorkGroupID.x / p.k_num : 0;
+            gqa_iq1 = gqa_packed ? 0 : gl_WorkGroupID.x / p.k_num;
             split_k_index = gl_WorkGroupID.x % p.k_num;
         } else {
             gqa_iq1 = 0;
@@ -173,8 +181,8 @@ void init_indices()
             i = gl_WorkGroupID.x / p.k_num;
         }
     } else if (p.gqa_ratio > 1) {
-        i = 0;
-        gqa_iq1 = gl_WorkGroupID.x;
+        i       = gqa_packed ? gl_WorkGroupID.x : 0;
+        gqa_iq1 = gqa_packed ? 0 : gl_WorkGroupID.x;
         split_k_index = 0;
     } else {
         i = gl_WorkGroupID.x;
@@ -236,7 +244,8 @@ void init_indices()
     // writes the neutral partial (O = 0, L = 0, M = NEG_FLT_MAX_OVER_2) that the
     // split_k reduce already tolerates.
     if (USE_KV_MAX && MASK_ENABLE) {
-        const uint32_t row_tile = (p.gqa_ratio > 1) ? (gqa_iq1 / Br) : i;
+        // the mask row tile of this tile's first token. Packed tiles are used for at most 8 tokens, one mask row tile.
+        const uint32_t row_tile = (p.gqa_ratio > 1) ? ((gqa_iq1 + (i * Br) / p.gqa_ratio) / Br) : i;
         const uint32_t plane    = (iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2);
         end_j = min(end_j, data_kv_max[plane * CEIL_DIV(p.nem1, Br) + row_tile]);
     }
@@ -250,6 +259,6 @@ const float FATTN_KQ_MAX_OFFSET = 3.0f*0.6931f;
 // Rows index by Q's dimension 2, and the first N rows are valid.
 void gqaStore(const in uint32_t r, const in uint32_t c, const in O_TYPEV4 elems, const in uint32_t o_offset, const in uint32_t iq2, const in uint32_t N)
 {
-    uint32_t offset = (iq2 + r) * HSV / 4 + c;
+    uint32_t offset = (iq2 + r % p.gqa_ratio) * HSV / 4 + c;
     data_ov4[o_offset + offset] = D_TYPEV4(elems);
 }
