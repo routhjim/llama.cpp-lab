@@ -1449,10 +1449,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
     // both norms group over one hc stream, with a weight over the whole hc*n_embd layout
     auto grouped_norm = [&](ggml_tensor * x, ggml_tensor * w) {
         ggml_tensor * t = ggml_reshape_3d(ctx0, x, n_embd, hc, n_tokens);
-        t = ggml_rms_norm(ctx0, t, hparams.f_norm_rms_eps);
-        t = ggml_reshape_2d(ctx0, t, hc_dim, n_tokens);
-        t = ggml_mul(ctx0, t, w);
-        return ggml_reshape_3d(ctx0, t, n_embd, hc, n_tokens);
+        // Keep the mul ADJACENT to the norm so the backend emits a fused RMS_NORM_MUL.
+        // The reshape that used to sit between them split the pair into two dispatches
+        // (the same block that was fixed in build_hc_mix). w is [hc_dim] = [n_embd*hc];
+        // viewing it as [n_embd, hc] broadcasts over the token axis, so the math is
+        // unchanged and the result is already [n_embd, hc, n_tokens].
+        return ggml_mul(ctx0, ggml_rms_norm(ctx0, t, hparams.f_norm_rms_eps),
+                        ggml_reshape_2d(ctx0, w, n_embd, hc));
     };
 
     key = grouped_norm(key, model.layers[il].ple_norm_key);
