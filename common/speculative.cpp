@@ -68,6 +68,15 @@ static int32_t spec_ngram_hint() {
     return v;
 }
 
+// NGRAM CHUNK (LLAMA_NGRAM_CHUNK = N, 0/unset = off): feed an adopted ngram draft N tokens per verify. The lookup
+// keeps its long window (--spec-ngram-mod-n-max 64) as the evidence that a copy span is real, but each verify stays
+// inside the free recurrent rollback window and the cheap <= 8 row band. With LLAMA_NGRAM_TRUST=1 the next chunk
+// is taken from ngram with no drafter pass, until a chunk is not fully accepted.
+static int32_t spec_ngram_chunk() {
+    static const int32_t v = [] { const char * e = getenv("LLAMA_NGRAM_CHUNK"); return e ? std::max(atoi(e), 0) : 0; }();
+    return v;
+}
+
 static bool spec_ngram_trust() {
     static const bool v = [] { const char * e = getenv("LLAMA_NGRAM_TRUST"); return e && atoi(e) != 0; }();
     return v;
@@ -239,6 +248,9 @@ struct common_speculative_impl {
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
+
+    // the driver cut this impl's draft to n tokens before the verify
+    virtual void on_truncate(llama_seq_id /*seq_id*/, int32_t /*n*/) {}
 
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     // exchange all per-sequence state between two sequence ids (see common_speculative_seq_swap)
@@ -2526,6 +2538,12 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         }
     }
 
+    void on_truncate(llama_seq_id seq_id, int32_t n) override {
+        if (seq_id >= 0 && (size_t) seq_id < sinfos.size()) {
+            sinfos[seq_id].n_draft_last = std::min<int32_t>(sinfos[seq_id].n_draft_last, n);
+        }
+    }
+
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
         if (is_other) {
             return;
@@ -3556,6 +3574,18 @@ void common_speculative_draft(common_speculative * spec) {
                             (unsigned long long) n_try, (unsigned long long) n_hit,
                             100.0 * n_hit / n_try, n_hit ? (double) n_ext_tok / n_hit : 0.0);
                 }
+            }
+        }
+    }
+
+    if (spec_ngram_chunk() > 0) {
+        for (size_t i = 0; i < dparams.size(); ++i) {
+            auto * impl = spec->impl_last[i];
+            auto * res  = dparams[i].result;
+            if (was_drafting[i] && res != nullptr && impl != nullptr && impl->type == COMMON_SPECULATIVE_TYPE_NGRAM_MOD &&
+                    (int32_t) res->size() > spec_ngram_chunk()) {
+                res->resize(spec_ngram_chunk());
+                impl->on_truncate((llama_seq_id) i, spec_ngram_chunk());
             }
         }
     }
