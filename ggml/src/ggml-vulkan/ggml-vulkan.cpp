@@ -11234,7 +11234,29 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         // workgroups proportionally in y dimension. The shader will detect gqa_ratio > 1
         // and change addressing calculations to index Q's dimension 2.
         gqa_ratio = qk_ratio;
-        N = gqa_ratio;
+
+        // With one token per dispatch, a small decode batch reads the whole KV once per token and leaves a 16-row
+        // coopmat block mostly empty (6 of 16 rows at gqa_ratio 6), so N tokens cost N times one. Pack instead: the rows
+        // of one KV head are the flat list token * gqa_ratio + head, cut into full tiles that cross token boundaries.
+        // GGML_VK_FA_GQA_TOK=1 keeps one token per dispatch.
+        static const bool gqa_pack = [] {
+            const char * e = getenv("GGML_VK_FA_GQA_TOK");
+            return e == nullptr || atoi(e) > 1;
+        }();
+        const bool sparse_wanted = ggml_get_op_params_i32(dst, 4) > 0 && ggml_vk_fa_sparse_enabled();
+        const uint32_t n_tok = N;
+        bool packed = gqa_pack && n_tok > 1 && tuning_params.path == FA_COOPMAT1 && !sparse_wanted;
+        if (packed) {
+            const vk_fa_tuning_params tp = get_fa_tuning_params(ctx->device, HSK, HSV, gqa_ratio * n_tok, KV, k_type_eff, v_type_eff, f32acc);
+            packed = tp.path == FA_COOPMAT1 && tp.block_rows >= gqa_ratio;
+            if (packed) {
+                N = gqa_ratio * n_tok;
+                workgroups_x = CEIL_DIV(N, tp.block_rows);
+            }
+        }
+        if (!packed) {
+            N = gqa_ratio;
+        }
         workgroups_y /= gqa_ratio;
     }
 
