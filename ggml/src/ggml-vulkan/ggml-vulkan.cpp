@@ -5446,7 +5446,21 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // Hold the product near the 32 that works at 8 columns instead:
     //   <=4 base | 5-8 -> 4 (32) | 9-10 -> 3 (27-30) | 11-16 -> 2 (22-32) | 17+ -> 1 (<=32)
     const bool is_rdna3 = device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA3;
+    // GGML_VK_RM_INT_COLS="r1,r2,...": rows-per-workgroup by column count, 0 keeps the default (tuning aid)
+    static const std::vector<uint32_t> rm_int_cols_override = [] {
+        std::vector<uint32_t> v;
+        const char * e = getenv("GGML_VK_RM_INT_COLS");
+        if (e != nullptr) {
+            std::stringstream ss(e);
+            std::string tok;
+            while (std::getline(ss, tok, ',')) { v.push_back((uint32_t) std::max(0, atoi(tok.c_str()))); }
+        }
+        return v;
+    }();
     auto const &rm_int_n = [&](uint32_t rows, uint32_t i) -> uint32_t {
+        if (i < rm_int_cols_override.size() && rm_int_cols_override[i] > 0) {
+            return rm_int_cols_override[i];
+        }
         if (!is_rdna3) {
             return rows;
         }
