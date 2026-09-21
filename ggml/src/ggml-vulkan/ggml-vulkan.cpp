@@ -3993,11 +3993,7 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
 }
 
 static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc) {
-    GGML_UNUSED(n_rows);
     GGML_UNUSED(n_kv);
-    GGML_UNUSED(k_type);
-    GGML_UNUSED(v_type);
-    GGML_UNUSED(f32acc);
 
     vk_fa_tuning_params result{};
     result.path = FA_COOPMAT1;
@@ -4014,6 +4010,24 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
     result.row_split = num_subgroups;
     result.subgroup_size = device->subgroup_size;
     result.workgroup_size = num_subgroups * result.subgroup_size;
+
+    // A small batch (packed GQA decode tiles, 17..48 rows) fits one tile of 2 or 3 row chunks: K, V and the mask are
+    // staged once per tile, so fewer tiles means fewer passes over the KV. GGML_VK_FA_CM1_ROWS caps the tile rows.
+    static const uint32_t cm1_rows_max = [] {
+        const char * e = getenv("GGML_VK_FA_CM1_ROWS");
+        return e ? (uint32_t) std::max(16, atoi(e)) : 48u;
+    }();
+    // note: not for big batches. Measured on a 7900 XTX, 48-row tiles cost prefill 3-5% at 16k-64k depth.
+    if (n_rows > coopmat_block_rows && n_rows <= 48) {
+        uint32_t rows = std::min(ROUNDUP_POW2(n_rows, coopmat_block_rows), cm1_rows_max / coopmat_block_rows * coopmat_block_rows);
+        for (; rows > coopmat_block_rows; rows -= coopmat_block_rows) {
+            result.block_rows = rows;
+            if (ggml_vk_flash_attn_coopmat_shmem_support(device, result, hsk, hsv, f32acc, k_type, v_type)) {
+                break;
+            }
+        }
+        result.block_rows = rows;
+    }
 
     const uint32_t D_lsb = D ^ (D & (D-1));  // extract lowest set bit
     result.d_split = std::min(std::min(result.subgroup_size, 8u), D_lsb / 4);
@@ -11129,7 +11143,7 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
     // BF16 PVMat accumulator is f32 (no bf16 accumulator support), so pvsh is vec4 (16 bytes)
     const uint32_t pvsh_elem_size = (k_type == GGML_TYPE_BF16) ? 16u : f16vec4;
     const uint32_t osh_stride = params.row_split * MatBr / 4;
-    const uint32_t pvsh = MatBc * osh_stride * pvsh_elem_size;
+    const uint32_t pvsh = Br * osh_stride * pvsh_elem_size;
 
     const uint32_t slope = Br * acctype;
 
