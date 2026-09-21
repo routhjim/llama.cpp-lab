@@ -1,3 +1,4 @@
+#include <map>
 #include "llama-memory-hybrid-idx.h"
 
 #include "llama-impl.h"
@@ -71,34 +72,63 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         const uint32_t n_stream  = mem_idx->get_n_stream();
         const int64_t  idx_dim   = model.hparams.indexer_head_size;
 
-        ggml_init_params params = { ggml_tensor_overhead()*(layer_ids.size() + 1), nullptr, true };
-        pooled_ctx.reset(ggml_init(params));
-
-        ggml_backend_buffer_type_t buft = nullptr;
-        size_t bytes = 0;
+        // Group the QSA layers by the buffer type of THEIR OWN k storage, and give each group its
+        // own context + buffer.
+        //
+        // This used to take `buft` from whichever layer came first and allocate every layer's
+        // pooled store into that single buffer. With --tensor-split that is wrong: the first QSA
+        // layer (blk.3 on Flash-Next) sits on the iGPU, so the pooled stores for the layers that
+        // actually run on the second device were allocated on the FIRST device and had to be
+        // copied across the bus on every decode step. MEASURED on a 88/12 split: indexer_k-47 and
+        // indexer_k_fresh-47 appear as ggml-sched split inputs at 640K/1024K/2048K/4096K for
+        // contexts of 5k/10k/20k/40k -- i.e. ~128 B/token each, growing linearly -- while the main
+        // KV never crosses at all, because llama_kv_cache picks its buffer per layer from
+        // model.dev_layer(il). This makes the pooled cache follow the same rule.
+        std::map<ggml_backend_buffer_type_t, std::vector<int32_t>> by_buft;
         for (const auto il : layer_ids) {
             const uint32_t r = model.hparams.dsv4_compress_ratios[il];
             if (r == 0 || idx_dim == 0) {
                 continue;
             }
-            const uint32_t rows = pooled_rows_for(r);
-            ggml_tensor * t = ggml_new_tensor_3d(pooled_ctx.get(), GGML_TYPE_F32, idx_dim, rows, n_stream);
-            ggml_format_name(t, "qsa_pooled_l%d", il);
-            pooled_k[il]    = t;
-            pooled_rows[il] = rows;
-            pooled_w[r].assign(n_stream, 0);
-            bytes += ggml_nbytes(t);
-            if (buft == nullptr) {
-                buft = ggml_backend_buffer_get_type(mem_idx->get_k_storage(il)->buffer);
+            by_buft[ggml_backend_buffer_get_type(mem_idx->get_k_storage(il)->buffer)].push_back(il);
+        }
+        size_t bytes = 0;
+        for (auto & kv : by_buft) {
+            ggml_backend_buffer_type_t buft = kv.first;
+            const auto & ils = kv.second;
+
+            ggml_init_params params = { ggml_tensor_overhead()*(ils.size() + 1), nullptr, true };
+            ggml_context_ptr cx;
+            cx.reset(ggml_init(params));
+
+            size_t group_bytes = 0;
+            for (const auto il : ils) {
+                const uint32_t r    = model.hparams.dsv4_compress_ratios[il];
+                const uint32_t rows = pooled_rows_for(r);
+                ggml_tensor * t = ggml_new_tensor_3d(cx.get(), GGML_TYPE_F32, idx_dim, rows, n_stream);
+                ggml_format_name(t, "qsa_pooled_l%d", il);
+                pooled_k[il]    = t;
+                pooled_rows[il] = rows;
+                pooled_w[r].assign(n_stream, 0);
+                group_bytes += ggml_nbytes(t);
             }
+
+            ggml_backend_buffer_ptr bp;
+            bp.reset(ggml_backend_alloc_ctx_tensors_from_buft(cx.get(), buft));
+            GGML_ASSERT(bp && "failed to allocate the QSA pooled key cache");
+            ggml_backend_buffer_clear(bp.get(), 0);
+
+            LLAMA_LOG_INFO("%s: QSA pooled key cache: %zu layer(s) x %u stream(s), %.1f MiB (%s)\n",
+                    __func__, ils.size(), n_stream, group_bytes/1024.0/1024.0, ggml_backend_buft_name(buft));
+
+            bytes += group_bytes;
+            pooled_ctxs.push_back(std::move(cx));
+            pooled_bufs.push_back(std::move(bp));
         }
         if (!pooled_k.empty()) {
-            pooled_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(pooled_ctx.get(), buft));
-            GGML_ASSERT(pooled_buf && "failed to allocate the QSA pooled key cache");
-            ggml_backend_buffer_clear(pooled_buf.get(), 0);
             pooled_n_stream = n_stream;
-            LLAMA_LOG_INFO("%s: QSA pooled key cache: %zu layers x %u streams, %.1f MiB (%s)\n",
-                    __func__, pooled_k.size(), n_stream, bytes/1024.0/1024.0, ggml_backend_buft_name(buft));
+            LLAMA_LOG_INFO("%s: QSA pooled key cache total: %zu layers, %.1f MiB across %zu buffer type(s)\n",
+                    __func__, pooled_k.size(), bytes/1024.0/1024.0, by_buft.size());
         }
     }
 }
