@@ -78,6 +78,11 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // ngram hint (LLAMA_NGRAM_HINT=N): a long ngram proposal, adopted by the drafter when its first N tokens agree
+    const llama_tokens * hint         = nullptr;
+    int32_t              hint_n       = 0;
+    bool                 hint_adopted = false;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

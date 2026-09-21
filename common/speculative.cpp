@@ -59,6 +59,20 @@ static int32_t spec_ngram_ext() {
     return v;
 }
 
+// NGRAM HINT (LLAMA_NGRAM_HINT = agreement prefix N, 0/unset = off). Like LLAMA_NGRAM_EXT, but the check runs
+// INSIDE the drafter loop: after N drafter passes that match the ngram proposal, the long ngram draft is adopted
+// and the drafter stops. A good fire costs N drafter passes instead of a full-depth draft. ngram misfires are
+// bimodal (they die in the first 1-2 tokens), so a short agreement prefix filters most of them.
+static int32_t spec_ngram_hint() {
+    static const int32_t v = [] { const char * e = getenv("LLAMA_NGRAM_HINT"); return e ? std::max(atoi(e), 0) : 0; }();
+    return v;
+}
+
+static bool spec_ngram_trust() {
+    static const bool v = [] { const char * e = getenv("LLAMA_NGRAM_TRUST"); return e && atoi(e) != 0; }();
+    return v;
+}
+
 static int32_t spec_draft_top_k() {
     static int32_t v = 0;
     if (v == 0) {
@@ -1006,6 +1020,28 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     std::vector<int> n_last; // [n_seq] tokens drafted in the most recent draft() call
     std::vector<common_speculative_adaptive> adaptive_ctrl; // [n_seq] per-seq depth controller
 
+    // confidence gate (LLAMA_DFLASH_CONF=1): cut the block where the chained selector confidence stops paying for a verify row
+    std::vector<std::vector<float>> conf_q;                 // [n_seq] cumulative confidence per drafted token
+    std::vector<float>              conf_len;               // [n_seq] EMA of the gated draft length, sizes the next block
+    double   conf_pred[16] = {};
+    uint64_t conf_obs [16] = {};
+    uint64_t conf_cnt [16] = {};
+    uint64_t conf_rounds = 0;
+
+    static bool conf_mode() {
+        static const bool v = [] { const char * e = getenv("LLAMA_DFLASH_CONF"); return e && atoi(e) != 0; }();
+        return v;
+    }
+    static float conf_decay() {
+        static const float v = [] { const char * e = getenv("LLAMA_ADAPTIVE_CONF_DECAY"); return e ? (float) atof(e) : 1.0f; }();
+        return v;
+    }
+    // LLAMA_DFLASH_CONF_BLOCK=1: also shrink the drafted block after gated rounds. prose +10%, reasoning -7% on q38: opt-in
+    static bool conf_block() {
+        static const bool v = [] { const char * e = getenv("LLAMA_DFLASH_CONF_BLOCK"); return e && atoi(e) != 0; }();
+        return v;
+    }
+
     // depth by occupancy: LLAMA_DFLASH_DEPTH_BY_OCC="5,3,2,2" = draft depth when 1,2,3,4+ sequences draft in the
     // same step (the last entry covers any higher count). The verify batch is n_active*(depth+1) rows, and the
     // Vulkan mat-vec path holds up to GGML_VULKAN_MMV_MAX_COLS rows, so the best depth falls with occupancy:
@@ -1320,6 +1356,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             const auto & dp = dparams[seq_id];
             if (!dp.drafting) { continue; }
             int32_t d = occ > 0 ? occ : (adaptive ? adaptive_ctrl[seq_id].n_cur : params.n_max);
+            if (conf_mode() && conf_block() && (size_t) seq_id < conf_len.size()) {
+                // the gate cut recent blocks short: draft a smaller block, keep 2 positions of headroom to grow back
+                d = std::min(d, std::max(2, (int32_t) std::ceil(conf_len[seq_id]) + 2));
+            }
             if (dp.n_max > 0 && dp.n_max < d) { d = dp.n_max; }
             n_draft_common = std::min(n_draft_common, d);
         }
@@ -1372,6 +1412,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (is_dflash2) {
                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
+
+                if (conf_q.size() < (size_t) n_seq) { conf_q.resize(n_seq); }
+                auto & cq = conf_q[seq_id];
+                cq.clear();
 
                 int32_t predecessor = 0;
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
@@ -1428,7 +1472,33 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                             break;
                         }
                     }
+                    {
+                        // selector confidence of the picked candidate, chained over the block
+                        float sum = 0.0f;
+                        for (int32_t k = 0; k < selector_top_k; ++k) {
+                            sum += std::exp(scores[k] - scores[predecessor]);
+                        }
+                        const float q = (cq.empty() ? 1.0f : cq.back() * conf_decay()) / sum;
+
+                        if (conf_mode() && !cq.empty()) {
+                            // the block is already drafted: a position costs one verify row (r) and yields q tokens
+                            const float r = common_speculative_adaptive::cost_ratio();
+                            float e = 0.0f;
+                            for (float x : cq) { e += x; }
+                            if (q < r * (1.0f + e) / (1.0f + r * (float) cq.size())) {
+                                break;
+                            }
+                        }
+                        cq.push_back(q);
+                    }
                     result.push_back((llama_token) row[predecessor]);
+                }
+
+                if (conf_len.size() < (size_t) n_seq) { conf_len.resize(n_seq, (float) params.n_max); }
+                if ((int32_t) result.size() >= n_block_tokens - 1) {
+                    conf_len[seq_id] = (float) params.n_max; // the gate did not cut: a run started, go back to the full block now
+                } else {
+                    conf_len[seq_id] += 0.25f * ((float) result.size() - conf_len[seq_id]);
                 }
 
                 n_last[seq_id] = (int32_t) result.size();
@@ -1500,6 +1570,22 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
         // feed the adaptive controller only when this implementation produced the accepted draft
+        if (!is_other && seq_id >= 0 && seq_id < (llama_seq_id) conf_q.size()) {
+            const auto & cq = conf_q[seq_id];
+            for (size_t k = 0; k < cq.size() && k < 15; ++k) {
+                conf_pred[k + 1] += cq[k];
+                conf_obs [k + 1] += n_accepted > k ? 1 : 0;
+                conf_cnt [k + 1]++;
+            }
+            if (!cq.empty() && ++conf_rounds % 256 == 0) {
+                std::string msg;
+                for (int k = 1; k < 16 && conf_cnt[k] >= 32; ++k) {
+                    msg += string_format(" %d:%.2f/%.2f", k, conf_pred[k] / conf_cnt[k], (double) conf_obs[k] / conf_cnt[k]);
+                }
+                SPC_INF("dflash conf calib (pos:pred/obs, %llu rounds):%s\n", (unsigned long long) conf_rounds, msg.c_str());
+            }
+        }
+
         if (adaptive && !is_other && seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
             const int depth_before = adaptive_ctrl[seq_id].n_cur;
             adaptive_ctrl[seq_id].update(n_last[seq_id], n_accepted, params.n_max, params.n_min_adaptive);
@@ -1659,6 +1745,29 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     const bool adaptive;
     std::vector<common_speculative_adaptive> adaptive_ctrl; // [n_seq] per-seq depth controller
     std::vector<int32_t>                     n_last;        // [n_seq] tokens drafted on the last pass
+
+    // confidence gate (LLAMA_ADAPTIVE_CONF=1, draft-mtp-adaptive only): stop the draft when the
+    // cumulative drafter confidence no longer pays for one more drafter pass. No EMA, no probe.
+    std::vector<std::vector<float>> conf_q;                 // [n_seq] cumulative confidence per drafted token
+    static constexpr int CONF_MAX = 32;
+    double   conf_pred[CONF_MAX + 1] = {};                  // calibration log: predicted vs observed acceptance by position
+    uint64_t conf_obs [CONF_MAX + 1] = {};
+    uint64_t conf_cnt [CONF_MAX + 1] = {};
+    uint64_t conf_rounds = 0;
+
+    static bool conf_mode() {
+        static const bool v = [] { const char * e = getenv("LLAMA_ADAPTIVE_CONF"); return e && atoi(e) != 0; }();
+        return v;
+    }
+    // the drafter is calibrated at positions 1-2 and overconfident deeper: observed/predicted falls ~5% per position
+    static float conf_decay() {
+        static const float v = [] { const char * e = getenv("LLAMA_ADAPTIVE_CONF_DECAY"); return e ? (float) atof(e) : 0.95f; }();
+        return v;
+    }
+    static float conf_pow() {
+        static const float v = [] { const char * e = getenv("LLAMA_ADAPTIVE_CONF_POW"); return e ? (float) atof(e) : 1.0f; }();
+        return v;
+    }
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq,
                                       common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_MTP)
@@ -1939,6 +2048,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             n_drafting++;
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
+            if (conf_q.size() < (size_t) n_seq) { conf_q.resize(n_seq); }
+            conf_q[seq_id].clear();
 
             common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
@@ -2024,7 +2135,43 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
-                const int n_draft_seq = adaptive ? adaptive_ctrl[seq_id].n_cur : params.n_max;
+                if (dp.hint != nullptr && dp.hint_n > 0 && (int) result.size() == dp.hint_n && dp.hint->size() > result.size() &&
+                        std::equal(result.begin(), result.end(), dp.hint->begin())) {
+                    result = *dp.hint;
+                    dp.hint_adopted = true;
+                    drafting[seq_id] = false;
+                    n_drafting--;
+                    continue;
+                }
+
+                const bool conf_gate = adaptive && conf_mode();
+
+                int n_draft_seq = (adaptive && !conf_gate) ? adaptive_ctrl[seq_id].n_cur : params.n_max;
+                if (dp.n_max > 0 && dp.n_max < n_draft_seq) {
+                    n_draft_seq = dp.n_max;
+                }
+
+                if (adaptive) {
+                    // confidence of the token we drafted, chained over the draft so far
+                    float p_id = 0.0f;
+                    for (size_t k = 0; k < cur_p->size; ++k) {
+                        if (cur_p->data[k].id == id) { p_id = cur_p->data[k].p; break; }
+                    }
+                    auto & cq = conf_q[seq_id];
+                    const float q = (cq.empty() ? 1.0f : cq.back() * conf_decay()) * std::pow(p_id, conf_pow());
+                    cq.push_back(q);
+
+                    if (conf_gate) {
+                        // one more drafter pass costs r steps and yields at most q tokens: stop when q < r * rate
+                        const float r = common_speculative_adaptive::cost_ratio();
+                        float e = 0.0f;
+                        for (float x : cq) { e += x; }
+                        const float rate = (1.0f + e) / (1.0f + r * (float) cq.size());
+                        if (q < r * rate) {
+                            n_draft_seq = (int) result.size();
+                        }
+                    }
+                }
                 if (n_draft_seq <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
@@ -2082,6 +2229,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
         // must precede the early-outs below: the controller has to observe every verify, including
         // ones that produced no rows, or its statistics silently skip the bad outcomes.
+        if (adaptive && !is_other && seq_id >= 0 && seq_id < (llama_seq_id) conf_q.size()) {
+            const auto & cq = conf_q[seq_id];
+            for (size_t k = 0; k < cq.size() && k < (size_t) CONF_MAX; ++k) {
+                conf_pred[k + 1] += cq[k];
+                conf_obs [k + 1] += n_accepted > k ? 1 : 0;
+                conf_cnt [k + 1]++;
+            }
+            if (!cq.empty() && ++conf_rounds % 256 == 0) {
+                std::string msg;
+                for (int k = 1; k <= CONF_MAX && conf_cnt[k] >= 32; ++k) {
+                    msg += string_format(" %d:%.2f/%.2f", k, conf_pred[k] / conf_cnt[k], (double) conf_obs[k] / conf_cnt[k]);
+                }
+                SPC_INF("mtp conf calib (pos:pred/obs, %llu rounds):%s\n", (unsigned long long) conf_rounds, msg.c_str());
+            }
+        }
+
         if (adaptive && !is_other && seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
             const int depth_before = adaptive_ctrl[seq_id].n_cur;
             adaptive_ctrl[seq_id].update(n_last[seq_id], n_accepted, params.n_max, params.n_min_adaptive);
@@ -2570,6 +2733,10 @@ struct common_speculative {
 
     // which implementaion was used for a given seq_id
     std::vector<common_speculative_impl *> impl_last;
+
+    // ngram trust (LLAMA_NGRAM_TRUST=1): after a fully accepted ngram draft, take the next ngram proposal without a drafter check
+    std::vector<int32_t> n_draft_last;
+    std::vector<uint8_t> ng_trust;
 
     std::vector<double> synth_probs;
 };
@@ -3223,9 +3390,57 @@ void common_speculative_draft(common_speculative * spec) {
         }
     }
 
+    common_speculative_impl * ng_hint = nullptr;
+    std::vector<llama_tokens> hints;
+    if (spec_ngram_hint() > 0 || (spec_ngram_ext() > 0 && spec_ngram_trust())) {
+        for (auto & impl : spec->impls) {
+            if (impl->type == COMMON_SPECULATIVE_TYPE_NGRAM_MOD) { ng_hint = impl.get(); break; }
+        }
+    }
+    spec->n_draft_last.resize(dparams.size(), 0);
+    spec->ng_trust.resize(dparams.size(), 0);
+    std::vector<uint8_t> was_drafting(dparams.size(), 0);
+    for (size_t i = 0; i < dparams.size(); ++i) { was_drafting[i] = dparams[i].drafting; }
+    if (ng_hint != nullptr) {
+        hints.resize(dparams.size());
+        const auto dparams_save = dparams;
+        for (size_t i = 0; i < dparams.size(); ++i) { dparams[i].result = &hints[i]; }
+        {
+            common_time_meas tm(ng_hint->t_draft_us, !ng_hint->gen_perf);
+            ng_hint->draft(dparams);
+            ng_hint->n_call_draft++;
+        }
+        dparams = dparams_save;
+        static uint64_t n_trusted = 0;
+        for (size_t i = 0; i < dparams.size(); ++i) {
+            auto & dp = dparams[i];
+            dp.hint         = nullptr;
+            dp.hint_n       = spec_ngram_hint();
+            dp.hint_adopted = false;
+            if (!dp.drafting || hints[i].empty()) {
+                continue;
+            }
+            if (spec_ngram_trust() && spec->ng_trust[i]) {
+                // the last ngram draft was fully accepted: a copy span is contiguous, skip the drafter
+                *dp.result  = hints[i];
+                dp.drafting = false;
+                spec->impl_last[i] = ng_hint;
+                ng_hint->n_gen_drafts++;
+                ng_hint->n_gen_tokens += dp.result->size();
+                if (++n_trusted % 100 == 0) {
+                    SPC_INF("ngram-trust: %llu drafts taken without a drafter check\n", (unsigned long long) n_trusted);
+                }
+                continue;
+            }
+            if (spec_ngram_hint() > 0) {
+                dp.hint = &hints[i];
+            }
+        }
+    }
+
     for (auto & impl : spec->impls) {
-        // with the gate on, ngram must NOT pre-empt: it is applied below as an extension instead
-        if (spec_ngram_ext() > 0 && impl->type == COMMON_SPECULATIVE_TYPE_NGRAM_MOD) {
+        // with the gate on, ngram must NOT pre-empt: it is applied as a hint (above) or an extension (below) instead
+        if ((spec_ngram_ext() > 0 || ng_hint != nullptr) && impl->type == COMMON_SPECULATIVE_TYPE_NGRAM_MOD) {
             continue;
         }
         {
@@ -3279,6 +3494,24 @@ void common_speculative_draft(common_speculative * spec) {
         }
     }
 
+    if (ng_hint != nullptr) {
+        static uint64_t n_prop = 0, n_adopt = 0;
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
+            auto & dp = dparams[seq_id];
+            if (dp.hint != nullptr) { n_prop++; }
+            if (dp.hint_adopted) {
+                n_adopt++;
+                spec->impl_last[seq_id] = ng_hint;
+                ng_hint->n_gen_drafts++;
+                ng_hint->n_gen_tokens += dp.result->size();
+            }
+            dp.hint = nullptr;
+            if (dp.hint_adopted && n_adopt % 100 == 0) {
+                SPC_INF("ngram-hint: proposed=%llu adopted=%llu (%.1f%%)\n", (unsigned long long) n_prop, (unsigned long long) n_adopt, 100.0 * n_adopt / n_prop);
+            }
+        }
+    }
+
     // gated ngram extension: adopt ngram's (long) draft only where it agrees with the drafter's
     // first N tokens. See spec_ngram_ext() above.
     if (spec_ngram_ext() > 0) {
@@ -3327,6 +3560,12 @@ void common_speculative_draft(common_speculative * spec) {
         }
     }
 
+    for (size_t i = 0; i < dparams.size(); ++i) {
+        if (was_drafting[i] && dparams[i].result != nullptr) {
+            spec->n_draft_last[i] = (int32_t) dparams[i].result->size();
+        }
+    }
+
     // these sequences failed to generate a draft
     for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
         auto & dp = dparams[seq_id];
@@ -3339,6 +3578,11 @@ void common_speculative_draft(common_speculative * spec) {
 
 void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
     common_speculative_impl * impl = spec->impl_last[seq_id];
+
+    if ((size_t) seq_id < spec->ng_trust.size()) {
+        spec->ng_trust[seq_id] = impl != nullptr && impl->type == COMMON_SPECULATIVE_TYPE_NGRAM_MOD &&
+                                 n_accepted > 0 && (int32_t) n_accepted == spec->n_draft_last[seq_id];
+    }
 
     if (impl == nullptr) {
         GGML_ASSERT(n_accepted == 0);
