@@ -102,7 +102,7 @@
          padding: 6px 9px; border-radius: 3px; background: var(--gain-soft); color: var(--gain); }
 
   /* findings */
-  .findings { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }
+  .findings { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 380px), 1fr)); gap: 16px; }
   .finding { background: var(--panel); border: 1px solid var(--rule); border-radius: 6px; padding: 20px; display: grid; gap: 10px; align-content: start; }
   .finding .big { font: 700 34px/1 var(--display); color: var(--accent); font-variant-numeric: tabular-nums; }
   .finding p { font-size: 15px; }
@@ -280,6 +280,10 @@
         <span class="big">0.389 µs</span>
         <p>per token of context on top of a 41.53 ms step: Flash-Next decode at np1 is linear in KV length, with no cliffs.</p>
       </div>
+      <div class="finding">
+        <span class="big">−5.7% / −0.3%</span>
+        <p>perplexity from an Engram-style n-gram memory table trained post hoc on a <em>frozen</em> Qwen3.8-27B: −5.7% on held-out text from its training mix, −5.1% on agent prose, but −0.3% on the agent's own shell commands and −0.12% on wikitext. Flash-Next trains its table jointly; this measures the post-hoc case. On gfx1151, fla's Triton gated-DeltaNet backward returns NaN gradients, so train with the PyTorch path.</p>
+      </div>
     </div>
   </section>
 
@@ -298,6 +302,7 @@
           <tr><td>Sparse flash attention at prefill</td><td><span class="delta">−18% at 16k, −10% at 32k</span><br>Pays only past ~33k context (+7% at 64k).</td></tr>
           <tr><td>Adaptive MTP depth on Flash-Next at np ≥ 2</td><td><span class="delta">−5% to −9% per slot</span><br>Fixed depth wins at every concurrency on this model.</td></tr>
           <tr><td>Naive q4_K requant of Flash-Next's dense tensors</td><td><span class="delta">+6.4% perplexity</span><br>For +23% single-stream decode, shrinking to about +7% at np4.</td></tr>
+          <tr><td>Scaling up a post-hoc n-gram table for agent work</td><td><span class="delta">−0.3% perplexity</span><br>On agent command blocks after 3M tokens and 14.7 h of training; only 1.6% of Terminal-Bench 2.1 steps were fixable by it.</td></tr>
           <tr><td>Drafter temperature calibration and support truncation</td><td><span class="delta">no effect</span><br>Temperature scale 0.7–1.5 and top-k 10/15/32 left acceptance unchanged.</td></tr>
         </tbody>
       </table>
