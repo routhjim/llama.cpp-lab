@@ -52,6 +52,13 @@ The Flash-Next concurrency work (#15-#18) has its own write-up:
   8-bit dense path, 21% the MoE experts. At np4 and above the expert union takes over.
 - **Decode is linear in KV length** on Flash-Next at np1: 41.53 ms + 0.389 µs per token of context,
   with no cliffs.
+- **A post-hoc n-gram memory table helps prose, not commands.** An Engram-style hashed 2/3-gram
+  table (4M rows, gated injection after layer 3) trained for 3M tokens on a *frozen* Qwen3.8-27B,
+  the post-hoc version of the table Flash-Next trains jointly: perplexity -5.7% on held-out text
+  from its training mix and -5.1% on an agent's analysis prose, but -0.3% on the agent's own shell
+  command blocks and -0.12% on wikitext. Only 1.6% of Terminal-Bench 2.1 steps were fixable by it.
+  On gfx1151, fla's Triton gated-DeltaNet kernels run forward but return NaN gradients backward;
+  train with the plain PyTorch path.
 
 ## What did not work
 
@@ -65,6 +72,7 @@ Recorded so nobody has to measure them again.
 | Drafter temperature calibration (0.7-1.5) and support truncation (top-k 10/15/32) | no effect on acceptance |
 | Adaptive MTP depth on Flash-Next at np ≥ 2 | -5 to -9% per slot; fixed depth wins |
 | Naive q4_K requant of Flash-Next's dense path | +23% decode, but +6.4% perplexity |
+| Scaling up a post-hoc n-gram table for agent work | -0.3% perplexity on agent command blocks after 14.7 h of training on the iGPU; not worth a bigger table |
 
 ## Build
 
