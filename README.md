@@ -42,6 +42,8 @@ Each row is one merged change, measured on this machine with the other backend u
 
 The Flash-Next concurrency work (#15-#18) has its own write-up:
 [`docs/flash-next-concurrency.md`](docs/flash-next-concurrency.md).
+The dense-path requant study has its own too:
+[`docs/flash-next-dense-requant.md`](docs/flash-next-dense-requant.md).
 
 ## Findings that are not code
 
@@ -59,6 +61,14 @@ The Flash-Next concurrency work (#15-#18) has its own write-up:
   command blocks and -0.12% on wikitext. Only 1.6% of Terminal-Bench 2.1 steps were fixable by it.
   On gfx1151, fla's Triton gated-DeltaNet kernels run forward but return NaN gradients backward;
   train with the plain PyTorch path.
+- **A target requant costs the MTP drafter, even at equal quality.** Requantizing Flash-Next's
+  8-bit dense path with an importance matrix can keep perplexity equal to UD-Q4_K_XL (ratio 0.997),
+  yet MTP acceptance still drops 2-3 points (0.687 to 0.662-0.668 at depth 3), and only at draft
+  positions 2 and 3: at depth 1 it is unchanged. So C1's +18.5% without a drafter becomes +4.0%
+  in production (C2T8: +2.9%). A no-drafter benchmark overstates any requant of a model served with MTP.
+- **Speculative step cost is simple enough to predict.** On Flash-Next at np1: a no-drafter step is
+  about 42 ms, each draft position adds about 11 ms, and dense bytes saved come off at about 4.4 us
+  per MiB. Fitted on depth 3, it predicted depth 2 within 0.7 tok/s for both models tested.
 
 ## What did not work
 
@@ -72,6 +82,8 @@ Recorded so nobody has to measure them again.
 | Drafter temperature calibration (0.7-1.5) and support truncation (top-k 10/15/32) | no effect on acceptance |
 | Adaptive MTP depth on Flash-Next at np ≥ 2 | -5 to -9% per slot; fixed depth wins |
 | Naive q4_K requant of Flash-Next's dense path | +23% decode, but +6.4% perplexity |
+| Importance-matrix requant of the dense path, served with MTP | quality equal to UD, but +2 to +4% decode in production (C1: +18.5% without a drafter). We run C2T8 anyway; see [the write-up](docs/flash-next-dense-requant.md) |
+| MTP draft depth 2 on Flash-Next at np1 | -5.3% vs depth 3 on UD, -0.9% on C2T8 |
 | Scaling up a post-hoc n-gram table for agent work | -0.3% perplexity on agent command blocks after 14.7 h of training on the iGPU; not worth a bigger table |
 
 ## Build
