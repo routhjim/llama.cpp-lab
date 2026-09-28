@@ -284,6 +284,10 @@
         <span class="big">−5.7% / −0.3%</span>
         <p>perplexity from an Engram-style n-gram memory table trained post hoc on a <em>frozen</em> Qwen3.8-27B: −5.7% on held-out text from its training mix, −5.1% on agent prose, but −0.3% on the agent's own shell commands and −0.12% on wikitext. Flash-Next trains its table jointly; this measures the post-hoc case. On gfx1151, fla's Triton gated-DeltaNet backward returns NaN gradients, so train with the PyTorch path.</p>
       </div>
+      <div class="finding">
+        <span class="big">+18.5% &rarr; +2.9%</span>
+        <p>decode from requantizing Flash-Next's 8-bit dense path, measured without a drafter and then in production with the MTP drafter at depth 3. Quality can match UD-Q4_K_XL (perplexity ratio 0.997), but drafter acceptance still drops 2&ndash;3 points, only at draft positions 2 and 3. A no-drafter benchmark overstates any requant of a model served with MTP. <a href="https://github.com/routhjim/llama.cpp-lab/pull/50">Write-up (#50)</a>.</p>
+      </div>
     </div>
   </section>
 
@@ -302,6 +306,8 @@
           <tr><td>Sparse flash attention at prefill</td><td><span class="delta">−18% at 16k, −10% at 32k</span><br>Pays only past ~33k context (+7% at 64k).</td></tr>
           <tr><td>Adaptive MTP depth on Flash-Next at np ≥ 2</td><td><span class="delta">−5% to −9% per slot</span><br>Fixed depth wins at every concurrency on this model.</td></tr>
           <tr><td>Naive q4_K requant of Flash-Next's dense tensors</td><td><span class="delta">+6.4% perplexity</span><br>For +23% single-stream decode, shrinking to about +7% at np4.</td></tr>
+          <tr><td>Importance-matrix requant of the dense tensors, served with MTP</td><td><span class="delta">+2% to +4%</span><br>Quality equal to UD, but the drafter accepts less; within run-to-run noise. The best variant (C2T8) is the default anyway. <a href="https://github.com/routhjim/llama.cpp-lab/pull/50">#50</a></td></tr>
+          <tr><td>MTP draft depth 2 instead of 3 on Flash-Next at np1</td><td><span class="delta">&minus;5.3%</span><br>On UD-Q4_K_XL (&minus;0.9% on C2T8). A step-cost model fitted on depth 3 predicted both within 0.7 tok/s.</td></tr>
           <tr><td>Scaling up a post-hoc n-gram table for agent work</td><td><span class="delta">−0.3% perplexity</span><br>On agent command blocks after 3M tokens and 14.7 h of training; only 1.6% of Terminal-Bench 2.1 steps were fixable by it.</td></tr>
           <tr><td>Drafter temperature calibration and support truncation</td><td><span class="delta">no effect</span><br>Temperature scale 0.7–1.5 and top-k 10/15/32 left acceptance unchanged.</td></tr>
         </tbody>
