@@ -695,6 +695,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
             if (std::string(llama_sampler_name(smp)) == "dist") { dist = smp; }
         }
     }
+
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+
     size_t i = 0;
     for (; i < draft.size(); i++) {
         if (dist && i < gsmpl->coupled_pos.size()) {
@@ -706,7 +709,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
         result.push_back(id);
 
-        if (draft[i] != id) {
+        // do not accept draft tokens after an EOG - they are not output but would stay in the context
+        // on replay the last token is from the target and can be EOG, so a trailing EOG is still accepted
+        if (draft[i] != id || (llama_vocab_is_eog(vocab, id) && i + 1 < draft.size())) {
             break;
         }
     }

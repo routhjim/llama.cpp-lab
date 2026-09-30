@@ -39,6 +39,7 @@ Each row is one merged change, measured on this machine with the other backend u
 | Flash-Next concurrency set: indexer pooling, pooled-key cache, sparse FA, upstream indexer fix | [#15](https://github.com/routhjim/llama.cpp-lab/pull/15)-[#18](https://github.com/routhjim/llama.cpp-lab/pull/18) | 227 ms/step | **156 ms/step** | Flash-Next, np4, one 59k slot + two short |
 | Coupled (Gumbel-max) sampling between drafter and target | [#26](https://github.com/routhjim/llama.cpp-lab/pull/26) | 0.466 / 0.576 acceptance | **0.540 / 0.688** (code / thinking) | Qwen3.8-27B + DFlash2, temp 1.0 |
 | Confidence-gated draft depth, ngram agreement gates, chunked ngram drafts, per-request `n_max`, mat-vec row override | [#43](https://github.com/routhjim/llama.cpp-lab/pull/43)-[#46](https://github.com/routhjim/llama.cpp-lab/pull/46) | 89.6 tok/s (best static MTP) | **109.2 tok/s** geomean over 5 content kinds | Qwen3.8-27B, XTX, np1 (autoregressive is 34.0) |
+| Upstream PLE row prefetch ([ggml-org #29599](https://github.com/ggml-org/llama.cpp/pull/29599)), picked with #29638 (no draft accept after EOG) and #29280 (Vulkan descriptor reuse) | [#51](https://github.com/routhjim/llama.cpp-lab/pull/51) | 215 / 247 / 239 tok/s prefill | **262 / 289 / 272 (+22% / +17% / +14%)** at 512 / 4k / 16k | Flash-Next C2T8, 84/16 split, MTP 3, cold page cache, ABBA; decode unchanged |
 
 The Flash-Next concurrency work (#15-#18) has its own write-up:
 [`docs/flash-next-concurrency.md`](docs/flash-next-concurrency.md).
@@ -84,6 +85,7 @@ Recorded so nobody has to measure them again.
 | Naive q4_K requant of Flash-Next's dense path | +23% decode, but +6.4% perplexity |
 | Importance-matrix requant of the dense path, served with MTP | quality equal to UD, but +2 to +4% decode in production (C1: +18.5% without a drafter). We run C2T8 anyway; see [the write-up](docs/flash-next-dense-requant.md) |
 | MTP draft depth 2 on Flash-Next at np1 | -5.3% vs depth 3 on UD, -0.9% on C2T8 |
+| Upstream MoE-aware `mul_mat_id` tile selection ([ggml-org #29182](https://github.com/ggml-org/llama.cpp/pull/29182)) | -6% prefill at 4k and 16k on Flash-Next (ABBA, same build otherwise); not picked |
 | Scaling up a post-hoc n-gram table for agent work | -0.3% perplexity on agent command blocks after 14.7 h of training on the iGPU; not worth a bigger table |
 
 ## Build
