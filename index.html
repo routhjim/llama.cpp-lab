@@ -172,6 +172,27 @@
     <div class="ledger">
       <div class="row">
         <div class="what">
+          <h3>MTP draft head re-fit to the requantized target it serves</h3>
+          <div class="prs"><a href="https://github.com/routhjim/llama.cpp-lab/pull/52">#52</a><a href="https://huggingface.co/Jrouth/Qwen3.8-Flash-Next-MTP-C2T8-refit-GGUF">weights</a></div>
+          <div class="cond">Flash-Next C2T8 · 84/16 iGPU/XTX · MTP depth 3 · 12 real TB2.1 requests · <a href="https://github.com/routhjim/llama.cpp-lab/blob/main/docs/flash-next-mtp-refit.md">write-up</a></div>
+        </div>
+        <div class="nums"><span class="before">0.651 acceptance</span><span class="after">0.692 <small>acceptance</small></span></div>
+        <div class="meter"><span class="factor">1.034&times;</span><div class="track"><div class="fill" style="width:2%"></div></div><div class="scale"><span>1&times;</span><span>2.5&times;</span></div></div>
+        <div class="meter"><span class="tag">+4.1 pts acceptance</span></div>
+      </div>
+
+      <div class="row">
+        <div class="what">
+          <h3>Upstream PLE row prefetch (madvise), picked with the EOG draft fix and Vulkan descriptor reuse</h3>
+          <div class="prs"><a href="https://github.com/routhjim/llama.cpp-lab/pull/51">#51</a></div>
+          <div class="cond">Flash-Next C2T8 prefill at 512 / 4k / 16k · cold page cache · ABBA · decode unchanged</div>
+        </div>
+        <div class="nums"><span class="before">215 / 247 / 239 tok/s</span><span class="after">262 / 289 / 272 <small>tok/s</small></span></div>
+        <div class="meter"><span class="factor">1.17&times;</span><div class="track"><div class="fill" style="width:11%"></div></div><div class="scale"><span>1&times;</span><span>2.5&times;</span></div></div>
+      </div>
+
+      <div class="row">
+        <div class="what">
           <h3>MTP (nextn) speculative head for Qwen3.8-Flash-Next</h3>
           <div class="prs"><a href="https://github.com/routhjim/llama.cpp-lab/pull/1">#1</a></div>
           <div class="cond">iGPU · np1 · greedy · 62–86% acceptance</div>
@@ -288,6 +309,10 @@
         <span class="big">+18.5% &rarr; +2.9%</span>
         <p>decode from requantizing Flash-Next's 8-bit dense path, measured without a drafter and then in production with the MTP drafter at depth 3. Quality can match UD-Q4_K_XL (perplexity ratio 0.997), but drafter acceptance still drops 2&ndash;3 points, only at draft positions 2 and 3. A no-drafter benchmark overstates any requant of a model served with MTP. <a href="https://github.com/routhjim/llama.cpp-lab/blob/main/docs/flash-next-dense-requant.md">Write-up</a>.</p>
       </div>
+      <div class="finding">
+        <span class="big">0.651 &rarr; 0.692</span>
+        <p>live draft acceptance after re-fitting the MTP head to the requantized model it serves, which closes the gap above. The head was trained against the bf16 weights; 20 minutes of training on the iGPU against C2T8's own top-20 distribution, unrolled over draft depths 1&ndash;3, recovers the loss and passes UD's 0.687. A torch port of the head predicted the live acceptance to three decimals (0.663 vs 0.662). Output is unchanged; decode +2&ndash;3%. <a href="https://github.com/routhjim/llama.cpp-lab/blob/main/docs/flash-next-mtp-refit.md">Write-up</a> &middot; <a href="https://huggingface.co/Jrouth/Qwen3.8-Flash-Next-MTP-C2T8-refit-GGUF">weights</a>.</p>
+      </div>
     </div>
   </section>
 
@@ -306,10 +331,11 @@
           <tr><td>Sparse flash attention at prefill</td><td><span class="delta">−18% at 16k, −10% at 32k</span><br>Pays only past ~33k context (+7% at 64k).</td></tr>
           <tr><td>Adaptive MTP depth on Flash-Next at np ≥ 2</td><td><span class="delta">−5% to −9% per slot</span><br>Fixed depth wins at every concurrency on this model.</td></tr>
           <tr><td>Naive q4_K requant of Flash-Next's dense tensors</td><td><span class="delta">+6.4% perplexity</span><br>For +23% single-stream decode, shrinking to about +7% at np4.</td></tr>
-          <tr><td>Importance-matrix requant of the dense tensors, served with MTP</td><td><span class="delta">+2% to +4%</span><br>Quality equal to UD, but the drafter accepts less; within run-to-run noise. The best variant (C2T8) is the default anyway. <a href="https://github.com/routhjim/llama.cpp-lab/blob/main/docs/flash-next-dense-requant.md">write-up</a></td></tr>
+          <tr><td>Importance-matrix requant of the dense tensors, served with MTP</td><td><span class="delta">+2% to +4%</span><br>Quality equal to UD, but the drafter accepts less; within run-to-run noise. The best variant (C2T8) is the default anyway, and a re-fit head wins the acceptance back (<a href="https://github.com/routhjim/llama.cpp-lab/pull/52">#52</a>). <a href="https://github.com/routhjim/llama.cpp-lab/blob/main/docs/flash-next-dense-requant.md">write-up</a></td></tr>
           <tr><td>MTP draft depth 2 instead of 3 on Flash-Next at np1</td><td><span class="delta">&minus;5.3%</span><br>On UD-Q4_K_XL (&minus;0.9% on C2T8). A step-cost model fitted on depth 3 predicted both within 0.7 tok/s.</td></tr>
           <tr><td>Scaling up a post-hoc n-gram table for agent work</td><td><span class="delta">−0.3% perplexity</span><br>On agent command blocks after 3M tokens and 14.7 h of training; only 1.6% of Terminal-Bench 2.1 steps were fixable by it.</td></tr>
-          <tr><td>Drafter temperature calibration and support truncation</td><td><span class="delta">no effect</span><br>Temperature scale 0.7–1.5 and top-k 10/15/32 left acceptance unchanged.</td></tr>
+          <tr><td>Upstream MoE-aware <code>mul_mat_id</code> tile selection (ggml-org #29182)</td><td><span class="delta">&minus;6% prefill</span><br>At 4k and 16k on Flash-Next, same build otherwise. Not picked.</td></tr>
+          <tr><td>Drafter temperature calibration and support truncation</td><td><span class="delta">no effect</span><br>Temperature scale 0.7–1.5 and top-k 10/15/32 left acceptance unchanged. Re-fitting the head itself did help (<a href="https://github.com/routhjim/llama.cpp-lab/pull/52">#52</a>).</td></tr>
         </tbody>
       </table>
     </div>
