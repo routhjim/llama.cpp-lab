@@ -3824,7 +3824,12 @@ private:
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
+                            // LLAMA_CKPT_USER_BREAK=0: agent harnesses only append, so a checkpoint at the last user message
+                            // is never restored, and the extra batch it forces costs a full MoE expert sweep (~0.6 s on
+                            // Flash-Next). Keep only the min-step breaks then.
+                            static const bool user_break = [] { const char * e = getenv("LLAMA_CKPT_USER_BREAK"); return e == nullptr || atoi(e) != 0; }();
+                            const bool min_step = !checkpoints.empty() && pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step;
+                            if (min_step || (user_break && (pos == last_user_pos || checkpoints.empty()))) {
                                 break;
                             }
                         }

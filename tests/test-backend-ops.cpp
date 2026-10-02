@@ -8595,6 +8595,14 @@ static const ggml_type other_types[] = {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // 512 experts, top-10 (Flash-Next / qwen4exp): hoisted row ids past 256 experts and the gather path
+    for (int64_t n : {33, 129, 700}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false, 64, n, 256));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_1, GGML_TYPE_F32, 512, 10, false, 64, n, 128));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 10, false, 64, n, 256));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16,  GGML_TYPE_F32, 512, 10, false, 64, n, 128));
+    }
+
     // FA_DECODE_TEST=1: only folded decode tiles (several tokens x gqa_ratio rows per tile), incl. a partial last tile,
     // odd KV sizes, split_k-sized KV, quantized KV and sinks
     if (getenv("FA_DECODE_TEST")) {
