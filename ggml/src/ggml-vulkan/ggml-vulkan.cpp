@@ -991,6 +991,9 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
+    // MoE for small per-expert batches over count_experts' hoisted row ids (GGML_VK_MMID_GATHER)
+    vk_pipeline pipeline_mmid_gather_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
+    uint32_t mmid_gather_cols = 0;
 
     vk_pipeline pipeline_mul_mat_vec_p021_f16_f32[p021_max_gqa_ratio];
     vk_pipeline pipeline_mul_mat_vec_nc_f16_f32;
@@ -5647,6 +5650,27 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q5_0], "mul_mat_vec_id_q5_0_q8_1_f32", arr_dmmv_id_q5_0_q8_1_f32_len[reduc], arr_dmmv_id_q5_0_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_id(1*rm_stdq_int), 1, 1}, {wg_size_subgroup_int, rm_id(1*rm_stdq_int)}, 1, true, use_subgroups, subgroup_size_int);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q5_1], "mul_mat_vec_id_q5_1_q8_1_f32", arr_dmmv_id_q5_1_q8_1_f32_len[reduc], arr_dmmv_id_q5_1_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_id(1*rm_stdq_int), 1, 1}, {wg_size_subgroup_int, rm_id(1*rm_stdq_int)}, 1, true, use_subgroups, subgroup_size_int);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q8_0], "mul_mat_vec_id_q8_0_q8_1_f32", arr_dmmv_id_q8_0_q8_1_f32_len[reduc], arr_dmmv_id_q8_0_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_id(1*rm_stdq_int), 1, 1}, {wg_size_subgroup_int, rm_id(1*rm_stdq_int)}, 1, true, use_subgroups, subgroup_size_int);
+
+            {
+                static const uint32_t gcols = [] { const char * e = getenv("GGML_VK_MMID_GATHER_COLS"); return e ? (uint32_t) atoi(e) : 8u; }();
+                static const uint32_t grows = [] { const char * e = getenv("GGML_VK_MMID_GATHER_ROWS"); return e ? (uint32_t) atoi(e) : 0u; }();
+                device->mmid_gather_cols = gcols;
+                // only the subgroup-sized variant is dispatched; the 4x one would not fit tmpsh at larger row counts
+#define MMID_GATHER(T, tn, rows) { \
+                    const void * gd[3] = { mul_mat_vec_id_gather_##tn##_q8_1_f32_data, mul_mat_vec_id_gather_##tn##_q8_1_f32_subgroup_data, mul_mat_vec_id_gather_##tn##_q8_1_f32_subgroup_no_shmem_data }; \
+                    const uint64_t gl[3] = { mul_mat_vec_id_gather_##tn##_q8_1_f32_len, mul_mat_vec_id_gather_##tn##_q8_1_f32_subgroup_len, mul_mat_vec_id_gather_##tn##_q8_1_f32_subgroup_no_shmem_len }; \
+                    const uint32_t r_ = grows ? grows : (rows); ggml_vk_create_pipeline(device, device->pipeline_mmid_gather_q8_1_f32[w][T], "mul_mat_vec_id_gather_" #tn "_q8_1_f32", gl[reduc], gd[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {r_, 1, 1}, {wg_size_subgroup_int, r_, gcols}, 1, true, use_subgroups, subgroup_size_int); }
+                if (w == DMMV_WG_SIZE_SUBGROUP) {
+                MMID_GATHER(GGML_TYPE_Q4_0, q4_0, rm_id(1*rm_stdq_int))
+                MMID_GATHER(GGML_TYPE_Q5_0, q5_0, rm_id(1*rm_stdq_int))
+                MMID_GATHER(GGML_TYPE_Q5_1, q5_1, rm_id(1*rm_stdq_int))
+                MMID_GATHER(GGML_TYPE_Q8_0, q8_0, rm_id(1*rm_stdq_int))
+                MMID_GATHER(GGML_TYPE_Q4_K, q4_k, rm_id(1*rm_kq_int))
+                MMID_GATHER(GGML_TYPE_Q5_K, q5_k, rm_id(1*rm_kq_int))
+                MMID_GATHER(GGML_TYPE_Q6_K, q6_k, rm_id(1*rm_kq_int))
+                }
+#undef MMID_GATHER
+            }
 
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_MXFP4], "mul_mat_vec_id_mxfp4_q8_1_f32", arr_dmmv_id_mxfp4_q8_1_f32_len[reduc], arr_dmmv_id_mxfp4_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_id(2*rm_stdq_int), 1, 1}, {wg_size_subgroup_int, rm_id(2*rm_stdq_int)}, 1, true, use_subgroups, subgroup_size_int);
 
@@ -10452,7 +10476,8 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     // n_as counts, n_as offsets, one total, then one packed row id per (expert, token).
     // Hoisting requires 16-bit indices for the packing and a table that fits one binding.
     const uint64_t hoisted_row_id_words = 2 * n_as + 1 + nei0 * nei1;
-    const bool hoist_row_ids = n_as <= 256 && nei0 <= 0xffff && nei1 <= 0xffff &&
+    // count_experts sizes its per-expert shared counters for up to 512 experts (Flash-Next / qwen4exp)
+    const bool hoist_row_ids = n_as <= 512 && nei0 <= 0xffff && nei1 <= 0xffff &&
                                 hoisted_row_id_words * sizeof(uint32_t) <=
                                     ctx->device->properties.limits.maxStorageBufferRange;
 
@@ -10519,6 +10544,21 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         mmp = ggml_vk_get_mul_mat_mat_id_pipeline(ctx, src0->type, y_non_contig ? f16_type : src1->type, (ggml_prec)dst->op_params[0]);
         quantize_y = false;
     }
+
+    // GGML_VK_MMID_GATHER: the gathered mat-vec reads q8_1 activations, so keep the quantization even when no
+    // int8 MUL_MAT_ID matmul exists for this type (the matmul is bypassed below)
+    {
+        static const bool gather_env = [] { const char * e = getenv("GGML_VK_MMID_GATHER"); return e != nullptr && atoi(e) != 0; }();
+        static const uint32_t gather_kdiv_q = [] { const char * e = getenv("GGML_VK_MMID_GATHER_KDIV"); return e ? (uint32_t) atoi(e) : 128u; }();
+        const bool gather_small_q = (nei0 * nei1 + n_as - 1) / n_as <= std::max<uint64_t>(1, ne10 / gather_kdiv_q);
+        if (gather_env && gather_small_q && !quantize_y && hoist_row_ids && ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 &&
+                ctx->device->pipeline_mmid_gather_q8_1_f32[DMMV_WG_SIZE_SUBGROUP][src0->type] != nullptr) {
+            quantize_y = true;
+        }
+    }
+
+
 
     const bool qx_needs_dequant = mmp == nullptr || x_non_contig;
     bool qy_needs_dequant = !quantize_y && ((src1->type != f16_type && !y_f32_kernel) || y_non_contig);
@@ -10631,6 +10671,11 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
             ggml_pipeline_request_descriptor_sets(ctx, to_q8_1, 1);
         }
         ggml_pipeline_request_descriptor_sets(ctx, count_experts, 1);
+        for (int w = 0; w < DMMV_WG_SIZE_COUNT; ++w) {
+            if (ctx->device->pipeline_mmid_gather_q8_1_f32[w][src0->type]) {
+                ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_mmid_gather_q8_1_f32[w][src0->type], 1);
+            }
+        }
     }
 
     vk_buffer d_D = dst_buf_ctx->dev_buffer;
@@ -10761,6 +10806,41 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 
     if (!ggml_vk_dim01_contiguous(src1) && !qy_needs_dequant && !quantize_y) {
         stride_batch_y = src1->nb[0] / ggml_type_size(src1->type);
+    }
+
+    // GGML_VK_MMID_GATHER=1: small per-expert batches as a gathered mat-vec over the hoisted row ids
+    {
+        static const bool gather_on = [] { const char * e = getenv("GGML_VK_MMID_GATHER"); return e != nullptr && atoi(e) != 0; }();
+        // it re-reads an expert's weights once per NUM_COLS of its tokens, so it only wins while experts get few tokens:
+        // measured crossovers (gfx1151, 512x10) ~20 tokens/expert at k=2560 and ~5 at k=640 -> tokens/expert <= k/128
+        const uint64_t tok_per_expert = (nei0 * nei1 + n_as - 1) / n_as;
+        static const uint32_t gather_kdiv = [] { const char * e = getenv("GGML_VK_MMID_GATHER_KDIV"); return e ? (uint32_t) atoi(e) : 128u; }();
+        const bool gather_small = tok_per_expert <= std::max<uint64_t>(1, ne10 / gather_kdiv);
+        vk_pipeline gp = (gather_on && gather_small && hoist_row_ids && quantize_y && !qx_needs_dequant && !y_needs_reformat &&
+                dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst)) ?
+            ctx->device->pipeline_mmid_gather_q8_1_f32[DMMV_WG_SIZE_SUBGROUP][src0->type] : nullptr;
+        if (gp != nullptr) {
+            const vk_mat_vec_id_push_constants gpc = {
+                (uint32_t)ne10, (uint32_t)ne10, stride_b_y, (uint32_t)ne01,
+                stride_batch_x, stride_batch_y, (uint32_t)(ne20 * ne21),
+                0,
+                (uint32_t)nei0, (uint32_t)ne11, (uint32_t)n_as, nbi1 / (uint32_t)ggml_type_size(ids->type)
+            };
+            const uint32_t rows = gp->wg_denoms[0];
+            uint32_t gx = CEIL_DIV((uint32_t)ne01, rows);
+            uint32_t gz = 1;
+            const uint32_t max_gx = ctx->device->properties.limits.maxComputeWorkGroupCount[0];
+            if (gx > max_gx) { gz = 64; gx = CEIL_DIV(gx, gz); }
+            vk_subbuffer dD = { d_D, d_buf_offset, d_sz };
+            ggml_vk_dispatch_pipeline(ctx, subctx, gp,
+                { vk_subbuffer{ d_X, x_buf_offset, x_sz }, vk_subbuffer{ d_Y, y_buf_offset, y_sz }, dD, dD, dD, expert_count_buf },
+                gpc, { gx * rows, (uint32_t)n_as, gz });
+            if (y_needs_reformat || quantize_y) {
+                ctx->prealloc_y_need_sync = true;
+            }
+            ctx->prealloc_split_k_need_sync = true;
+            return;
+        }
     }
 
     // compute

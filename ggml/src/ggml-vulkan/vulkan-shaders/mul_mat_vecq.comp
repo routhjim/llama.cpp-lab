@@ -122,8 +122,162 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     reduce_result(temp, d_offset, first_row, num_rows, tid);
 }
 
+#ifdef MUL_MAT_ID_GATHER
+// MoE for small per-expert batches: one workgroup per (row block, expert). The expert's (slot, token) list comes
+// from count_experts' hoisted table in data_ids (counts [0, E), offsets [E, 2E), total [2E], packed ids after),
+// with E = p.expert_i1. Each pass streams the expert's weight rows once and applies them to up to NUM_COLS of
+// its tokens, so a weight row is read ceil(count / NUM_COLS) times instead of once per token.
+void iter_g(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint col, const uint b_qs_idx, const uint bo[NUM_COLS]) {
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        const uint b_block_idx = col / QUANT_K_Q8_1 + bo[j];
+        const uint b_block_idx_outer = b_block_idx / 4;
+        const uint b_block_idx_inner = b_block_idx % 4;
+        cache_b_ds = vec2(data_b[b_block_idx_outer].ds[b_block_idx_inner]);
+
+#if QUANT_R == 2
+        cache_b_qs[0] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx];
+        cache_b_qs[1] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx + 4];
+#else
+#if K_PER_ITER == 8
+        cache_b_qs[0] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx * 2];
+        cache_b_qs[1] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx * 2 + 1];
+#elif K_PER_ITER == 16
+        cache_b_qs[0] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx * 4    ];
+        cache_b_qs[1] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx * 4 + 1];
+        cache_b_qs[2] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx * 4 + 2];
+        cache_b_qs[3] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx * 4 + 3];
+#else
+#error unimplemented
+#endif
+#endif
+
+        uint ibi = first_row*p.ncols;
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            const uint a_block_idx = (ibi + col)/QUANT_K_Q8_1 + a_offset;
+            ibi += p.ncols;
+
+            temp[j][n] += mmvq_dot_product(a_block_idx, b_qs_idx);
+        }
+    }
+}
+
+void reduce_g(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint dofs[NUM_COLS], const uint nv, const uint first_row, const uint num_rows, const uint tid) {
+#ifdef USE_SUBGROUP_ADD_NO_SHMEM
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            temp[j][n] = subgroupAdd(temp[j][n]);
+        }
+    }
+    if (tid == 0) {
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            if (j < nv) {
+                [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+                    data_d[dofs[j] + first_row + n] = D_TYPE(temp[j][n]);
+                }
+            }
+        }
+    }
+#else
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            tmpsh[j][n][tid] = temp[j][n];
+        }
+    }
+    barrier();
+    [[unroll]] for (uint s = BLOCK_SIZE/2; s > 0; s >>= 1) {
+        if (tid < s) {
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+                    tmpsh[j][n][tid] += tmpsh[j][n][tid + s];
+                }
+            }
+        }
+        barrier();
+    }
+    if (tid == 0) {
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            if (j < nv) {
+                [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+                    data_d[dofs[j] + first_row + n] = D_TYPE(tmpsh[j][n][0]);
+                }
+            }
+        }
+    }
+    barrier();
+#endif
+}
+
+void compute_outputs_g(const uint first_row, const uint num_rows) {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint e = gl_WorkGroupID.y;
+    const uint n_experts = p.expert_i1;
+    const uint count = uint(data_ids[e]);
+    if (count == 0) {
+        return;
+    }
+    const uint ids_base = 2 * n_experts + 1 + uint(data_ids[n_experts + e]);
+
+    a_offset = e * (p.batch_stride_a / QUANT_K);
+    a_offset *= QUANT_K / QUANT_K_Q8_1;
+
+    const uint col_stride = K_PER_ITER * BLOCK_SIZE;
+    const uint b_qs_idx = tid % (32 / K_PER_ITER);
+
+    for (uint c0 = 0; c0 < count; c0 += NUM_COLS) {
+        const uint nv = min(NUM_COLS, count - c0);
+        uint bo[NUM_COLS];
+        uint dofs[NUM_COLS];
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            // pad a short last pass by repeating its last token; those columns are computed but never written
+            const uint packed = uint(data_ids[ids_base + c0 + min(j, nv - 1)]);
+            const uint i00 = packed & 0xffffu;   // expert slot
+            const uint i01 = packed >> 16;       // token
+            bo[j]   = ((i00 % p.ne11) * p.stride_b + i01 * p.batch_stride_b) / QUANT_K_Q8_1;
+            dofs[j] = i00 * p.stride_d + i01 * p.batch_stride_d;
+        }
+
+        FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+                temp[j][n] = FLOAT_TYPE(0.0f);
+            }
+        }
+
+        uint num_iters = p.ncols / col_stride;
+        if (num_iters * col_stride + K_PER_ITER * tid < p.ncols) {
+            num_iters++;
+        }
+        uint col = tid * K_PER_ITER;
+        while (num_iters >= 2) {
+            iter_g(temp, first_row, num_rows, col, b_qs_idx, bo);
+            col += col_stride;
+            iter_g(temp, first_row, num_rows, col, b_qs_idx, bo);
+            col += col_stride;
+            num_iters -= 2;
+        }
+        if (num_iters > 0) {
+            iter_g(temp, first_row, num_rows, col, b_qs_idx, bo);
+        }
+
+        reduce_g(temp, dofs, nv, first_row, num_rows, tid);
+    }
+}
+#endif
+
 void main() {
     const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+
+#ifdef MUL_MAT_ID_GATHER
+    if (first_row >= p.stride_d) {
+        return;
+    }
+    if (first_row + NUM_ROWS <= p.stride_d) {
+        compute_outputs_g(first_row, NUM_ROWS);
+    } else {
+        compute_outputs_g(first_row, p.stride_d - first_row);
+    }
+    return;
+#endif
 
 #ifdef NEEDS_INIT_IQ_SHMEM
     init_iq_shmem(gl_WorkGroupSize);
