@@ -8642,6 +8642,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16,  GGML_TYPE_F32, 512, 10, false, 64, n, 128));
     }
 
+    // int8 coopmat1 MMQ (upstream #27952): quantized mat-mat and MUL_MAT_ID with q8_1 activations.
+    // n=16 is still mat-vec with GGML_VULKAN_MMV_MAX_COLS=16, n=17 is the first mat-mat column count;
+    // m=272 leaves a partial tile on every tile size, k=8192 with small m/n exercises split_k.
+    for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K,
+                             GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_MXFP4}) {
+        for (int64_t n : {16, 17, 64, 256, 512, 2048}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 272, n, 1024, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 64, 17, 8192, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 128, 64, 1024, {2, 3}, {1, 1}));
+    }
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K}) {
+        for (int64_t n : {33, 64, 256, 512, 2048}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 96, n, 512));
+        }
+    }
+
     // FA_DECODE_TEST=1: only folded decode tiles (several tokens x gqa_ratio rows per tile), incl. a partial last tile,
     // odd KV sizes, split_k-sized KV, quantized KV and sinks
     if (getenv("FA_DECODE_TEST")) {
@@ -10651,6 +10668,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // skinny f32 products from Flash-Next prefill (hyper-connection gates): m below one matmul tile, large k
+    for (auto [m, k] : std::vector<std::pair<int,int>>{{4, 10240}, {1, 2560}, {48, 2560}, {4, 2560}}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, m, 256, k, {1, 1}, {1, 1}));
+    }
+
+    // int8 coopmat1 MMQ (upstream #27952) A/B shapes: dense mat-mat and 512-expert top-10 MUL_MAT_ID prefill
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K}) {
+        for (int bs : {16, 17, 64, 256, 512, 2048}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 5120, bs, 5120, {1, 1}, {1, 1}));
+        }
+        for (int bs : {33, 64, 256, 512, 2048}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 768, bs, 2560));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 2560, bs, 768));
+        }
+    }
 
     // FA_DECODE_PERF=1: only decode-shaped FA at Qwen3.8-27B dims (24 q heads / 4 kv heads, head 256), small batches at depth
     if (getenv("FA_DECODE_PERF")) {
