@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>llama.cpp-lab</title>
-<meta name="description" content="Measured llama.cpp changes for AMD Strix Halo (gfx1151) on Vulkan/RADV, with every before/after number and the negative results.">
+<meta name="description" content="Measured llama.cpp changes for AMD Strix Halo (gfx1151) and two Radeon RX 7900 XTX on Vulkan/RADV, with every before/after number and the negative results.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&display=swap">
@@ -123,6 +123,16 @@
   .build { display: grid; gap: 14px; }
   .note { font-size: 15px; color: var(--muted); }
 
+  /* setup sections */
+  .setup { display: grid; gap: 26px; }
+  .setup-head { display: grid; gap: 10px; border-left: 4px solid var(--accent); padding-left: 16px; }
+  .setup-head h2 { font-size: 38px; }
+  .setup-head .stack { font: 400 13px/1.5 var(--mono); color: var(--muted); }
+  .sub { font: 600 13px/1.2 var(--body); letter-spacing: .1em; text-transform: uppercase; color: var(--muted); margin: 6px 0 -8px; }
+  .neg tr.grp td { font: 600 12px/1.2 var(--body); letter-spacing: .1em; text-transform: uppercase; color: var(--accent);
+                   padding-top: 22px; border-top: 0; }
+  .callout { background: var(--accent-soft); border-radius: 6px; padding: 16px 18px; font-size: 15px; max-width: none; }
+
   footer { border-top: 1px solid var(--rule); padding-top: 24px; display: grid; gap: 8px; font-size: 14.5px; color: var(--muted); }
 
   @media (max-width: 760px) {
@@ -143,124 +153,107 @@
     <div class="top">
       <div class="brand">routhjim / <span>llama.cpp-lab</span></div>
       <nav>
-        <a href="#results">Results</a>
+        <a href="#igpu">iGPU</a>
+        <a href="#two-xtx">Two XTX</a>
+        <a href="#one-xtx">One XTX</a>
         <a href="#negative">What didn't work</a>
         <a href="#build">Build</a>
         <a href="https://github.com/routhjim/llama.cpp-lab">GitHub</a>
       </nav>
     </div>
-    <h1>llama.cpp, measured on <em>Strix Halo</em></h1>
-    <p class="lede">Changes to llama.cpp for AMD's Ryzen AI Max+ 395 on Vulkan/RADV, each merged through a pull request with a before and after number from this one machine. The negative results are here too.</p>
-    <p class="lede">Two models drive the work: Qwen3.8-Flash-Next, a 180B sparse MoE with hyper-connections and a sparse-attention indexer, on the integrated GPU; and dense Qwen3.8-27B on a 7900 XTX over USB4. None of this is in upstream llama.cpp.</p>
+    <h1>llama.cpp, measured on <em>Strix Halo</em> and two 7900 XTX</h1>
+    <p class="lede">Changes to llama.cpp for AMD's Ryzen AI Max+ 395 and two Radeon RX 7900 XTX eGPUs on Vulkan/RADV, each merged through a pull request with a before and after number from this one machine. The negative results are here too.</p>
+    <p class="lede">Three setups: Qwen3.8-Flash-Next, a 180B sparse MoE, on the integrated GPU with an XTX helping; dense Qwen3.8-27B pipelined over both XTX for many concurrent agent streams; and the 27B on one XTX. None of this is in upstream llama.cpp.</p>
 
     <dl class="bench" aria-label="Test machine">
-      <div><dt class="label">APU</dt><dd>Ryzen AI Max+ 395<br>Radeon 8060S · gfx1151</dd></div>
+      <div><dt class="label">APU</dt><dd>Ryzen AI Max+ 395<br>Radeon 8060S &middot; gfx1151</dd></div>
       <div><dt class="label">Memory</dt><dd>128 GB LPDDR5X, unified<br>~215 GB/s decode roofline</dd></div>
-      <div><dt class="label">eGPU</dt><dd>Radeon RX 7900 XTX, 24 GB<br>USB4 dock</dd></div>
+      <div><dt class="label">eGPUs</dt><dd>2&times; Radeon RX 7900 XTX, 24 GB<br>TB5 docks on USB4, PCIe Gen4</dd></div>
       <div><dt class="label">Stack</dt><dd>Vulkan, Mesa RADV<br>Fedora 44, kernel 7.2</dd></div>
       <div class="kc"><dt class="label">Kernel command line</dt><dd>amd_iommu=off amdgpu.gttsize=126976 ttm.pages_limit=32505856</dd></div>
     </dl>
   </header>
 
-  <section id="results">
-    <div class="sec-head">
-      <span class="label">Results · merged in main</span>
-      <h2>What each change bought</h2>
-      <p class="note">Bars show speedup on one scale from 1× to 2.5×. Each row names the conditions it was measured under; a different quant, power limit or kernel command line will not reproduce these exactly.</p>
+  <section id="igpu" class="setup">
+    <div class="setup-head">
+      <span class="label">Setup 1 &middot; integrated GPU</span>
+      <h2>Qwen3.8-Flash-Next on the iGPU</h2>
+      <p>180B sparse MoE (512 experts, top-10) with hyper-connections and a sparse-attention indexer, C2T8 quant, MTP depth 3. Production places the target on the iGPU and the MTP drafter on an XTX.</p>
+      <span class="stack">run-flashnext.sh &middot; SPLIT=drafter &middot; np1 &middot; 256k context &middot; q8_0 KV</span>
     </div>
-
     <div class="ledger">
       <div class="row">
         <div class="what">
           <h3>MTP draft head re-fit to the requantized target it serves</h3>
           <div class="prs"><a href="https://github.com/routhjim/llama.cpp-lab/pull/52">#52</a><a href="https://huggingface.co/Jrouth/Qwen3.8-Flash-Next-MTP-C2T8-refit-GGUF">weights</a></div>
-          <div class="cond">Flash-Next C2T8 · 84/16 iGPU/XTX · MTP depth 3 · 12 real TB2.1 requests · <a href="https://github.com/routhjim/llama.cpp-lab/blob/main/docs/flash-next-mtp-refit.md">write-up</a></div>
+          <div class="cond">Flash-Next C2T8 &middot; 84/16 iGPU/XTX &middot; MTP depth 3 &middot; 12 real TB2.1 requests &middot; <a href="https://github.com/routhjim/llama.cpp-lab/blob/main/docs/flash-next-mtp-refit.md">write-up</a></div>
         </div>
         <div class="nums"><span class="before">0.651 acceptance</span><span class="after">0.692 <small>acceptance</small></span></div>
-        <div class="meter"><span class="factor">1.034&times;</span><div class="track"><div class="fill" style="width:2%"></div></div><div class="scale"><span>1&times;</span><span>2.5&times;</span></div></div>
-        <div class="meter"><span class="tag">+4.1 pts acceptance</span></div>
+        <div class="meter"><span class="factor">1.03&times;</span><div class="track"><div class="fill" style="width:2%"></div></div><div class="scale"><span>1&times;</span><span>2.5&times;</span></div></div><div class="meter"><span class="tag">+4.1 pts acceptance</span></div>
       </div>
-
+      <div class="row">
+        <div class="what">
+          <h3>MoE prefill for 512 experts: row-id hoist and a gather kernel for small per-expert batches</h3>
+          <div class="prs"><a href="https://github.com/routhjim/llama.cpp-lab/pull/53">#53</a></div>
+          <div class="cond">Flash-Next &middot; iGPU &middot; replayed real TB2.1 turns<br>llama-bench pp128 at 10k context: 183 &rarr; 212 tok/s</div>
+        </div>
+        <div class="nums"><span class="before">204 tok/s prefill</span><span class="after">248&ndash;255 <small>tok/s</small></span></div>
+        <div class="meter"><span class="factor">1.23&times;</span><div class="track"><div class="fill" style="width:15%"></div></div><div class="scale"><span>1&times;</span><span>2.5&times;</span></div></div>
+      </div>
       <div class="row">
         <div class="what">
           <h3>Upstream PLE row prefetch (madvise), picked with the EOG draft fix and Vulkan descriptor reuse</h3>
           <div class="prs"><a href="https://github.com/routhjim/llama.cpp-lab/pull/51">#51</a></div>
-          <div class="cond">Flash-Next C2T8 prefill at 512 / 4k / 16k · cold page cache · ABBA · decode unchanged</div>
+          <div class="cond">Flash-Next C2T8 prefill at 512 / 4k / 16k &middot; cold page cache &middot; ABBA &middot; decode unchanged</div>
         </div>
         <div class="nums"><span class="before">215 / 247 / 239 tok/s</span><span class="after">262 / 289 / 272 <small>tok/s</small></span></div>
         <div class="meter"><span class="factor">1.17&times;</span><div class="track"><div class="fill" style="width:11%"></div></div><div class="scale"><span>1&times;</span><span>2.5&times;</span></div></div>
       </div>
-
       <div class="row">
         <div class="what">
           <h3>MTP (nextn) speculative head for Qwen3.8-Flash-Next</h3>
           <div class="prs"><a href="https://github.com/routhjim/llama.cpp-lab/pull/1">#1</a></div>
-          <div class="cond">iGPU · np1 · greedy · 62–86% acceptance</div>
+          <div class="cond">iGPU &middot; np1 &middot; greedy &middot; 62&ndash;86% acceptance</div>
         </div>
-        <div class="nums"><span class="before">no draft head</span><span class="after">up to 1.63× <small>decode</small></span></div>
-        <div class="meter"><span class="factor">1.63×</span><div class="track"><div class="fill" style="width:42%"></div></div><div class="scale"><span>1×</span><span>2.5×</span></div></div>
+        <div class="nums"><span class="before">no draft head</span><span class="after">up to 1.63&times; <small>decode</small></span></div>
+        <div class="meter"><span class="factor">1.63&times;</span><div class="track"><div class="fill" style="width:42%"></div></div><div class="scale"><span>1&times;</span><span>2.5&times;</span></div></div>
       </div>
-
       <div class="row">
         <div class="what">
           <h3>Pack GQA flash-attention tiles across tokens; 32/48-row coopmat1 tiles</h3>
           <div class="prs"><a href="https://github.com/routhjim/llama.cpp-lab/pull/41">#41</a><a href="https://github.com/routhjim/llama.cpp-lab/pull/42">#42</a></div>
-          <div class="cond">FA op, 8 rows · iGPU · q8_0 KV · 65k context<br>end to end on the XTX: 0.652 → 0.167 ms per 1k context</div>
+          <div class="cond">FA op, 8 rows &middot; iGPU &middot; q8_0 KV &middot; 65k context</div>
         </div>
-        <div class="nums"><span class="before">8,259 µs</span><span class="after">3,573 µs</span></div>
-        <div class="meter"><span class="factor">2.31×</span><div class="track"><div class="fill" style="width:87%"></div></div><div class="scale"><span>1×</span><span>2.5×</span></div></div>
+        <div class="nums"><span class="before">8,259 &micro;s</span><span class="after">3,573 &micro;s</span></div>
+        <div class="meter"><span class="factor">2.31&times;</span><div class="track"><div class="fill" style="width:87%"></div></div><div class="scale"><span>1&times;</span><span>2.5&times;</span></div></div>
       </div>
-
       <div class="row">
         <div class="what">
           <h3>Flash-Next concurrency: indexer pooling, incremental pooled-key cache, sparse FA</h3>
           <div class="prs"><a href="https://github.com/routhjim/llama.cpp-lab/pull/15">#15</a><a href="https://github.com/routhjim/llama.cpp-lab/pull/17">#17</a><a href="https://github.com/routhjim/llama.cpp-lab/pull/18">#18</a></div>
-          <div class="cond">np4 · one 59k slot + two short slots · <a href="https://github.com/routhjim/llama.cpp-lab/blob/main/docs/flash-next-concurrency.md">write-up</a></div>
+          <div class="cond">np4 &middot; one 59k slot + two short slots &middot; <a href="https://github.com/routhjim/llama.cpp-lab/blob/main/docs/flash-next-concurrency.md">write-up</a></div>
         </div>
         <div class="nums"><span class="before">227 ms/step</span><span class="after">156 ms/step</span></div>
-        <div class="meter"><span class="factor">1.46×</span><div class="track"><div class="fill" style="width:31%"></div></div><div class="scale"><span>1×</span><span>2.5×</span></div></div>
+        <div class="meter"><span class="factor">1.46&times;</span><div class="track"><div class="fill" style="width:31%"></div></div><div class="scale"><span>1&times;</span><span>2.5&times;</span></div></div>
       </div>
-
       <div class="row">
         <div class="what">
           <h3>QSA pooled key cache allocated on each layer's own device</h3>
           <div class="prs"><a href="https://github.com/routhjim/llama.cpp-lab/pull/38">#38</a></div>
-          <div class="cond">Flash-Next split 88/12 iGPU/XTX · 60k context<br>the cache had been crossing USB4 every step</div>
+          <div class="cond">Flash-Next split 88/12 iGPU/XTX &middot; 60k context<br>the cache had been crossing USB4 every step</div>
         </div>
         <div class="nums"><span class="before">16.60 tok/s</span><span class="after">21.80 <small>tok/s</small></span></div>
-        <div class="meter"><span class="factor">1.31×</span><div class="track"><div class="fill" style="width:21%"></div></div><div class="scale"><span>1×</span><span>2.5×</span></div></div>
+        <div class="meter"><span class="factor">1.31&times;</span><div class="track"><div class="fill" style="width:21%"></div></div><div class="scale"><span>1&times;</span><span>2.5&times;</span></div></div>
       </div>
-
       <div class="row">
         <div class="what">
-          <h3>Speculative stack for the 27B: confidence-gated depth, ngram agreement gates, chunked ngram drafts, per-request n_max</h3>
-          <div class="prs"><a href="https://github.com/routhjim/llama.cpp-lab/pull/43">#43</a><a href="https://github.com/routhjim/llama.cpp-lab/pull/44">#44</a><a href="https://github.com/routhjim/llama.cpp-lab/pull/45">#45</a><a href="https://github.com/routhjim/llama.cpp-lab/pull/46">#46</a></div>
-          <div class="cond">Qwen3.8-27B · XTX · np1 · geomean of 5 content kinds<br>baseline is the best static MTP; autoregressive is 34.0</div>
-        </div>
-        <div class="nums"><span class="before">89.6 tok/s</span><span class="after">109.2 <small>tok/s</small></span></div>
-        <div class="meter"><span class="factor">1.22×</span><div class="track"><div class="fill" style="width:15%"></div></div><div class="scale"><span>1×</span><span>2.5×</span></div></div>
-      </div>
-
-      <div class="row">
-        <div class="what">
-          <h3>MUL_MAT_ID GEMV threshold 8 → 32, RDNA3 row counts sized to the column count</h3>
+          <h3>MUL_MAT_ID GEMV threshold 8 &rarr; 32, RDNA3 row counts sized to the column count</h3>
           <div class="prs"><a href="https://github.com/routhjim/llama.cpp-lab/pull/31">#31</a></div>
-          <div class="cond">Flash-Next · llama-batched-bench · batch 16</div>
+          <div class="cond">Flash-Next &middot; llama-batched-bench &middot; batch 16</div>
         </div>
         <div class="nums"><span class="before">66.6 tok/s</span><span class="after">80.7 <small>tok/s</small></span></div>
-        <div class="meter"><span class="factor">1.21×</span><div class="track"><div class="fill" style="width:14%"></div></div><div class="scale"><span>1×</span><span>2.5×</span></div></div>
+        <div class="meter"><span class="factor">1.21&times;</span><div class="track"><div class="fill" style="width:14%"></div></div><div class="scale"><span>1&times;</span><span>2.5&times;</span></div></div>
       </div>
-
-      <div class="row">
-        <div class="what">
-          <h3>Coupled (Gumbel-max) sampling between drafter and target</h3>
-          <div class="prs"><a href="https://github.com/routhjim/llama.cpp-lab/pull/26">#26</a></div>
-          <div class="cond">Qwen3.8-27B + DFlash2 · temp 1.0 · thinking text<br>code: acceptance 0.466 → 0.540, 63 → 71 tok/s</div>
-        </div>
-        <div class="nums"><span class="before">76 tok/s</span><span class="after">87 <small>tok/s</small></span></div>
-        <div class="meter"><span class="factor">1.14×</span><div class="track"><div class="fill" style="width:9%"></div></div><div class="scale"><span>1×</span><span>2.5×</span></div></div>
-      </div>
-
       <div class="row">
         <div class="what">
           <h3>Prompt-cache disk tier made NVMe-resident instead of gated by RAM size</h3>
@@ -268,26 +261,20 @@
           <div class="cond">one Terminal-Bench 2.1 task, same settings<br>NVMe reload 2.75 GB/s vs ~486 s to re-prefill 103k tokens</div>
         </div>
         <div class="nums"><span class="before">13% cache hit, killed at 6 h</span><span class="after">98% hit <small>at 114k, passed in 86 min</small></span></div>
-        <div class="meter"><span class="tag">killed → passed</span></div>
+        <div class="meter"><span class="tag">killed &rarr; passed</span></div>
       </div>
-
       <div class="row">
         <div class="what">
           <h3>Hot slot packing: live sequences move to the lowest KV streams between steps</h3>
           <div class="prs"><a href="https://github.com/routhjim/llama.cpp-lab/pull/16">#16</a></div>
-          <div class="cond">Flash-Next · np4 · swap costs 0.7–4.3 ms</div>
+          <div class="cond">Flash-Next &middot; np4 &middot; swap costs 0.7&ndash;4.3 ms</div>
         </div>
-        <div class="nums"><span class="before">−38% per slot on a {0,3} pair</span><span class="after">no penalty</span></div>
+        <div class="nums"><span class="before">&minus;38% per slot on a {0,3} pair</span><span class="after">no penalty</span></div>
         <div class="meter"><span class="tag">penalty removed</span></div>
       </div>
     </div>
-  </section>
-
-  <section>
-    <div class="sec-head">
-      <span class="label">Findings</span>
-      <h2>Where the time goes</h2>
-    </div>
+    <p class="callout">Placement numbers here were taken with the dock links at PCIe Gen1. A Gen4 re-measure on the latest build is queued: drafter-only, an 86/14 layer split, and layers on the second XTX.</p>
+    <span class="sub">Findings</span>
     <div class="findings">
       <div class="finding">
         <span class="big">~205 ms</span>
@@ -298,12 +285,8 @@
         <p>of a Flash-Next decode step at np1 is the 8-bit dense path and the MoE experts respectively. With several streams the expert union takes over.</p>
       </div>
       <div class="finding">
-        <span class="big">0.389 µs</span>
+        <span class="big">0.389 &micro;s</span>
         <p>per token of context on top of a 41.53 ms step: Flash-Next decode at np1 is linear in KV length, with no cliffs.</p>
-      </div>
-      <div class="finding">
-        <span class="big">−5.7% / −0.3%</span>
-        <p>perplexity from an Engram-style n-gram memory table trained post hoc on a <em>frozen</em> Qwen3.8-27B: −5.7% on held-out text from its training mix, −5.1% on agent prose, but −0.3% on the agent's own shell commands and −0.12% on wikitext. Flash-Next trains its table jointly; this measures the post-hoc case. On gfx1151, fla's Triton gated-DeltaNet backward returns NaN gradients, so train with the PyTorch path.</p>
       </div>
       <div class="finding">
         <span class="big">+18.5% &rarr; +2.9%</span>
@@ -311,7 +294,111 @@
       </div>
       <div class="finding">
         <span class="big">0.651 &rarr; 0.692</span>
-        <p>live draft acceptance after re-fitting the MTP head to the requantized model it serves, which closes the gap above. The head was trained against the bf16 weights; 20 minutes of training on the iGPU against C2T8's own top-20 distribution, unrolled over draft depths 1&ndash;3, recovers the loss and passes UD's 0.687. A torch port of the head predicted the live acceptance to three decimals (0.663 vs 0.662). Output is unchanged; decode +2&ndash;3%. <a href="https://github.com/routhjim/llama.cpp-lab/blob/main/docs/flash-next-mtp-refit.md">Write-up</a> &middot; <a href="https://huggingface.co/Jrouth/Qwen3.8-Flash-Next-MTP-C2T8-refit-GGUF">weights</a>.</p>
+        <p>live draft acceptance after re-fitting the MTP head to the requantized model it serves. The head was trained against the bf16 weights; 20 minutes of training on the iGPU against C2T8's own top-20 distribution, unrolled over draft depths 1&ndash;3, recovers the loss and passes UD's 0.687. <a href="https://github.com/routhjim/llama.cpp-lab/blob/main/docs/flash-next-mtp-refit.md">Write-up</a>.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="two-xtx" class="setup">
+    <div class="setup-head">
+      <span class="label">Setup 2 &middot; two eGPUs</span>
+      <h2>Qwen3.8-27B pipelined over two 7900 XTX</h2>
+      <p>One copy of the weights layer-split 48/52 over both cards; two server instances on it run out of phase so both cards stay busy. Every stream reserves its own 131k KV. Built for throughput over many concurrent agent streams.</p>
+      <span class="stack">scripts/two-xtx/run-qwen38-2x.sh &middot; 2 instances &times; np4 &middot; MTP depth 2, drafters on card 1 &middot; q4_0 KV &middot; <a href="https://github.com/routhjim/llama.cpp-lab/blob/main/docs/qwen38-two-xtx-pipeline.md">write-up</a></span>
+    </div>
+    <div class="ledger">
+      <div class="row">
+        <div class="what">
+          <h3>Rings for small host&harr;device transfers, async scheduler inputs</h3>
+          <div class="prs"><a href="https://github.com/routhjim/llama.cpp-lab/pull/55">#55</a></div>
+          <div class="cond">2 instances &times; 4 slots &middot; 8 real agent prompts &middot; GPUs 62/59% &rarr; 88/84% busy &middot; two loads</div>
+        </div>
+        <div class="nums"><span class="before">115.4 tok/s</span><span class="after">185.5 <small>tok/s</small></span></div>
+        <div class="meter"><span class="factor">1.61&times;</span><div class="track"><div class="fill" style="width:41%"></div></div><div class="scale"><span>1&times;</span><span>2.5&times;</span></div></div>
+      </div>
+      <div class="row">
+        <div class="what">
+          <h3>Dock PCIe links retrained from Gen1 to Gen4 (not code)</h3>
+          <div class="prs"><a href="https://github.com/routhjim/llama.cpp-lab/blob/main/docs/egpu-dock-pcie-gen1.md">note</a></div>
+          <div class="cond">same harness &middot; host&harr;GPU 0.8 &rarr; 3.3&ndash;3.8 GB/s</div>
+        </div>
+        <div class="nums"><span class="before">185.5 tok/s</span><span class="after">259&ndash;269 <small>tok/s</small></span></div>
+        <div class="meter"><span class="factor">1.42&times;</span><div class="track"><div class="fill" style="width:28%"></div></div><div class="scale"><span>1&times;</span><span>2.5&times;</span></div></div>
+      </div>
+      <div class="row">
+        <div class="what">
+          <h3>Several server instances on one copy of the weights, so the layer split keeps both cards busy</h3>
+          <div class="prs"><a href="https://github.com/routhjim/llama.cpp-lab/pull/56">#56</a></div>
+          <div class="cond">4 streams &middot; MTP drafters on card 1, split 45/55<br>two fully independent cards (own weights each): 162 tok/s</div>
+        </div>
+        <div class="nums"><span class="before">69.3 tok/s, one instance</span><span class="after">135&ndash;146 <small>tok/s</small></span></div>
+        <div class="meter"><span class="factor">2.02&times;</span><div class="track"><div class="fill" style="width:68%"></div></div><div class="scale"><span>1&times;</span><span>2.5&times;</span></div></div>
+      </div>
+      <div class="row">
+        <div class="what">
+          <h3>Cross-device copy race with several contexts on one layer-split model</h3>
+          <div class="prs"><a href="https://github.com/routhjim/llama.cpp-lab/pull/54">#54</a></div>
+          <div class="cond">drafters on card 1 &middot; one instance had run at 0.23 acceptance</div>
+        </div>
+        <div class="nums"><span class="before">~1 in 3 launches broken</span><span class="after">0 of 8</span></div>
+        <div class="meter"><span class="tag">race fixed</span></div>
+      </div>
+    </div>
+    <span class="sub">Findings</span>
+    <div class="findings">
+      <div class="finding">
+        <span class="big">2.3&times;</span>
+        <p>aggregate decode on the same 8-stream test in one day: 115 &rarr; 185 tok/s from removing host stalls, then 259&ndash;269 from retraining the dock links. Draft acceptance stayed 0.85. <a href="https://github.com/routhjim/llama.cpp-lab/blob/main/docs/qwen38-two-xtx-pipeline.md">Write-up</a>.</p>
+      </div>
+      <div class="finding">
+        <span class="big">32 vs 17</span>
+        <p>Terminal-Bench 2.1 tasks scored in the first hour (29 passed), against 17 for the same two cards before these changes and 16 for one XTX. Decode per stream 24.4 vs 13.7 tok/s, prefill 449 vs 274 tok/s per request, same pass/fail outcomes. Run in progress.</p>
+      </div>
+      <div class="finding">
+        <span class="big">0.8 GB/s</span>
+        <p>was every host&harr;GPU transfer on both TB5 docks: the controller&rarr;GPU link inside each dock trained at 2.5 GT/s (Target Link Speed Gen1). Stepping the port's kernel bandwidth-controller cooling device 1&rarr;0 retrains it at 16 GT/s. <a href="https://github.com/routhjim/llama.cpp-lab/blob/main/docs/egpu-dock-pcie-gen1.md">Note</a>.</p>
+      </div>
+      <div class="finding">
+        <span class="big">83%</span>
+        <p>of the decode threads' time, before <a href="https://github.com/routhjim/llama.cpp-lab/pull/55">#55</a>, went to waiting on fences for transfers: 38% output readback from card 2 (the Vulkan host buffer was pinned for card 1 only), 33% before each cross-card copy, 12% synchronous input uploads.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="one-xtx" class="setup">
+    <div class="setup-head">
+      <span class="label">Setup 3 &middot; one eGPU</span>
+      <h2>Qwen3.8-27B on one 7900 XTX</h2>
+      <p>Dense 27B, Q4_K_S, the whole model on one card. Single-stream speed for interactive use: DFlash2 or MTP drafting with confidence-gated depth and ngram drafts.</p>
+      <span class="stack">run-qwen38.sh &middot; np1&ndash;np2 &middot; these numbers predate the Gen4 dock retrain</span>
+    </div>
+    <div class="ledger">
+      <div class="row">
+        <div class="what">
+          <h3>Speculative stack for the 27B: confidence-gated depth, ngram agreement gates, chunked ngram drafts, per-request n_max</h3>
+          <div class="prs"><a href="https://github.com/routhjim/llama.cpp-lab/pull/43">#43</a><a href="https://github.com/routhjim/llama.cpp-lab/pull/44">#44</a><a href="https://github.com/routhjim/llama.cpp-lab/pull/45">#45</a><a href="https://github.com/routhjim/llama.cpp-lab/pull/46">#46</a></div>
+          <div class="cond">Qwen3.8-27B &middot; one XTX &middot; np1 &middot; geomean of 5 content kinds<br>baseline is the best static MTP; autoregressive is 34.0</div>
+        </div>
+        <div class="nums"><span class="before">89.6 tok/s</span><span class="after">109.2 <small>tok/s</small></span></div>
+        <div class="meter"><span class="factor">1.22&times;</span><div class="track"><div class="fill" style="width:15%"></div></div><div class="scale"><span>1&times;</span><span>2.5&times;</span></div></div>
+      </div>
+      <div class="row">
+        <div class="what">
+          <h3>Packed GQA flash-attention tiles, end to end</h3>
+          <div class="prs"><a href="https://github.com/routhjim/llama.cpp-lab/pull/41">#41</a><a href="https://github.com/routhjim/llama.cpp-lab/pull/42">#42</a></div>
+          <div class="cond">Qwen3.8-27B &middot; one XTX &middot; real np2 traffic &middot; decode cost per 1k tokens of context</div>
+        </div>
+        <div class="nums"><span class="before">0.652 ms per 1k</span><span class="after">0.167 <small>ms per 1k</small></span></div>
+        <div class="meter"><span class="tag">3.9&times; less context cost</span></div>
+      </div>
+      <div class="row">
+        <div class="what">
+          <h3>Coupled (Gumbel-max) sampling between drafter and target</h3>
+          <div class="prs"><a href="https://github.com/routhjim/llama.cpp-lab/pull/26">#26</a></div>
+          <div class="cond">Qwen3.8-27B + DFlash2 &middot; temp 1.0 &middot; thinking text<br>code: acceptance 0.466 &rarr; 0.540, 63 &rarr; 71 tok/s</div>
+        </div>
+        <div class="nums"><span class="before">76 tok/s</span><span class="after">87 <small>tok/s</small></span></div>
+        <div class="meter"><span class="factor">1.14&times;</span><div class="track"><div class="fill" style="width:9%"></div></div><div class="scale"><span>1&times;</span><span>2.5&times;</span></div></div>
       </div>
     </div>
   </section>
@@ -326,16 +413,24 @@
       <table class="neg">
         <thead><tr><th class="label">Idea</th><th class="label">Result</th></tr></thead>
         <tbody>
-          <tr><td>ngram-mod drafting on Flash-Next</td><td><span class="delta">−1.7% to −48%</span><br>Negative in all five tests. A 512-expert top-10 MoE pays for the union of every wide verify batch.</td></tr>
-          <tr><td>Speculative lookahead: draft the next batch during verify</td><td><span class="delta">−7.1%</span><br>On real traffic, after fixing four concurrency bugs in the prefetch worker.</td></tr>
-          <tr><td>Sparse flash attention at prefill</td><td><span class="delta">−18% at 16k, −10% at 32k</span><br>Pays only past ~33k context (+7% at 64k).</td></tr>
-          <tr><td>Adaptive MTP depth on Flash-Next at np ≥ 2</td><td><span class="delta">−5% to −9% per slot</span><br>Fixed depth wins at every concurrency on this model.</td></tr>
+          <tr class="grp"><td colspan="2">iGPU &middot; Flash-Next</td></tr>
+          <tr><td>ngram-mod drafting on Flash-Next</td><td><span class="delta">&minus;1.7% to &minus;48%</span><br>Negative in all five tests. A 512-expert top-10 MoE pays for the union of every wide verify batch.</td></tr>
+          <tr><td>Speculative lookahead: draft the next batch during verify</td><td><span class="delta">&minus;7.1%</span><br>On real traffic, after fixing four concurrency bugs in the prefetch worker.</td></tr>
+          <tr><td>Sparse flash attention at prefill</td><td><span class="delta">&minus;18% at 16k, &minus;10% at 32k</span><br>Pays only past ~33k context (+7% at 64k).</td></tr>
+          <tr><td>Adaptive MTP depth on Flash-Next at np &ge; 2</td><td><span class="delta">&minus;5% to &minus;9% per slot</span><br>Fixed depth wins at every concurrency on this model.</td></tr>
           <tr><td>Naive q4_K requant of Flash-Next's dense tensors</td><td><span class="delta">+6.4% perplexity</span><br>For +23% single-stream decode, shrinking to about +7% at np4.</td></tr>
-          <tr><td>Importance-matrix requant of the dense tensors, served with MTP</td><td><span class="delta">+2% to +4%</span><br>Quality equal to UD, but the drafter accepts less; within run-to-run noise. The best variant (C2T8) is the default anyway, and a re-fit head wins the acceptance back (<a href="https://github.com/routhjim/llama.cpp-lab/pull/52">#52</a>). <a href="https://github.com/routhjim/llama.cpp-lab/blob/main/docs/flash-next-dense-requant.md">write-up</a></td></tr>
-          <tr><td>MTP draft depth 2 instead of 3 on Flash-Next at np1</td><td><span class="delta">&minus;5.3%</span><br>On UD-Q4_K_XL (&minus;0.9% on C2T8). A step-cost model fitted on depth 3 predicted both within 0.7 tok/s.</td></tr>
-          <tr><td>Scaling up a post-hoc n-gram table for agent work</td><td><span class="delta">−0.3% perplexity</span><br>On agent command blocks after 3M tokens and 14.7 h of training; only 1.6% of Terminal-Bench 2.1 steps were fixable by it.</td></tr>
-          <tr><td>Upstream MoE-aware <code>mul_mat_id</code> tile selection (ggml-org #29182)</td><td><span class="delta">&minus;6% prefill</span><br>At 4k and 16k on Flash-Next, same build otherwise. Not picked.</td></tr>
-          <tr><td>Drafter temperature calibration and support truncation</td><td><span class="delta">no effect</span><br>Temperature scale 0.7–1.5 and top-k 10/15/32 left acceptance unchanged. Re-fitting the head itself did help (<a href="https://github.com/routhjim/llama.cpp-lab/pull/52">#52</a>).</td></tr>
+          <tr><td>Importance-matrix requant of the dense tensors, served with MTP</td><td><span class="delta">+2% to +4%</span><br>Quality equal to UD, but the drafter accepts less. A re-fit head wins the acceptance back (<a href="https://github.com/routhjim/llama.cpp-lab/pull/52">#52</a>).</td></tr>
+          <tr><td>MTP draft depth 2 instead of 3 on Flash-Next at np1</td><td><span class="delta">&minus;5.3%</span><br>On UD-Q4_K_XL (&minus;0.9% on C2T8).</td></tr>
+          <tr><td>Upstream MoE-aware <code>mul_mat_id</code> tile selection (ggml-org #29182)</td><td><span class="delta">&minus;6% prefill</span><br>At 4k and 16k on Flash-Next. Not picked.</td></tr>
+          <tr><td>Drafter temperature calibration and support truncation</td><td><span class="delta">no effect</span><br>Temperature scale 0.7&ndash;1.5 and top-k 10/15/32 left acceptance unchanged.</td></tr>
+          <tr class="grp"><td colspan="2">One XTX &middot; Qwen3.8-27B</td></tr>
+          <tr><td>Scaling up a post-hoc n-gram (Engram-style) table for agent work</td><td><span class="delta">&minus;0.3% perplexity</span><br>On agent command blocks after 14.7 h of training (&minus;5.7% on its training mix). Only 1.6% of TB2.1 steps were fixable by it.</td></tr>
+          <tr class="grp"><td colspan="2">Two XTX &middot; Qwen3.8-27B pipelined</td></tr>
+          <tr><td>Device&rarr;device copies with no CPU wait (dma-buf bridge + <code>sync_fd</code> semaphore)</td><td><span class="delta">113 vs 191 tok/s</span><br>A queue waiting on another device's fence stalls that device. Once everything else is async, the blocking host-staged copy is cheap.</td></tr>
+          <tr><td>Importing host buffers into every GPU (userptr)</td><td><span class="delta">26% of thread time in the submit ioctl</span><br>amdgpu revalidates userptr pages on every command submission.</td></tr>
+          <tr><td>Micro-batching one context's decode over the layer split</td><td><span class="delta">61.7 &rarr; 39.4 tok/s</span><br>Every micro-batch re-reads the weights. Run several instances instead (<a href="https://github.com/routhjim/llama.cpp-lab/pull/56">#56</a>).</td></tr>
+          <tr><td>GPU sampling for the target (<code>-bs</code>) to cut the logits readback</td><td><span class="delta">acceptance 0.81 &rarr; 0.73</span><br>Throughput unchanged (117.8 vs 115.4 tok/s).</td></tr>
+          <tr><td>One compute queue per context; forced per-device ordering</td><td><span class="delta">no gain</span><br>185 vs 190 tok/s; ordering gave nothing once the stages were balanced.</td></tr>
         </tbody>
       </table>
     </div>
@@ -348,12 +443,17 @@
     </div>
 <pre>cmake -B build -DGGML_VULKAN=ON -DGGML_VULKAN_MMV_MAX_COLS=32 -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j</pre>
-    <p class="note"><code>MMV_MAX_COLS=32</code> matters: the default of 16 puts a decode cliff at verify batches above 16.</p>
-<pre>build/bin/llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
+    <p class="note"><code>MMV_MAX_COLS=32</code> matters for Flash-Next: the default of 16 puts a decode cliff at verify batches above 16.</p>
+<pre># Flash-Next on the iGPU
+build/bin/llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
   -md mtp-Qwen3.8-Flash-Next-Q4DRAFT.gguf --spec-type draft-mtp \
   --spec-draft-n-max 3 --spec-coupled -ngl 99 -ngld 99 -fa on \
   -ctk q8_0 -ctv q8_0 -lm mmap -lzm auto -c 262144 -np 1 --jinja</pre>
     <p class="note">Always pass <code>-lm mmap</code> for Flash-Next. With <code>auto</code>, one device that lacks mmap turns it off for all of them, and the load then needs the whole file in RAM.</p>
+<pre># Qwen3.8-27B pipelined over two 7900 XTX (one endpoint on :8090)
+MODEL=Qwen3.8-27B-Q4_K_S.gguf DRAFT=mtp-Qwen3.8-27B-Q4_K_M.gguf TMPL=qwen38.jinja \
+  scripts/two-xtx/run-qwen38-2x.sh --reasoning-format deepseek -rea on --reasoning-effort medium</pre>
+    <p class="note">Check the dock links first: <code>cat /sys/bus/pci/devices/*/current_link_speed</code> on the GPU's upstream port should read 16 GT/s. See the <a href="https://github.com/routhjim/llama.cpp-lab/blob/main/docs/egpu-dock-pcie-gen1.md">dock note</a>.</p>
   </section>
 
   <footer>
