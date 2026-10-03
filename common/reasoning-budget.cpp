@@ -185,6 +185,17 @@ static void common_reasoning_budget_apply(struct llama_sampler * smpl, llama_tok
     }
 }
 
+llama_token common_reasoning_budget_forced_token(const struct llama_sampler * smpl) {
+    if (!smpl) {
+        return LLAMA_TOKEN_NULL;
+    }
+    const auto * ctx = (const common_reasoning_budget_ctx *) smpl->ctx;
+    if (ctx->state != REASONING_BUDGET_FORCING || ctx->force_pos >= ctx->forced_tokens.size()) {
+        return LLAMA_TOKEN_NULL;
+    }
+    return ctx->forced_tokens[ctx->force_pos];
+}
+
 static void common_reasoning_budget_reset(struct llama_sampler * smpl) {
     auto * ctx = (common_reasoning_budget_ctx *) smpl->ctx;
     ctx->state = REASONING_BUDGET_IDLE;
