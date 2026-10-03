@@ -858,6 +858,8 @@ struct vk_device_struct {
     uint64_t suballocation_block_size;
     uint64_t min_imported_host_pointer_alignment;
     bool external_memory_host {};
+    bool external_semaphore_fd {};
+    bool external_memory_dma_buf {};
     bool fp16;
     bool bf16;
     bool pipeline_robustness;
@@ -2533,6 +2535,14 @@ struct ggml_backend_vk_context {
     size_t upload_ring_head {};
     vk_buffer readback_ring;
     size_t readback_ring_head {};
+    // GGML_VK_XDEV_ASYNC bridge for copies INTO this context's device: a dma-buf shared with the source device
+    vk_buffer xdev_bridge;                 // the owner's buffer
+    vk_buffer xdev_bridge_peer;            // the same memory imported on the other device
+    bool xdev_bridge_owner_is_dst {true};
+    vk_device_struct * xdev_bridge_src {};
+    int xdev_bridge_fd = -1;
+    size_t xdev_bridge_head {};
+    vk_device_struct * xdev_failed_src {};   // a pair whose dma-buf sharing failed: never retried
     struct pending_readback { void * dst; const void * src; size_t n; };
     std::vector<pending_readback> pending_readbacks;
 
@@ -6648,6 +6658,10 @@ static vk_device ggml_vk_get_device(size_t idx) {
                 device->memory_priority = true;
             } else if (strcmp("VK_EXT_external_memory_host", properties.extensionName) == 0) {
                 device->external_memory_host = true;
+            } else if (strcmp("VK_KHR_external_semaphore_fd", properties.extensionName) == 0) {
+                device->external_semaphore_fd = true;
+            } else if (strcmp("VK_EXT_external_memory_dma_buf", properties.extensionName) == 0) {
+                device->external_memory_dma_buf = true;
 #if defined(VK_EXT_shader_64bit_indexing)
             } else if (strcmp("VK_EXT_shader_64bit_indexing", properties.extensionName) == 0) {
                 device->shader_64b_indexing = true;
@@ -6998,6 +7012,13 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         if (device->external_memory_host) {
             device_extensions.push_back("VK_EXT_external_memory_host");
+        }
+        if (device->external_semaphore_fd) {
+            device_extensions.push_back("VK_KHR_external_semaphore_fd");
+        }
+        if (device->external_memory_dma_buf) {
+            device_extensions.push_back("VK_KHR_external_memory_fd");
+            device_extensions.push_back("VK_EXT_external_memory_dma_buf");
         }
 
 #if defined(VK_EXT_shader_64bit_indexing)
@@ -17559,6 +17580,233 @@ static void ggml_backend_vk_get_tensor_async(ggml_backend_t backend, const ggml_
     ggml_backend_vk_get_tensor_2d_async(backend, tensor, data, offset, size, 1, size, size);
 }
 
+// GGML_VK_XDEV_ASYNC=1 (opt-in): device -> device copy with no CPU wait. The source queue copies into host memory
+// imported into both devices and signals a binary semaphore exported as a sync file; the destination queue waits on
+// it (imported temporarily) and copies out. Before, every cross-device copy stalled the calling thread on two fences
+// (src -> staging, CPU memcpy, staging -> dst) while holding both device locks.
+static bool ggml_vk_xdev_async_on() {
+    // off by default: MEASURED 2026-10-03 (2 inst x np4 layer split, 2 x 7900 XTX): 113 t/s with it vs 191 without. A queue
+    // submission waiting on another device's sync_fd stalls that device's work; once uploads/readbacks are async the
+    // blocking host-staged copy is cheap (only the calling thread waits, no queue is held back).
+    static const bool on = [] { const char * e = getenv("GGML_VK_XDEV_ASYNC"); return e != nullptr && atoi(e) != 0; }();
+    return on;
+}
+
+// host-visible memory on `device`, exported as a dma-buf (not a userptr: no per-submission page validation)
+static vk_buffer ggml_vk_create_dmabuf_host_buffer(vk_device & device, size_t size, int & fd) {
+    fd = -1;
+    vk_buffer buf = std::make_shared<vk_buffer_struct>();
+    vk::ExternalMemoryBufferCreateInfo ebci{ vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT };
+    vk::BufferCreateInfo bci{ {}, size, vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst, vk::SharingMode::eExclusive };
+    bci.setPNext(&ebci);
+    buf->buffer = device->device.createBuffer(bci);
+    const vk::MemoryRequirements req = device->device.getBufferMemoryRequirements(buf->buffer);
+    const vk::PhysicalDeviceMemoryProperties props = device->physical_device.getMemoryProperties();
+    const vk::MemoryPropertyFlags want = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent;
+    uint32_t type = UINT32_MAX;
+    for (uint32_t i = 0; i < props.memoryTypeCount; i++) {
+        if ((req.memoryTypeBits & (1u << i)) && (props.memoryTypes[i].propertyFlags & want) == want &&
+            !(props.memoryTypes[i].propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal)) {
+            type = i;
+            break;
+        }
+    }
+    if (type == UINT32_MAX) {
+        device->device.destroyBuffer(buf->buffer);
+        return {};
+    }
+    vk::ExportMemoryAllocateInfo emai{ vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT };
+    try {
+        buf->device_memory = device->device.allocateMemory({ req.size, type, &emai });
+        device->device.bindBufferMemory(buf->buffer, buf->device_memory, 0);
+        fd = device->device.getMemoryFdKHR({ buf->device_memory, vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT });
+    } catch (vk::SystemError & e) {
+        GGML_LOG_WARN("ggml_vulkan: dma-buf bridge allocation failed (%s)\n", e.what());
+        if (buf->device_memory) {
+            device->device.freeMemory(buf->device_memory);
+        }
+        device->device.destroyBuffer(buf->buffer);
+        return {};
+    }
+    buf->memory_property_flags = props.memoryTypes[type].propertyFlags;
+    buf->ptr = nullptr;
+    buf->device = device;
+    buf->size = size;
+    return buf;
+}
+
+// import a dma-buf (does not take ownership of fd) as a transfer buffer on `device`
+static vk_buffer ggml_vk_import_dmabuf_buffer(vk_device & device, int fd, size_t size) {
+    const int dfd = dup(fd);
+    if (dfd < 0) {
+        return {};
+    }
+    vk_buffer buf = std::make_shared<vk_buffer_struct>();
+    vk::ExternalMemoryBufferCreateInfo ebci{ vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT };
+    vk::BufferCreateInfo bci{ {}, size, vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst, vk::SharingMode::eExclusive };
+    bci.setPNext(&ebci);
+    try {
+        buf->buffer = device->device.createBuffer(bci);
+        const vk::MemoryRequirements req = device->device.getBufferMemoryRequirements(buf->buffer);
+        const vk::MemoryFdPropertiesKHR fdp = device->device.getMemoryFdPropertiesKHR(vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT, dfd);
+        const uint32_t bits = req.memoryTypeBits & fdp.memoryTypeBits;
+        if (bits == 0) {
+            throw vk::SystemError(vk::make_error_code(vk::Result::eErrorFormatNotSupported), "no memory type for the dma-buf");
+        }
+        const uint32_t type = __builtin_ctz(bits);
+        vk::ImportMemoryFdInfoKHR imi{ vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT, dfd };
+        buf->device_memory = device->device.allocateMemory({ std::max<vk::DeviceSize>(req.size, size), type, &imi });   // owns dfd now
+        device->device.bindBufferMemory(buf->buffer, buf->device_memory, 0);
+        buf->memory_property_flags = device->physical_device.getMemoryProperties().memoryTypes[type].propertyFlags;
+    } catch (vk::SystemError & e) {
+        GGML_LOG_WARN("ggml_vulkan: dma-buf import failed (%s)\n", e.what());
+        if (!buf->device_memory) {
+            close(dfd);
+        } else {
+            device->device.freeMemory(buf->device_memory);
+        }
+        if (buf->buffer) {
+            device->device.destroyBuffer(buf->buffer);
+        }
+        return {};
+    }
+    buf->ptr = nullptr;
+    buf->device = device;
+    buf->size = size;
+    return buf;
+}
+
+static bool ggml_vk_cpy_xdev_async(ggml_backend_vk_context * sctx, ggml_backend_vk_context * dctx,
+                                   vk_buffer & src_buf, size_t src_off, vk_buffer & dst_buf, size_t dst_off, size_t size) {
+#ifdef _WIN32
+    return false;
+#else
+    if (!ggml_vk_xdev_async_on() ||
+        !sctx->device->external_semaphore_fd || !dctx->device->external_semaphore_fd ||
+        !sctx->device->external_memory_dma_buf || !dctx->device->external_memory_dma_buf) {
+        return false;
+    }
+    // one bridge per destination context, owned (allocated + exported as a dma-buf) by whichever side can export
+    // memory the other side can import: dst first; if src cannot import it (a UMA iGPU cannot import a discrete
+    // card's export), let the src own it and import into dst instead
+    if (dctx->xdev_bridge && (dctx->xdev_bridge->size < size || dctx->xdev_bridge_src != sctx->device.get())) {
+        ggml_vk_synchronize(dctx);
+        dctx->xdev_bridge = nullptr;
+        dctx->xdev_bridge_peer = nullptr;
+        if (dctx->xdev_bridge_fd >= 0) {
+            close(dctx->xdev_bridge_fd);
+        }
+        dctx->xdev_bridge_fd = -1;
+    }
+    if (dctx->xdev_failed_src == sctx->device.get()) {
+        return false;
+    }
+    if (!dctx->xdev_bridge) {
+        const size_t bsize = std::max<size_t>(64ull << 20, size);
+        for (int owner_is_dst = 1; owner_is_dst >= 0 && !dctx->xdev_bridge; --owner_is_dst) {
+            vk_device & own  = owner_is_dst ? dctx->device : sctx->device;
+            vk_device & peer = owner_is_dst ? sctx->device : dctx->device;
+            int fd = -1;
+            vk_buffer ob = ggml_vk_create_dmabuf_host_buffer(own, bsize, fd);
+            if (!ob) {
+                continue;
+            }
+            vk_buffer pb = ggml_vk_import_dmabuf_buffer(peer, fd, bsize);
+            if (!pb) {
+                close(fd);
+                continue;
+            }
+            dctx->xdev_bridge = ob;
+            dctx->xdev_bridge_peer = pb;
+            dctx->xdev_bridge_fd = fd;
+            dctx->xdev_bridge_owner_is_dst = owner_is_dst != 0;
+            dctx->xdev_bridge_src = sctx->device.get();
+        }
+        if (!dctx->xdev_bridge) {
+            // RADV 26.2: the 8060S and a 7900 XTX cannot import each other's dma-buf ("no memory type") either way
+            dctx->xdev_failed_src = sctx->device.get();
+            return false;
+        }
+        dctx->xdev_bridge_head = 0;
+    }
+    vk_buffer bsrc = dctx->xdev_bridge_owner_is_dst ? dctx->xdev_bridge_peer : dctx->xdev_bridge;
+    vk_buffer bdst = dctx->xdev_bridge_owner_is_dst ? dctx->xdev_bridge : dctx->xdev_bridge_peer;
+    size_t off = (dctx->xdev_bridge_head + 255) & ~(size_t) 255;
+    if (off + size > bdst->size) {
+        ggml_vk_synchronize(dctx);   // resets the bridge head
+        off = 0;
+    }
+    dctx->xdev_bridge_head = off + size;
+    const size_t bsrc_off = off, bdst_off = off;
+
+    // source: copy into the bridge, signal an exportable binary semaphore, submit now
+    vk::ExportSemaphoreCreateInfo eci{ vk::ExternalSemaphoreHandleTypeFlagBits::eSyncFd };
+    vk::SemaphoreTypeCreateInfo tci{ vk::SemaphoreType::eBinary, 0 };
+    tci.setPNext(&eci);
+    vk::SemaphoreCreateInfo sci{};
+    sci.setPNext(&tci);
+    vk::Semaphore s_src = sctx->device->device.createSemaphore(sci);
+    sctx->gc.semaphores.push_back({ s_src, 0 });   // destroyed at the context's next graph cleanup (after a sync)
+
+    ggml_vk_submit_transfer_ctx(sctx);
+    vk_context sc = ggml_vk_get_compute_ctx(sctx);
+    ggml_vk_sync_buffers(nullptr, sc);
+    sc->s->buffer->buf.copyBuffer(src_buf->buffer, bsrc->buffer, { vk::BufferCopy{ src_off, bsrc_off, size } });
+    // release the bridge range to the external (other device) queue family: makes the copy's writes leave this GPU's caches
+    {
+        vk::BufferMemoryBarrier rel{ vk::AccessFlagBits::eTransferWrite, {}, sc->p->q->queue_family_index, VK_QUEUE_FAMILY_EXTERNAL,
+                                     bsrc->buffer, bsrc_off, size };
+        sc->s->buffer->buf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eBottomOfPipe, {}, {}, { rel }, {});
+    }
+    sc->s->signal_semaphores.push_back({ s_src, 0 });
+    ggml_vk_ctx_end(sc);
+    ggml_vk_submit(sc, {});
+    sctx->submit_pending = true;
+    sctx->compute_ctx.reset();
+
+    int fd = -1;
+    try {
+        fd = sctx->device->device.getSemaphoreFdKHR({ s_src, vk::ExternalSemaphoreHandleTypeFlagBits::eSyncFd });
+    } catch (vk::SystemError & e) {
+        GGML_LOG_WARN("ggml_vulkan: sync fd export failed (%s), falling back to a CPU wait\n", e.what());
+        ggml_vk_synchronize(sctx);
+        fd = -1;   // -1 imports as an already-signaled payload
+    }
+
+    // destination: wait on the imported payload in a fresh submission, then copy out of the bridge
+    vk::SemaphoreTypeCreateInfo dtci{ vk::SemaphoreType::eBinary, 0 };
+    vk::SemaphoreCreateInfo dsci{};
+    dsci.setPNext(&dtci);
+    vk::Semaphore s_dst = dctx->device->device.createSemaphore(dsci);
+    dctx->gc.semaphores.push_back({ s_dst, 0 });
+    try {
+        dctx->device->device.importSemaphoreFdKHR({ s_dst, vk::SemaphoreImportFlagBits::eTemporary, vk::ExternalSemaphoreHandleTypeFlagBits::eSyncFd, fd });
+    } catch (vk::SystemError & e) {
+        GGML_LOG_WARN("ggml_vulkan: sync fd import failed (%s), falling back to a CPU wait\n", e.what());
+        if (fd >= 0) {
+            close(fd);
+        }
+        ggml_vk_synchronize(sctx);
+        s_dst = nullptr;
+    }
+    vk_context dc = ggml_vk_get_compute_ctx(dctx);
+    if (s_dst) {
+        ggml_vk_ctx_begin(dctx->device, dc);   // the wait holds back only what follows
+        dc->s->wait_semaphores.push_back({ s_dst, 0 });
+    }
+    ggml_vk_sync_buffers(nullptr, dc);
+    // acquire the bridge range from the external queue family: invalidates whatever this GPU cached of it last step
+    {
+        vk::BufferMemoryBarrier acq{ {}, vk::AccessFlagBits::eTransferRead, VK_QUEUE_FAMILY_EXTERNAL, dc->p->q->queue_family_index,
+                                     bdst->buffer, bdst_off, size };
+        dc->s->buffer->buf.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe, vk::PipelineStageFlagBits::eTransfer, {}, {}, { acq }, {});
+    }
+    dc->s->buffer->buf.copyBuffer(bdst->buffer, dst_buf->buffer, { vk::BufferCopy{ bdst_off, dst_off, size } });
+    ggml_vk_sync_buffers(nullptr, dc);
+    return true;
+#endif
+}
+
 static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_backend_vk_cpy_tensor_async(" << src << " -> " << dst << ", size=" << ggml_nbytes(src) << ")");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend_dst->context;
@@ -17578,9 +17826,13 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
     if (ggml_backend_buffer_is_vk(src->buffer)) {
         ggml_backend_vk_buffer_context * src_buf_ctx = (ggml_backend_vk_buffer_context *)src->buffer->context;
 
-        // Async copy only works within the same device
         if (src_buf_ctx->dev_buffer->device != dst_buf->device) {
-            return false;
+            if (!ggml_backend_is_vk(backend_src)) {
+                return false;
+            }
+            return ggml_vk_cpy_xdev_async((ggml_backend_vk_context *) backend_src->context, ctx,
+                                          src_buf_ctx->dev_buffer, vk_tensor_offset(src) + src->view_offs,
+                                          dst_buf, vk_tensor_offset(dst) + dst->view_offs, ggml_nbytes(src));
         }
 
         vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
@@ -17705,6 +17957,7 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
     ctx->pending_readbacks.clear();
     ctx->readback_ring_head = 0;
     ctx->upload_ring_head = 0;
+    ctx->xdev_bridge_head = 0;
 }
 
 static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
