@@ -1,4 +1,8 @@
 #include "server-context.h"
+#include <vector>
+#include <sstream>
+#include <mutex>
+#include <filesystem>
 #include "server-http.h"
 #include "server-models.h"
 #include "server-cors-proxy.h"
@@ -34,6 +38,28 @@ static inline void signal_handler(int signal) {
     }
 
     shutdown_handler(signal);
+}
+
+// LLAMA_SERVER_INSTANCES: every instance registers its own stop function; a signal stops them all
+static std::mutex shutdown_mtx;
+static std::vector<std::function<void(int)>> shutdown_handlers;
+// LLAMA_SERVER_INSTANCES: instances start one at a time -- model/context/backend initialisation is not safe to run
+// concurrently (an intermittent SIGSEGV during startup with 3 instances). Each instance bumps this once loaded.
+static std::atomic<int> instances_loaded{0};
+static std::atomic<bool> instance_failed{false};
+static void register_shutdown(std::function<void(int)> f) {
+    std::lock_guard<std::mutex> lk(shutdown_mtx);
+    shutdown_handlers.push_back(std::move(f));
+    shutdown_handler = [](int sig) {
+        std::vector<std::function<void(int)>> hs;
+        {
+            std::lock_guard<std::mutex> lk2(shutdown_mtx);
+            hs = shutdown_handlers;
+        }
+        for (auto & h : hs) {
+            h(sig);
+        }
+    };
 }
 
 // satisfies -Wmissing-declarations (used by llama command)
@@ -108,6 +134,59 @@ int llama_server(int argc, char ** argv) {
 
     llama_backend_init();
     llama_numa_init(params.numa);
+
+    // LLAMA_SERVER_INSTANCES=N: N independent servers (own context, slots, KV, drafter, decode thread) on ports
+    // port .. port+N-1, sharing one copy of the weights (sets LLAMA_SHARE_MODEL). With the model layer-split over
+    // several GPUs, their decode steps interleave, so each GPU works on one instance while another uses the next GPU.
+    const char * inst_env = getenv("LLAMA_SERVER_INSTANCES");
+    const int n_inst = inst_env ? std::max(1, atoi(inst_env)) : 1;
+    if (n_inst > 1) {
+        setenv("LLAMA_SHARE_MODEL", "1", 0);   // respect an explicit LLAMA_SHARE_MODEL=0 (debugging)
+        // LLAMA_INSTANCE_DEVD="dev0,dev1,...": instance i drafts on dev[i % n] (e.g. alternate the drafters over the cards)
+        std::vector<std::string> inst_devd;
+        if (const char * e = getenv("LLAMA_INSTANCE_DEVD")) {
+            std::stringstream ss(e); std::string tok;
+            while (std::getline(ss, tok, ',')) { if (!tok.empty()) inst_devd.push_back(tok); }
+        }
+        auto set_devd = [&](common_params & pi, int i) {
+            if (inst_devd.empty()) return;
+            ggml_backend_dev_t d = ggml_backend_dev_by_name(inst_devd[i % inst_devd.size()].c_str());
+            if (d == nullptr) { SRV_ERR("LLAMA_INSTANCE_DEVD: unknown device '%s'\n", inst_devd[i % inst_devd.size()].c_str()); return; }
+            pi.speculative.draft.devices = { d, nullptr };
+            SRV_INF("instance %d drafts on %s\n", i, inst_devd[i % inst_devd.size()].c_str());
+        };
+        set_devd(params, 0);
+        std::vector<std::thread> extra;
+        std::vector<common_params> extra_params(n_inst - 1, params);
+        for (int i = 1; i < n_inst; ++i) {
+            common_params & pi = extra_params[i - 1];
+            pi.port = params.port + i;
+            set_devd(pi, i);
+            if (!pi.cache_disk_path.empty()) {
+                pi.cache_disk_path += "/inst" + std::to_string(i);
+                std::filesystem::create_directories(pi.cache_disk_path);
+            }
+            const int before = instances_loaded.load();
+            extra.emplace_back([&pi, argc, argv] {
+                if (llama_server(pi, argc, argv) != 0) {
+                    instance_failed.store(true);
+                }
+            });
+            // wait until this instance has loaded (or failed) before starting the next one
+            while (instances_loaded.load() == before && !instance_failed.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            if (instance_failed.load()) {
+                SRV_ERR("%s", "an instance failed to start; not starting the rest\n");
+                break;
+            }
+        }
+        const int rc = instance_failed.load() ? 1 : llama_server(params, argc, argv);
+        for (auto & t : extra) {
+            t.join();
+        }
+        return rc;
+    }
 
     return llama_server(params, argc, argv);
 }
@@ -487,12 +566,13 @@ int llama_server(common_params & params, int argc, char ** argv) {
         ctx_http.is_ready.store(true);
 
         SRV_INF("%s", "model loaded\n");
+        instances_loaded.fetch_add(1);
 
-        shutdown_handler = [&](int) {
+        register_shutdown([&](int) {
             mcp_mgr.shutdown();
             // this will unblock start_loop()
             ctx_server.terminate();
-        };
+        });
     }
 
     // register signal handler if not running by CLI

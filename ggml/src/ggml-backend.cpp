@@ -22,6 +22,10 @@
 #include <algorithm>
 #include <unordered_map>
 #include <vector>
+#include <chrono>
+#include <condition_variable>
+#include <map>
+#include <mutex>
 
 #ifdef __APPLE__
 #include <sys/types.h>
@@ -1681,6 +1685,68 @@ static bool sched_async_input_ok(ggml_backend_t split_backend, const struct ggml
     return ggml_nbytes(input) <= ring / 4;   // the size the backend stages in its ring
 }
 
+// GGML_PIPE_ORDER=1 (opt-in): forced ordering for several schedulers (e.g. llama-server instances) that share a model
+// layer-split over several GPUs. Every scheduler whose graph spans >= 2 GPU devices joins a ring, and each device serves
+// the ring in strict rotation: a scheduler waits for its turn on a device before submitting its split there and passes
+// the turn on right after. A member idle for GGML_PIPE_ORDER_IDLE_MS (default 50) is skipped, and no one waits longer
+// than GGML_PIPE_ORDER_WAIT_MS (default 30), so an idle instance cannot stall the others.
+namespace {
+struct pipe_order_state {
+    std::mutex m;
+    std::condition_variable cv;
+    std::vector<const void *> ring;
+    std::map<const void *, int> slot;                       // scheduler -> ring index
+    std::map<const void *, size_t> turn;                    // device -> next ring index to serve
+    std::map<const void *, std::chrono::steady_clock::time_point> active;
+};
+pipe_order_state & pipe_order() { static pipe_order_state s; return s; }
+bool pipe_order_on() { static const bool on = [] { const char * e = getenv("GGML_PIPE_ORDER"); return e && atoi(e) != 0; }(); return on; }
+int pipe_order_env(const char * name, int def) { const char * e = getenv(name); return e ? atoi(e) : def; }
+
+void pipe_order_touch(const void * self) {
+    auto & po = pipe_order();
+    std::lock_guard<std::mutex> lk(po.m);
+    if (!po.slot.count(self)) {
+        po.slot[self] = (int) po.ring.size();
+        po.ring.push_back(self);
+    }
+    po.active[self] = std::chrono::steady_clock::now();
+}
+
+void pipe_order_acquire(const void * self, const void * dev) {
+    auto & po = pipe_order();
+    static const auto idle = std::chrono::milliseconds(pipe_order_env("GGML_PIPE_ORDER_IDLE_MS", 50));
+    static const auto wait = std::chrono::milliseconds(pipe_order_env("GGML_PIPE_ORDER_WAIT_MS", 30));
+    std::unique_lock<std::mutex> lk(po.m);
+    const auto deadline = std::chrono::steady_clock::now() + wait;
+    while (po.ring.size() > 1) {
+        size_t & t = po.turn[dev];
+        const void * want = po.ring[t % po.ring.size()];
+        if (want == self) {
+            break;
+        }
+        if (std::chrono::steady_clock::now() - po.active[want] > idle) {   // skip an idle member
+            t = (t + 1) % po.ring.size();
+            continue;
+        }
+        if (po.cv.wait_until(lk, deadline) == std::cv_status::timeout) {   // never stall for long
+            break;
+        }
+    }
+    po.active[self] = std::chrono::steady_clock::now();
+}
+
+void pipe_order_release(const void * self, const void * dev) {
+    auto & po = pipe_order();
+    {
+        std::lock_guard<std::mutex> lk(po.m);
+        po.turn[dev] = (size_t) (po.slot[self] + 1) % std::max<size_t>(1, po.ring.size());
+        po.active[self] = std::chrono::steady_clock::now();
+    }
+    po.cv.notify_all();
+}
+} // namespace
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1691,10 +1757,31 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    // GGML_PIPE_ORDER: does this graph span >= 2 GPU devices (a member of a layer-split pipeline)?
+    bool po_member = false;
+    if (pipe_order_on()) {
+        std::vector<const void *> devs;
+        for (int i = 0; i < sched->n_splits; i++) {
+            ggml_backend_dev_t d = ggml_backend_get_device(sched->backends[splits[i].backend_id]);
+            if (d && ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_CPU && std::find(devs.begin(), devs.end(), (const void *) d) == devs.end()) {
+                devs.push_back(d);
+            }
+        }
+        po_member = devs.size() >= 2;
+        if (po_member) {
+            pipe_order_touch(sched);
+        }
+    }
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        ggml_backend_dev_t po_dev = po_member ? ggml_backend_get_device(split_backend) : nullptr;
+        const bool po_gpu = po_dev && ggml_backend_dev_type(po_dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
+        if (po_gpu) {
+            pipe_order_acquire(sched, po_dev);
+        }
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -1849,6 +1936,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            if (po_gpu) {
+                pipe_order_release(sched, po_dev);
+            }
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
@@ -1883,6 +1973,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
 
                 j0 = j1;
+            }
+            if (po_gpu) {
+                pipe_order_release(sched, po_dev);
             }
         }
 
