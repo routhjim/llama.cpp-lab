@@ -1098,9 +1098,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "HC_COMBINE",
+    "HC_MIX",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1213,9 +1216,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "hc_combine(r,b,i)",
+    "hc_mix(x,g)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -2532,6 +2538,52 @@ struct ggml_tensor * ggml_mean(
 }
 
 // ggml_argmax
+
+// ggml_hc_combine
+
+struct ggml_tensor * ggml_hc_combine(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * res,
+        struct ggml_tensor  * blk,
+        struct ggml_tensor  * inj,
+        float                 scale) {
+    GGML_ASSERT(res->type == GGML_TYPE_F32 && blk->type == GGML_TYPE_F32 && inj->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(res) && ggml_is_contiguous(blk) && ggml_is_contiguous(inj));
+    GGML_ASSERT(res->ne[3] == 1);
+    GGML_ASSERT(ggml_nelements(blk) == res->ne[0] * res->ne[2]);
+    GGML_ASSERT(ggml_nelements(inj) == res->ne[1] * res->ne[2]);
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 3, res->ne);
+    ggml_set_op_params_f32(result, 0, scale);
+
+    result->op     = GGML_OP_HC_COMBINE;
+    result->src[0] = res;
+    result->src[1] = blk;
+    result->src[2] = inj;
+
+    return result;
+}
+
+// ggml_hc_mix
+
+struct ggml_tensor * ggml_hc_mix(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * g,
+        int                   n_streams) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && g->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(g) && ggml_are_same_shape(x, g));
+    GGML_ASSERT(n_streams > 0 && x->ne[0] % n_streams == 0 && x->ne[2] == 1 && x->ne[3] == 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, x->ne[0] / n_streams, x->ne[1]);
+    ggml_set_op_params_i32(result, 0, n_streams);
+
+    result->op     = GGML_OP_HC_MIX;
+    result->src[0] = x;
+    result->src[1] = g;
+
+    return result;
+}
 
 struct ggml_tensor * ggml_argmax(
         struct ggml_context * ctx,

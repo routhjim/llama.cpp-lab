@@ -1127,6 +1127,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_cumsum_multipass1_f32;
     vk_pipeline pipeline_cumsum_multipass2_f32;
     vk_pipeline pipeline_argmax_f32;
+    vk_pipeline pipeline_hc_combine;
+    vk_pipeline pipeline_hc_mix;
     vk_pipeline pipeline_count_equal_i32;
     std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
     vk_pipeline pipeline_im2col_f32, pipeline_im2col_f32_f16;
@@ -1486,6 +1488,19 @@ struct vk_flash_attn_push_constants {
     uint32_t k_num;
 };
 static_assert(sizeof(vk_flash_attn_push_constants) <= 128, "sizeof(vk_flash_attn_push_constants) must be <= 128");
+
+struct vk_op_hc_combine_push_constants {
+    uint32_t E;
+    uint32_t C;
+    uint32_t N;
+    float    scale;
+};
+
+struct vk_op_hc_mix_push_constants {
+    uint32_t E;
+    uint32_t C;
+    uint32_t N;
+};
 
 struct vk_op_push_constants {
     uint32_t KX;
@@ -6097,6 +6112,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
 
     ggml_vk_create_pipeline(device, device->pipeline_argmax_f32, "argmax_f32", argmax_f32_len, argmax_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_hc_combine, "hc_combine", hc_combine_len, hc_combine_data, "main", 4, sizeof(vk_op_hc_combine_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_hc_mix, "hc_mix", hc_mix_len, hc_mix_data, "main", 3, sizeof(vk_op_hc_mix_push_constants), {512, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_sum_rows_f32, "sum_rows_f32", sum_rows_f32_len, sum_rows_f32_data, "main", 2, sizeof(vk_op_sum_rows_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cross_entropy_loss_f32, "cross_entropy_loss_f32", cross_entropy_loss_f32_len, cross_entropy_loss_f32_data, "main", 3, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
@@ -8571,12 +8588,96 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
     subctx->s->buffer->buf.dispatch(wg0, wg1, wg2);
 }
 
+// GGML_VK_CB_TS=1 (profiling): GPU timestamps at the start and end of every command buffer, per device. Every 10 s
+// prints per device: GPU-active ms/s (sum of buffer durations), idle gaps between back-to-back buffers (< 20 ms apart:
+// the GPU waiting for the CPU to record/submit), buffers/s.
+struct vk_cbts_dev {
+    vk::QueryPool pool;
+    uint64_t next = 0, flushed = 0;
+    std::vector<uint64_t> begin_q;          // per buffer slot pair: query index of begin
+    double active_ns = 0, gap_ns = 0; uint64_t n_cb = 0; uint64_t last_end = 0;
+};
+static std::mutex vk_cbts_mutex;
+static std::map<vk_device_struct *, vk_cbts_dev> vk_cbts;
+static std::map<VkCommandBuffer, std::pair<vk_device_struct *, uint32_t>> vk_cbts_open;
+static int64_t vk_cbts_t0 = 0;
+static constexpr uint32_t VK_CBTS_N = 16384;
+static bool vk_cbts_on() { static const bool on = getenv("GGML_VK_CB_TS") != nullptr; return on; }
+static void vk_cbts_begin(vk_device & d, vk::CommandBuffer buf) {
+    std::lock_guard<std::mutex> lk(vk_cbts_mutex);
+    auto & st = vk_cbts[d.get()];
+    if (!st.pool) {
+        st.pool = d->device.createQueryPool({ {}, vk::QueryType::eTimestamp, VK_CBTS_N });
+    }
+    const uint32_t q = (uint32_t) (st.next % VK_CBTS_N);
+    st.next += 2;
+    buf.resetQueryPool(st.pool, q, 2);
+    buf.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, st.pool, q);
+    vk_cbts_open[(VkCommandBuffer) buf] = { d.get(), q };
+}
+static void vk_cbts_end(vk::CommandBuffer buf) {
+    std::lock_guard<std::mutex> lk(vk_cbts_mutex);
+    auto it = vk_cbts_open.find((VkCommandBuffer) buf);
+    if (it == vk_cbts_open.end()) {
+        return;
+    }
+    buf.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, vk_cbts[it->second.first].pool, it->second.second + 1);
+    vk_cbts_open.erase(it);
+}
+static void vk_cbts_flush(vk_device & d) {
+    std::lock_guard<std::mutex> lk(vk_cbts_mutex);
+    auto f = vk_cbts.find(d.get());
+    if (f == vk_cbts.end()) {
+        return;
+    }
+    auto & st = f->second;
+    const double period = d->properties.limits.timestampPeriod;
+    while (st.flushed < st.next) {
+        const uint32_t q = (uint32_t) (st.flushed % VK_CBTS_N);
+        uint64_t v[2] = {0, 0};
+        if (d->device.getQueryPoolResults(st.pool, q, 2, sizeof(v), v, sizeof(uint64_t), vk::QueryResultFlagBits::e64) != vk::Result::eSuccess) {
+            break;
+        }
+        const uint64_t b = (uint64_t) (v[0] * period), e = (uint64_t) (v[1] * period);
+        if (e > b) {
+            st.active_ns += e - b;
+            if (st.last_end && b > st.last_end && b - st.last_end < 20000000ull) {
+                st.gap_ns += b - st.last_end;
+            }
+            st.last_end = std::max(st.last_end, e);
+            st.n_cb++;
+        }
+        st.flushed += 2;
+    }
+    const int64_t now = ggml_time_us();
+    if (vk_cbts_t0 == 0) {
+        vk_cbts_t0 = now;
+    }
+    if (now - vk_cbts_t0 >= 10000000) {
+        const double secs = (now - vk_cbts_t0) / 1e6;
+        std::string out = "cb_ts:";
+        for (auto & kv : vk_cbts) {
+            char buf[200];
+            snprintf(buf, sizeof(buf), " [%s active %.0f ms/s, gaps %.0f ms/s, %.0f cb/s, %.3f ms/cb]", kv.first->name.c_str(),
+                     kv.second.active_ns / 1e6 / secs, kv.second.gap_ns / 1e6 / secs, kv.second.n_cb / secs,
+                     kv.second.n_cb ? kv.second.active_ns / 1e6 / kv.second.n_cb : 0.0);
+            out += buf;
+            kv.second.active_ns = kv.second.gap_ns = 0; kv.second.n_cb = 0;
+        }
+        fprintf(stderr, "%s\n", out.c_str());
+        vk_cbts_t0 = now;
+    }
+}
+
 static void ggml_vk_ctx_end(vk_context& ctx) {
     VK_LOG_DEBUG("ggml_vk_ctx_end(" << ctx << ", " << ctx->seqs.size() << ")");
     if (ctx->s == nullptr) {
         return;
     }
 
+    if (vk_cbts_on()) {
+        vk_cbts_end(ctx->s->buffer->buf);
+    }
     ctx->s->buffer->buf.end();
     ctx->s = nullptr;
 }
@@ -8589,6 +8690,9 @@ static void ggml_vk_ctx_begin(vk_device& device, vk_context& subctx) {
 
     subctx->seqs.push_back({ ggml_vk_begin_submission(device, *subctx->p) });
     subctx->s = subctx->seqs[subctx->seqs.size() - 1].data();
+    if (vk_cbts_on() && !subctx->p->q->transfer_only) {
+        vk_cbts_begin(device, subctx->s->buffer->buf);
+    }
 }
 
 static vk_context ggml_vk_get_compute_ctx(ggml_backend_vk_context * ctx) {
@@ -12289,6 +12393,10 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return ctx->device->pipeline_argmax_f32;
         }
         return nullptr;
+    case GGML_OP_HC_COMBINE:
+        return ctx->device->pipeline_hc_combine;
+    case GGML_OP_HC_MIX:
+        return ctx->device->pipeline_hc_mix;
     case GGML_OP_COUNT_EQUAL:
         if (src0->type == GGML_TYPE_I32 && src1->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_I64) {
             return ctx->device->pipeline_count_equal_i32;
@@ -12738,6 +12846,12 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     case GGML_OP_SOFT_MAX_BACK:
     case GGML_OP_SUM_ROWS:
     case GGML_OP_CUMSUM:
+    case GGML_OP_HC_COMBINE:
+    case GGML_OP_HC_MIX:
+        {
+            const uint32_t ne = (uint32_t) ggml_nelements(dst);
+            elements = ne > 512u * 256u ? std::array<uint32_t, 3>{ 512u * 256u, CEIL_DIV(ne, 512u * 256u), 1 } : std::array<uint32_t, 3>{ ne, 1, 1 };
+        } break;
     case GGML_OP_MEAN:
     case GGML_OP_ARGMAX:
         {
@@ -14846,6 +14960,23 @@ static void ggml_vk_cross_entropy_loss_back(ggml_backend_vk_context * ctx, vk_co
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { grad_buf, logits_buf, labels_buf, dst_buf }, pc, ggml_vk_nrows_elements(nrows));
 }
 
+static void ggml_vk_hc_combine(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, ggml_tensor * dst) {
+    vk_op_hc_combine_push_constants pc;
+    pc.E = (uint32_t) src0->ne[0];
+    pc.C = (uint32_t) src0->ne[1];
+    pc.N = (uint32_t) ggml_nelements(dst);
+    pc.scale = ggml_get_op_params_f32(dst, 0);
+    ggml_vk_op_f32<vk_op_hc_combine_push_constants>(ctx, subctx, src0, src1, src2, nullptr, dst, GGML_OP_HC_COMBINE, std::move(pc));
+}
+
+static void ggml_vk_hc_mix(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    vk_op_hc_mix_push_constants pc;
+    pc.E = (uint32_t) dst->ne[0];
+    pc.C = (uint32_t) ggml_get_op_params_i32(dst, 0);
+    pc.N = (uint32_t) ggml_nelements(dst);
+    ggml_vk_op_f32<vk_op_hc_mix_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_HC_MIX, std::move(pc));
+}
+
 static void ggml_vk_argmax(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
     ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_ARGMAX, { (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], 0.0f, 0.0f, 0.0f, 0.0f });
 }
@@ -16597,6 +16728,14 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         ggml_vk_argmax(ctx, compute_ctx, src0, node);
 
         break;
+    case GGML_OP_HC_COMBINE:
+        ggml_vk_hc_combine(ctx, compute_ctx, src0, src1, src2, node);
+
+        break;
+    case GGML_OP_HC_MIX:
+        ggml_vk_hc_mix(ctx, compute_ctx, src0, src1, node);
+
+        break;
     case GGML_OP_CROSS_ENTROPY_LOSS:
         ggml_vk_cross_entropy_loss(ctx, compute_ctx, node);
 
@@ -17556,6 +17695,9 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
         ctx->compute_ctx.reset();
     }
 
+    if (vk_cbts_on()) {
+        vk_cbts_flush(ctx->device);
+    }
     // everything recorded on this context has completed: deliver ring readbacks, reuse the rings from the start
     for (const auto & r : ctx->pending_readbacks) {
         memcpy(r.dst, r.src, r.n);
@@ -18269,7 +18411,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         std::fill(ctx->query_nodes.begin(), ctx->query_nodes.end(), nullptr);
         std::fill(ctx->query_node_idx.begin(), ctx->query_node_idx.end(), 0);
 
-        GGML_ASSERT(ctx->compute_ctx.expired());
+        // (wip/cb-ts) a multi-device split's event wait may already have opened the compute context: reuse it
         compute_ctx = ggml_vk_get_compute_ctx(ctx);
         ctx->query_idx = 0;
         compute_ctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->query_pool, ctx->query_idx++);
@@ -19836,6 +19978,12 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_ARGMAX:
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
+        case GGML_OP_HC_COMBINE:
+            return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op->src[2]) &&
+                   op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_F32;
+        case GGML_OP_HC_MIX:
+            return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                   op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_CROSS_ENTROPY_LOSS:
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32
                 && ggml_is_contiguous(op->src[1]) && op->src[1]->type == GGML_TYPE_F32

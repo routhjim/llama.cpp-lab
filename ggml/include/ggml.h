@@ -590,6 +590,9 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_HC_COMBINE,
+        GGML_OP_HC_MIX,
+
         GGML_OP_COUNT,
     };
 
@@ -1059,6 +1062,22 @@ extern "C" {
             struct ggml_tensor  * a);
 
     // argmax along rows
+    // Hyper-connection helpers (Flash-Next / qwen4exp), fused to cut small dispatches. All f32, contiguous.
+    // hc_combine: res [E, C, T], blk [E, T], inj [C, T] -> res + blk * scale * sigmoid(inj)
+    GGML_API struct ggml_tensor * ggml_hc_combine(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * res,
+            struct ggml_tensor  * blk,
+            struct ggml_tensor  * inj,
+            float                 scale);
+
+    // hc_mix: x [E*C, T], g [E*C, T] -> [E, T], dst[e,t] = sum over c of x[c*E+e, t] * sigmoid(g[c*E+e, t])
+    GGML_API struct ggml_tensor * ggml_hc_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * g,
+            int                   n_streams);
+
     GGML_API struct ggml_tensor * ggml_argmax(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);

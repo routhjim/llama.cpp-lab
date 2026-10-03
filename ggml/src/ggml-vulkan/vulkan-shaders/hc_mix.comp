@@ -1,0 +1,32 @@
+#version 450
+
+// Flash-Next hyper-connection mix, fused: dst[e,t] = sum_c x[c*E+e, t] * sigmoid(g[c*E+e, t])
+// (replaces sigmoid + mul + cont + one add per extra stream)
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer A {float data_x[];};
+layout (binding = 1) readonly  buffer B {float data_g[];};
+layout (binding = 2) writeonly buffer D {float data_d[];};
+
+layout (push_constant) uniform parameter {
+    uint  E;
+    uint  C;
+    uint  N;
+} p;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    if (i >= p.N) {
+        return;
+    }
+    const uint e = i % p.E;
+    const uint t = i / p.E;
+    const uint base = t * p.E * p.C + e;
+    float acc = 0.0;
+    for (uint c = 0; c < p.C; ++c) {
+        const uint j = base + c * p.E;
+        acc += data_x[j] / (1.0 + exp(-data_g[j]));
+    }
+    data_d[i] = acc;
+}

@@ -1,0 +1,30 @@
+#version 450
+
+// Flash-Next hyper-connection combine, fused: dst[e,c,t] = res[e,c,t] + blk[e,t] * scale * sigmoid(inj[c,t])
+// (replaces sigmoid + scale + repeat + mul + add)
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer A {float data_res[];};
+layout (binding = 1) readonly  buffer B {float data_blk[];};
+layout (binding = 2) readonly  buffer C {float data_inj[];};
+layout (binding = 3) writeonly buffer D {float data_d[];};
+
+layout (push_constant) uniform parameter {
+    uint  E;
+    uint  C;
+    uint  N;
+    float scale;
+} p;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    if (i >= p.N) {
+        return;
+    }
+    const uint e  = i % p.E;
+    const uint ct = i / p.E;
+    const uint t  = ct / p.C;
+    const float w = p.scale / (1.0 + exp(-data_inj[ct]));
+    data_d[i] = data_res[i] + data_blk[e + p.E * t] * w;
+}

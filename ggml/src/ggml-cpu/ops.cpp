@@ -1565,6 +1565,49 @@ void ggml_compute_forward_mean(
     }
 }
 
+// ggml_compute_forward_hc_combine
+
+void ggml_compute_forward_hc_combine(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * res = dst->src[0];
+    const ggml_tensor * blk = dst->src[1];
+    const ggml_tensor * inj = dst->src[2];
+    const float scale = ggml_get_op_params_f32(dst, 0);
+    const int64_t E = res->ne[0], C = res->ne[1], T = res->ne[2];
+    const float * r = (const float *) res->data;
+    const float * b = (const float *) blk->data;
+    const float * g = (const float *) inj->data;
+    float * d = (float *) dst->data;
+    for (int64_t ct = params->ith; ct < C * T; ct += params->nth) {
+        const int64_t t = ct / C;
+        const float w = scale / (1.0f + expf(-g[ct]));
+        for (int64_t e = 0; e < E; ++e) {
+            d[ct * E + e] = r[ct * E + e] + b[t * E + e] * w;
+        }
+    }
+}
+
+// ggml_compute_forward_hc_mix
+
+void ggml_compute_forward_hc_mix(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * x = dst->src[0];
+    const ggml_tensor * g = dst->src[1];
+    const int64_t C = ggml_get_op_params_i32(dst, 0);
+    const int64_t E = dst->ne[0], T = dst->ne[1];
+    const float * xd = (const float *) x->data;
+    const float * gd = (const float *) g->data;
+    float * d = (float *) dst->data;
+    for (int64_t t = params->ith; t < T; t += params->nth) {
+        for (int64_t e = 0; e < E; ++e) {
+            float acc = 0.0f;
+            for (int64_t c = 0; c < C; ++c) {
+                const int64_t i = t * E * C + c * E + e;
+                acc += xd[i] / (1.0f + expf(-gd[i]));
+            }
+            d[t * E + e] = acc;
+        }
+    }
+}
+
 // ggml_compute_forward_argmax
 
 static void ggml_compute_forward_argmax_f32(
