@@ -1651,6 +1651,36 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// GGML_SCHED_ASYNC_INPUTS (default on): for a Vulkan discrete-GPU split backend, upload user inputs with
+// set_tensor_async and skip the CPU synchronize before copying a split's inputs. The Vulkan backend stages small
+// host->device uploads in a ring (copied before the call returns, GGML_VK_UPLOAD_RING) and records the device copy
+// in queue order after every earlier use of the destination, so neither wait is needed. Other backends, and Vulkan
+// with the upload ring off, keep the blocking path.
+static bool sched_queue_ordered(ggml_backend_t backend) {
+    static const bool on = [] {
+        const char * e = getenv("GGML_SCHED_ASYNC_INPUTS");
+        const char * r = getenv("GGML_VK_UPLOAD_RING");
+        return (e == nullptr || atoi(e) != 0) && (r == nullptr || atoi(r) != 0);
+    }();
+    if (!on || strncmp(ggml_backend_name(backend), "Vulkan", 6) != 0) {
+        return false;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    return dev != NULL && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU;
+}
+
+static bool sched_async_input_ok(ggml_backend_t split_backend, const struct ggml_tensor * input, const struct ggml_tensor * input_cpy) {
+    static const size_t ring = [] { const char * e = getenv("GGML_VK_UPLOAD_RING"); return (size_t) (e ? atoi(e) : 32) << 20; }();
+    if (!sched_queue_ordered(split_backend) || split_backend->iface.set_tensor_async == NULL) {
+        return false;
+    }
+    if (input->buffer == NULL || !ggml_backend_buffer_is_host(input->buffer) || !ggml_is_contiguous(input) ||
+        input_cpy->buffer == NULL || ggml_backend_buffer_get_type(input_cpy->buffer) != ggml_backend_get_default_buffer_type(split_backend)) {
+        return false;
+    }
+    return ggml_nbytes(input) <= ring / 4;   // the size the backend stages in its ring
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1683,6 +1713,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+                if (sched_async_input_ok(split_backend, input, input_cpy)) {
+                    // copied out of input->data before this returns, uploaded in queue order: no wait needed
+                    ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                    continue;
+                }
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
@@ -1691,10 +1726,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
-                // wait for the split backend to finish using the input before overwriting it
+                // wait for the split backend to finish using the input before overwriting it. An in-queue (async) copy
+                // on a queue-ordered backend already comes after every earlier use; the blocking fallback below waits.
+                const bool queue_ordered = sched_queue_ordered(split_backend);
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
-                } else {
+                } else if (!queue_ordered) {
                     ggml_backend_synchronize(split_backend);
                 }
 
@@ -1795,6 +1832,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+                        if (queue_ordered && sched->events[split_backend_id][sched->cur_copy] == NULL) {
+                            ggml_backend_synchronize(split_backend);
+                        }
                         ggml_backend_synchronize(input_backend);
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
