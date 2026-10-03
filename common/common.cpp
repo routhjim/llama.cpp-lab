@@ -1,3 +1,5 @@
+#include <map>
+#include <mutex>
 #include "ggml.h"
 #include "gguf.h"
 
@@ -1279,6 +1281,7 @@ struct common_init_result::impl {
     common_threadpools threadpools;
 
     llama_model_ptr   model;
+    llama_model *     model_shared = nullptr; // LLAMA_SHARE_MODEL: another instance owns the weights
     llama_context_ptr context;
 
     std::vector<llama_adapter_lora_ptr> lora;
@@ -1325,12 +1328,39 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
     }
 
-    llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
+    // LLAMA_SHARE_MODEL=1: several contexts in one process (e.g. LLAMA_SERVER_INSTANCES) share one copy of the
+    // weights. The first load owns the model; later loads of the same path borrow it.
+    static std::mutex share_mtx;
+    static std::map<std::string, llama_model *> shared_models;
+    static const bool share = [] { const char * e = getenv("LLAMA_SHARE_MODEL"); return e != nullptr && atoi(e) != 0; }();
+    std::unique_lock<std::mutex> share_lock(share_mtx, std::defer_lock);
+    if (share) {
+        share_lock.lock();
+    }
+    llama_model * model = nullptr;
+    bool borrowed = false;
+    if (share && shared_models.count(params.model.path)) {
+        model = shared_models[params.model.path];
+        borrowed = true;
+        COM_INF("%s: sharing the already loaded model '%s'\n", __func__, params.model.path.c_str());
+    } else {
+        model = llama_model_load_from_file(params.model.path.c_str(), mparams);
+    }
     if (model == NULL) {
         return;
     }
 
-    pimpl->model.reset(model);
+    if (borrowed) {
+        pimpl->model_shared = model;
+    } else {
+        pimpl->model.reset(model);
+        if (share) {
+            shared_models[params.model.path] = model;
+        }
+    }
+    if (share_lock.owns_lock()) {
+        share_lock.unlock();
+    }
 
     if (model_only) {
         return;
@@ -1408,7 +1438,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 }
 
 llama_model * common_init_result::model() {
-    return pimpl->model.get();
+    return pimpl->model ? pimpl->model.get() : pimpl->model_shared;
 }
 
 llama_context * common_init_result::context() {
