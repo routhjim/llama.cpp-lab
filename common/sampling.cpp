@@ -170,6 +170,9 @@ struct common_sampler {
     mutable int64_t t_total_us = 0;
     // coupled sampling state for the next sample_and_accept_n (see common_sampler_set_coupled)
     bool coupled = false; uint32_t coupled_seed = 0; llama_seq_id coupled_seq = 0; std::vector<llama_pos> coupled_pos;
+    // position of the coupled draw for the current common_sampler_sample call (-1 = not coupled): a backend (GPU)
+    // dist sampler has already drawn with its own uniform, so the coupled pick is redone on the host
+    llama_pos coupled_pos_cur = -1;
 
 };
 
@@ -622,6 +625,29 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
             GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
             GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
 
+            // coupled sampling: the GPU dist drew with an independent uniform, which breaks the coupling with the
+            // drafter (acceptance 0.81 -> 0.73). Redo the draw with the shared rule argmax(p_i / E_i), as the CPU
+            // dist and common_spec_coupled_pick do, over the backend's post top-k/top-p probabilities (k entries,
+            // already read back -- not the full vocabulary).
+            if (gsmpl->coupled_pos_cur >= 0 && llama_get_sampled_probs_ith(ctx, idx) != nullptr && cur_p.size > 1) {
+                size_t sel = 0;
+                bool have = false;
+                double best_p = 0.0, best_e = 1.0;
+                for (size_t i = 0; i < cur_p.size; ++i) {
+                    const double pi = (double) cur_p.data[i].p;
+                    if (!(pi > 0.0)) {
+                        continue; // masked by the backend top-p / min-p
+                    }
+                    const double e = llama_sampler_coupled_exp(gsmpl->coupled_seed, gsmpl->coupled_seq, gsmpl->coupled_pos_cur, cur_p.data[i].id);
+                    if (!have || pi * best_e > best_p * e) {
+                        best_p = pi; best_e = e; sel = i; have = true;
+                    }
+                }
+                if (have) {
+                    id = cur_p.data[sel].id;
+                }
+            }
+
             for (size_t i = 0; i < cur_p.size; ++i) {
                 if (cur_p.data[i].id == id) {
                     cur_p.selected = i;
@@ -700,10 +726,17 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
     size_t i = 0;
     for (; i < draft.size(); i++) {
-        if (dist && i < gsmpl->coupled_pos.size()) {
+        const bool cpl = gsmpl->coupled && i < gsmpl->coupled_pos.size();
+        if (dist && cpl) {
             llama_sampler_dist_set_coupled(dist, gsmpl->coupled_seed, gsmpl->coupled_seq, gsmpl->coupled_pos[i]);
         }
+        gsmpl->coupled_pos_cur = cpl ? gsmpl->coupled_pos[i] : -1;
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        gsmpl->coupled_pos_cur = -1;
+        // on the backend path the CPU dist never consumed its one-shot arm: disarm it so it cannot leak
+        if (dist) {
+            llama_sampler_dist_set_coupled(dist, 0, 0, -1);
+        }
 
         common_sampler_accept(gsmpl, id, true);
 
