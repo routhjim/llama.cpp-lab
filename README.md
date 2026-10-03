@@ -4,7 +4,7 @@
 
 This is one person's working copy of llama.cpp, tuned against two models on one machine:
 Qwen3.8-Flash-Next (a 180B sparse MoE with hyper-connections and a sparse-attention indexer)
-on the integrated GPU, and dense Qwen3.8-27B on the eGPUs. Every change here was merged through
+layer-split across the integrated GPU and both eGPUs, and dense Qwen3.8-27B on the eGPUs. Every change here was merged through
 a PR with a before/after measurement, and the negative results are recorded next to the wins.
 
 It is not a GitHub fork of `ggml-org/llama.cpp`, and none of this work is in upstream llama.cpp.
@@ -26,9 +26,9 @@ Numbers from a different power envelope, kernel command line or quant will not m
 ## Results
 
 Each row is one merged change, measured on this machine with the other backend unloaded. Grouped by the setup it
-serves: Flash-Next on the iGPU (with an XTX helping), dense Qwen3.8-27B on one XTX, and the 27B pipelined over two.
+serves: Flash-Next split across the iGPU and both XTX, dense Qwen3.8-27B on one XTX, and the 27B pipelined over two.
 
-### iGPU: Qwen3.8-Flash-Next (180B MoE)
+### iGPU + two XTX: Qwen3.8-Flash-Next (180B MoE)
 
 | Change | PR | Before | After | Conditions |
 |---|---|---|---|---|
