@@ -426,11 +426,8 @@ struct common_sampler * common_sampler_init(
         params.backend_sampling = false;
     }
 
-    if (rbudget && params.backend_sampling) {
-        LOG_WRN("%s: backend sampling is not compatible with reasoning budget, disabling\n", __func__);
-
-        params.backend_sampling = false;
-    }
+    // a reasoning budget only constrains the next token while it is forcing its end sequence, so it composes with
+    // backend sampling: common_sampler_sample keeps the backend's pick except on those forced tokens
 
     auto * result = new common_sampler {
         /* .params  = */ params,
@@ -623,7 +620,6 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
             LOG_DBG("%s: Backend sampler selected token: '%d'. Will not run any CPU samplers\n", __func__, id);
 
             GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
-            GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
 
             // coupled sampling: the GPU dist drew with an independent uniform, which breaks the coupling with the
             // drafter (acceptance 0.81 -> 0.73). Redo the draw with the shared rule argmax(p_i / E_i), as the CPU
@@ -645,6 +641,14 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
                 }
                 if (have) {
                     id = cur_p.data[sel].id;
+                }
+            }
+
+            // the reasoning budget, while forcing, overrides whatever was sampled
+            if (rbudget) {
+                const llama_token forced = common_reasoning_budget_forced_token(rbudget);
+                if (forced != LLAMA_TOKEN_NULL) {
+                    id = forced;
                 }
             }
 
