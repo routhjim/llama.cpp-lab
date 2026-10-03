@@ -359,7 +359,22 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
 
     ggml_tensor * lo = build_lora_mm(w_down, xn);
     lo = ggml_silu(ctx0, lo);
-    ggml_tensor * gate = ggml_sigmoid(ctx0, build_lora_mm(w_up, lo));
+    ggml_tensor * gate_pre = build_lora_mm(w_up, lo);
+
+    // FN_HC_FUSE (default on): one kernel for sigmoid + gate + the sum over streams (sigmoid, mul, cont and hc-1 adds
+    // otherwise). On a discrete GPU this model is bound by the number of small dispatches, not bandwidth.
+    static const bool hc_fuse = [] { const char * e = getenv("FN_HC_FUSE"); return e == nullptr || atoi(e) != 0; }();
+    if (hc_fuse && ggml_is_contiguous(xn) && ggml_is_contiguous(gate_pre) && xn->ne[0] == hc_dim) {
+        ggml_tensor * mixed = ggml_hc_mix(ctx0, xn, gate_pre, (int) hc);
+        cb(mixed, "hc_mixed", il);
+        if (inject) {
+            *inject = build_lora_mm(w_inject, xn);
+            cb(*inject, "hc_inject", il);
+        }
+        return mixed;
+    }
+
+    ggml_tensor * gate = ggml_sigmoid(ctx0, gate_pre);
     cb(gate, "hc_gate", il);
 
     ggml_tensor * gated = ggml_mul(ctx0, xn, gate);
@@ -396,6 +411,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
 
     // 2*sigmoid centres the scatter weights on 1, so a zero injection is a plain residual add
     // inject is built from the already-1/hc-scaled xn, so no scale is needed here
+    // FN_HC_FUSE (default on): one kernel instead of sigmoid, scale, repeat, mul, add
+    static const bool hc_fuse = [] { const char * e = getenv("FN_HC_FUSE"); return e == nullptr || atoi(e) != 0; }();
+    if (hc_fuse && ggml_is_contiguous(residual) && ggml_is_contiguous(block_out) && ggml_is_contiguous(inject) &&
+            residual->ne[0] == n_embd && residual->ne[1] == hc) {
+        ggml_tensor * cur = ggml_hc_combine(ctx0, residual, block_out, inject, 2.0f);
+        cb(cur, "hc_combine", il);
+        return cur;
+    }
     ggml_tensor * w = ggml_sigmoid(ctx0, inject);
     w = ggml_scale(ctx0, w, 2.0f);
     w = ggml_reshape_3d(ctx0, w, 1, hc, nt);

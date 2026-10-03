@@ -2780,6 +2780,45 @@ struct test_rms_norm_mul_rope : public test_case {
 };
 
 // GGML_OP_ARGMAX
+struct test_hc_combine : public test_case {
+    const int64_t E, C, T;
+
+    std::string vars() override {
+        return VARS_TO_STR3(E, C, T);
+    }
+
+    test_hc_combine(int64_t E = 2560, int64_t C = 4, int64_t T = 4) : E(E), C(C), T(T) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * res = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, E, C, T);
+        ggml_tensor * blk = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E, T);
+        ggml_tensor * inj = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, T);
+        ggml_set_name(res, "res"); ggml_set_name(blk, "blk"); ggml_set_name(inj, "inj");
+        ggml_tensor * out = ggml_hc_combine(ctx, res, blk, inj, 2.0f);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+struct test_hc_mix : public test_case {
+    const int64_t E, C, T;
+
+    std::string vars() override {
+        return VARS_TO_STR3(E, C, T);
+    }
+
+    test_hc_mix(int64_t E = 2560, int64_t C = 4, int64_t T = 4) : E(E), C(C), T(T) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E * C, T);
+        ggml_tensor * g = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E * C, T);
+        ggml_set_name(x, "x"); ggml_set_name(g, "g");
+        ggml_tensor * out = ggml_hc_mix(ctx, x, g, (int) C);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_argmax : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
@@ -9119,6 +9158,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_count_equal(GGML_TYPE_F32, {4,  500, 1, 1}));
     test_cases.emplace_back(new test_count_equal(GGML_TYPE_F32, {4, 5000, 1, 1}));
 
+    for (int64_t T : {1, 4, 7, 300}) {
+        test_cases.emplace_back(new test_hc_combine(2560, 4, T));
+        test_cases.emplace_back(new test_hc_mix(2560, 4, T));
+    }
+    test_cases.emplace_back(new test_hc_combine(64, 3, 5));
+    test_cases.emplace_back(new test_hc_mix(64, 3, 5));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {32,    1, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {32,  513, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {100,  10, 1, 1}));

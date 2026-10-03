@@ -2258,6 +2258,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_argmax(params, tensor);
             } break;
+        case GGML_OP_HC_COMBINE:
+            {
+                ggml_compute_forward_hc_combine(params, tensor);
+            } break;
+        case GGML_OP_HC_MIX:
+            {
+                ggml_compute_forward_hc_mix(params, tensor);
+            } break;
         case GGML_OP_COUNT_EQUAL:
             {
                 ggml_compute_forward_count_equal(params, tensor);
@@ -2714,6 +2722,11 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_SUM:
         case GGML_OP_SUM_ROWS:
         case GGML_OP_MEAN:
+        case GGML_OP_HC_COMBINE:
+        case GGML_OP_HC_MIX:
+            {
+                n_tasks = n_threads;
+            } break;
         case GGML_OP_ARGMAX:
             {
                 n_tasks = 1;
