@@ -153,7 +153,7 @@
     <div class="top">
       <div class="brand">routhjim / <span>llama.cpp-lab</span></div>
       <nav>
-        <a href="#igpu">iGPU</a>
+        <a href="#igpu">Flash-Next</a>
         <a href="#two-xtx">Two XTX</a>
         <a href="#one-xtx">One XTX</a>
         <a href="#negative">What didn't work</a>
@@ -163,7 +163,7 @@
     </div>
     <h1>llama.cpp, measured on <em>Strix Halo</em> and two 7900 XTX</h1>
     <p class="lede">Changes to llama.cpp for AMD's Ryzen AI Max+ 395 and two Radeon RX 7900 XTX eGPUs on Vulkan/RADV, each merged through a pull request with a before and after number from this one machine. The negative results are here too.</p>
-    <p class="lede">Three setups: Qwen3.8-Flash-Next, a 180B sparse MoE, on the integrated GPU with an XTX helping; dense Qwen3.8-27B pipelined over both XTX for many concurrent agent streams; and the 27B on one XTX. None of this is in upstream llama.cpp.</p>
+    <p class="lede">Three setups: Qwen3.8-Flash-Next, a 180B sparse MoE, layer-split across the integrated GPU and both XTX (40 tok/s end to end on real agent turns); dense Qwen3.8-27B pipelined over both XTX for many concurrent agent streams; and the 27B on one XTX. None of this is in upstream llama.cpp.</p>
 
     <dl class="bench" aria-label="Test machine">
       <div><dt class="label">APU</dt><dd>Ryzen AI Max+ 395<br>Radeon 8060S &middot; gfx1151</dd></div>
@@ -176,8 +176,8 @@
 
   <section id="igpu" class="setup">
     <div class="setup-head">
-      <span class="label">Setup 1 &middot; integrated GPU</span>
-      <h2>Qwen3.8-Flash-Next on the iGPU</h2>
+      <span class="label">Setup 1 &middot; iGPU + two eGPUs</span>
+      <h2>Qwen3.8-Flash-Next on the iGPU and both XTX</h2>
       <p>180B sparse MoE (512 experts, top-10) with hyper-connections and a sparse-attention indexer, C2T8 quant, MTP depth 3. Production splits the layers three ways: iGPU, XTX#1 (with the MTP drafter) and XTX#2. 39.9 tok/s end to end on real TB2.1 turns, from 28.6 with only the drafter on an XTX.</p>
       <span class="stack">run-flashnext.sh &middot; SPLIT=25,11,13 &middot; -ub 256 &middot; np1 &middot; 256k context &middot; q8_0 KV</span>
     </div>
