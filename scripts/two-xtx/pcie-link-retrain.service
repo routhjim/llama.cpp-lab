@@ -1,0 +1,12 @@
+[Unit]
+Description=Retrain PCIe links that trained below capability (eGPU docks come up at Gen1)
+After=bolt.service systemd-udev-settle.service
+Wants=bolt.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pcie-link-retrain.sh --wait 180
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
