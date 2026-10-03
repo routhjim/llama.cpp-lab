@@ -10669,6 +10669,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // skinny f32 products from Flash-Next prefill (hyper-connection gates): m below one matmul tile, large k
+    for (auto [m, k] : std::vector<std::pair<int,int>>{{4, 10240}, {1, 2560}, {48, 2560}, {4, 2560}}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, m, 256, k, {1, 1}, {1, 1}));
+    }
+
     // int8 coopmat1 MMQ (upstream #27952) A/B shapes: dense mat-mat and 512-expert top-10 MUL_MAT_ID prefill
     for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K}) {
         for (int bs : {16, 17, 64, 256, 512, 2048}) {

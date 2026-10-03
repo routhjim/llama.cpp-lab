@@ -9414,7 +9414,11 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
     }
 
     uint32_t split_k = 1;
-    if (ctx->device->shader_core_count != 0 && m >= pipeline->wg_denoms[0] && n >= pipeline->wg_denoms[1]) {
+    // GGML_VK_SPLITK_SMALL_M=0 restores the old rule (no split when m or n is below one tile). Skinny products such as
+    // a [k=10240 x 4] gate over 256 tokens otherwise run as 2-8 workgroups each walking all of k.
+    static const bool small_m = [] { const char * e = getenv("GGML_VK_SPLITK_SMALL_M"); return !e || atoi(e) != 0; }();
+    const bool fits = m >= pipeline->wg_denoms[0] && n >= pipeline->wg_denoms[1];
+    if (ctx->device->shader_core_count != 0 && (fits || small_m)) {
         // If k is 'large' and the SMs will fill less than halfway, use split_k.
         uint32_t m_tiles = CEIL_DIV(m, pipeline->wg_denoms[0]);
         uint32_t n_tiles = CEIL_DIV(n, pipeline->wg_denoms[1]);
@@ -9426,7 +9430,8 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
                 split_k = 3;
             }
             // Cap the split at 8x. Unless k is huge this is a lot of overhead.
-            split_k = std::min(split_k, 8u);
+            // A sub-tile product has tiny partials (m*n floats per split), so it can afford more.
+            split_k = std::min(split_k, fits ? 8u : 16u);
 
             // ggml_vk_matmul will align the splits to be a multiple of 256.
             // If this rounded up size would cause the last split to be empty,
@@ -10863,8 +10868,10 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     // GGML_VK_MMID_GATHER: the gathered mat-vec reads q8_1 activations, so keep the quantization even when no
     // int8 MUL_MAT_ID matmul exists for this type (the matmul is bypassed below)
     {
-        static const bool gather_env = [] { const char * e = getenv("GGML_VK_MMID_GATHER"); return e != nullptr && atoi(e) != 0; }();
-        static const uint32_t gather_kdiv_q = [] { const char * e = getenv("GGML_VK_MMID_GATHER_KDIV"); return e ? (uint32_t) atoi(e) : 128u; }();
+        // on by default: at 512x10 routing and ub 256 (~5 rows per expert) it is 1.6-1.9x the matmul for gate/up (k 2560)
+        // on both the XTX and the iGPU, but loses on q5_1/q8_0 down (k 768), hence KDIV 256 keeps k < 1280 on the matmul
+        static const bool gather_env = [] { const char * e = getenv("GGML_VK_MMID_GATHER"); return e == nullptr || atoi(e) != 0; }();
+        static const uint32_t gather_kdiv_q = [] { const char * e = getenv("GGML_VK_MMID_GATHER_KDIV"); return e ? (uint32_t) atoi(e) : 256u; }();
         const bool gather_small_q = (nei0 * nei1 + n_as - 1) / n_as <= std::max<uint64_t>(1, ne10 / gather_kdiv_q);
         if (gather_env && gather_small_q && !quantize_y && hoist_row_ids && ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 &&
                 ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 &&
@@ -11123,13 +11130,14 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         stride_batch_y = src1->nb[0] / ggml_type_size(src1->type);
     }
 
-    // GGML_VK_MMID_GATHER=1: small per-expert batches as a gathered mat-vec over the hoisted row ids
+    // GGML_VK_MMID_GATHER: small per-expert batches as a gathered mat-vec over the hoisted row ids
     {
-        static const bool gather_on = [] { const char * e = getenv("GGML_VK_MMID_GATHER"); return e != nullptr && atoi(e) != 0; }();
+        // default on (GGML_VK_MMID_GATHER=0 disables); KDIV default 256 to match the quantization gate above
+        static const bool gather_on = [] { const char * e = getenv("GGML_VK_MMID_GATHER"); return e == nullptr || atoi(e) != 0; }();
         // it re-reads an expert's weights once per NUM_COLS of its tokens, so it only wins while experts get few tokens:
         // measured crossovers (gfx1151, 512x10) ~20 tokens/expert at k=2560 and ~5 at k=640 -> tokens/expert <= k/128
         const uint64_t tok_per_expert = (nei0 * nei1 + n_as - 1) / n_as;
-        static const uint32_t gather_kdiv = [] { const char * e = getenv("GGML_VK_MMID_GATHER_KDIV"); return e ? (uint32_t) atoi(e) : 128u; }();
+        static const uint32_t gather_kdiv = [] { const char * e = getenv("GGML_VK_MMID_GATHER_KDIV"); return e ? (uint32_t) atoi(e) : 256u; }();
         const bool gather_small = tok_per_expert <= std::max<uint64_t>(1, ne10 / gather_kdiv);
         vk_pipeline gp = (gather_on && gather_small && hoist_row_ids && quantize_y && !qx_needs_dequant && !y_needs_reformat &&
                 dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst)) ?
