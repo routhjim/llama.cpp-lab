@@ -2510,6 +2510,17 @@ class vk_perf_logger {
 struct ggml_backend_vk_context {
     std::string name;
 
+    // Rings for small host<->device transfers on a discrete GPU, so neither direction waits on a fence per transfer.
+    // upload: the bytes are copied into the ring when the call is made (the caller may reuse its memory), and the
+    // device copies them from there in queue order. readback: the device copies into the ring, and the bytes reach
+    // the caller's memory at the next synchronize (callers synchronize before they read).
+    vk_buffer upload_ring;
+    size_t upload_ring_head {};
+    vk_buffer readback_ring;
+    size_t readback_ring_head {};
+    struct pending_readback { void * dst; const void * src; size_t n; };
+    std::vector<pending_readback> pending_readbacks;
+
     vk_device device;
 
     size_t semaphore_idx, event_idx;
@@ -17174,6 +17185,115 @@ static ggml_backend_buffer_type_t ggml_backend_vk_get_default_buffer_type(ggml_b
     return &ctx->device->buffer_type;
 }
 
+// GGML_VK_UPLOAD_RING / GGML_VK_READBACK_RING: ring sizes in MiB (default 32 / 128), 0 = off
+static size_t ggml_vk_ring_mib(const char * env, size_t def) {
+    const char * e = getenv(env);
+    return e ? (size_t) atoi(e) : def;
+}
+
+static vk_buffer ggml_vk_create_ring(ggml_backend_vk_context * ctx, size_t size) {
+    vk_buffer buf;
+    try {
+        buf = ggml_vk_create_buffer(ctx->device, size,
+            { vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
+              vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent });
+    } catch (vk::SystemError & e) {
+        GGML_LOG_WARN("ggml_vulkan: ring allocation of %zu MiB failed (%s)\n", size >> 20, e.what());
+    }
+    return buf && buf->ptr ? buf : nullptr;
+}
+
+static bool ggml_vk_upload_ring_copy(ggml_backend_vk_context * ctx, vk_buffer & dst, size_t dst_offset, const void * data,
+                                     size_t stride_data, size_t stride_tensor, size_t size, size_t n_copies) {
+    static const size_t cap = ggml_vk_ring_mib("GGML_VK_UPLOAD_RING", 32) << 20;
+    const size_t total = size * n_copies;
+    if (cap == 0 || ctx->device->uma || total > cap / 4) {
+        return false;
+    }
+    if (!ctx->upload_ring) {
+        ctx->upload_ring = ggml_vk_create_ring(ctx, cap);
+        ctx->upload_ring_head = 0;
+        if (!ctx->upload_ring) {
+            return false;
+        }
+    }
+    size_t off = (ctx->upload_ring_head + 255) & ~(size_t) 255;
+    if (off + total > cap) {
+        ggml_vk_synchronize(ctx);   // frees the ring
+        off = 0;
+    }
+    ctx->upload_ring_head = off + total;
+
+    uint8_t * ring = (uint8_t *) ctx->upload_ring->ptr + off;
+    std::vector<vk::BufferCopy> slices;
+    if (size == stride_data) {
+        memcpy(ring, data, total);
+    } else {
+        for (size_t i = 0; i < n_copies; i++) {
+            memcpy(ring + i * size, (const uint8_t *) data + i * stride_data, size);
+        }
+    }
+    if (size == stride_tensor) {
+        slices.push_back({ off, dst_offset, total });
+    } else {
+        for (size_t i = 0; i < n_copies; i++) {
+            slices.push_back({ off + i * size, dst_offset + i * stride_tensor, size });
+        }
+    }
+    // the compute queue keeps the copy ordered with the graphs that read dst
+    vk_context cctx = ggml_vk_get_compute_ctx(ctx);
+    ggml_vk_sync_buffers(nullptr, cctx);
+    cctx->s->buffer->buf.copyBuffer(ctx->upload_ring->buffer, dst->buffer, slices);
+    ggml_vk_sync_buffers(nullptr, cctx);
+    return true;
+}
+
+static bool ggml_vk_readback_ring_copy(ggml_backend_vk_context * ctx, vk_buffer & src, size_t src_offset, void * data,
+                                       size_t stride_tensor, size_t stride_data, size_t size, size_t n_copies) {
+    static const size_t cap = ggml_vk_ring_mib("GGML_VK_READBACK_RING", 128) << 20;
+    const size_t total = size * n_copies;
+    if (cap == 0 || ctx->device->uma || total > cap / 2) {
+        return false;
+    }
+    if (!ctx->readback_ring) {
+        ctx->readback_ring = ggml_vk_create_ring(ctx, cap);
+        ctx->readback_ring_head = 0;
+        if (!ctx->readback_ring) {
+            return false;
+        }
+    }
+    size_t off = (ctx->readback_ring_head + 255) & ~(size_t) 255;
+    if (off + total > cap) {
+        ggml_vk_synchronize(ctx);   // delivers what is pending and frees the ring
+        off = 0;
+    }
+    ctx->readback_ring_head = off + total;
+
+    std::vector<vk::BufferCopy> slices;
+    if (size == stride_tensor) {
+        slices.push_back({ src_offset, off, total });
+    } else {
+        for (size_t i = 0; i < n_copies; i++) {
+            slices.push_back({ src_offset + i * stride_tensor, off + i * size, size });
+        }
+    }
+    vk_context cctx = ggml_vk_get_compute_ctx(ctx);
+    ggml_vk_sync_buffers(nullptr, cctx);
+    cctx->s->buffer->buf.copyBuffer(src->buffer, ctx->readback_ring->buffer, slices);
+    cctx->s->buffer->buf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {},
+        { { vk::AccessFlagBits::eTransferWrite, vk::AccessFlagBits::eHostRead } }, {}, {});
+
+    const uint8_t * ring = (const uint8_t *) ctx->readback_ring->ptr + off;
+    if (size == stride_data) {
+        ctx->pending_readbacks.push_back({ data, ring, total });
+    } else {
+        for (size_t i = 0; i < n_copies; i++) {
+            ctx->pending_readbacks.push_back({ (uint8_t *) data + i * stride_data, ring + i * size, size });
+        }
+    }
+    return true;
+}
+
 static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset,
                                                 size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     VK_LOG_DEBUG("ggml_backend_vk_set_tensor_2d_async(" << size << ", " << n_copies << ")");
@@ -17197,6 +17317,10 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
     vk_buffer buf = buf_ctx->dev_buffer;
 
     auto dst_offset = vk_tensor_offset(tensor) + tensor->view_offs + offset;
+
+    if (ggml_vk_upload_ring_copy(ctx, buf, dst_offset, data, stride_data, stride_tensor, size, n_copies)) {
+        return;
+    }
 
     bool ret = ggml_vk_buffer_write_2d_async(cpy_ctx, buf, dst_offset, data, stride_data, stride_tensor, size, n_copies);
 
@@ -17254,7 +17378,10 @@ static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const gg
     vk_buffer buf = buf_ctx->dev_buffer;
 
     auto src_offset = vk_tensor_offset(tensor) + tensor->view_offs + offset;
-    bool ret = ggml_vk_buffer_read_2d_async(compute_ctx, buf, src_offset, data, stride_tensor, stride_data, size, n_copies);
+    // memory pinned for this device: direct; otherwise (e.g. a host buffer pinned for another device) the readback
+    // ring; only then the synchronous staging path below
+    bool ret = ggml_vk_buffer_read_2d_async(compute_ctx, buf, src_offset, data, stride_tensor, stride_data, size, n_copies) ||
+               ggml_vk_readback_ring_copy(ctx, buf, src_offset, data, stride_tensor, stride_data, size, n_copies);
 
     if (!ret) {
         const size_t staging_size = size * n_copies;
@@ -17326,6 +17453,16 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
     }
 
     if (ggml_backend_buffer_is_host(src->buffer)) {
+        // Stage host sources through the upload ring when it is on: a zero-copy read happens whenever the queue gets
+        // to it, and the scheduler does not drain the queue before it copies (ggml_backend_sched, async inputs), so
+        // the CPU could overwrite the source first (e.g. the next graph's CPU split reusing its compute buffer).
+        if (ggml_vk_ring_mib("GGML_VK_UPLOAD_RING", 32) > 0 && !ctx->device->uma) {
+            if (!ggml_is_contiguous(src)) {
+                return false;
+            }
+            const size_t n = ggml_nbytes(src);
+            return ggml_vk_upload_ring_copy(ctx, dst_buf, vk_tensor_offset(dst) + dst->view_offs, src->data, n, n, n, 1);
+        }
         vk_buffer pinned_buf = nullptr;
         size_t pinned_offset = 0;
         ggml_vk_host_get(ctx->device, src->data, pinned_buf, pinned_offset);
@@ -17418,6 +17555,14 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
         }
         ctx->compute_ctx.reset();
     }
+
+    // everything recorded on this context has completed: deliver ring readbacks, reuse the rings from the start
+    for (const auto & r : ctx->pending_readbacks) {
+        memcpy(r.dst, r.src, r.n);
+    }
+    ctx->pending_readbacks.clear();
+    ctx->readback_ring_head = 0;
+    ctx->upload_ring_head = 0;
 }
 
 static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
