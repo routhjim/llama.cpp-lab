@@ -41,10 +41,21 @@ serves: Flash-Next on the iGPU (with an XTX helping), dense Qwen3.8-27B on one X
 | QSA pooled key cache allocated per layer device | [#38](https://github.com/routhjim/llama.cpp-lab/pull/38) | 16.60 tok/s | **21.80 tok/s (+31%)** | Flash-Next split 88/12 iGPU/XTX, 60k context |
 | MUL_MAT_ID GEMV threshold 8 → 32, with RDNA3 row counts sized to the column count | [#31](https://github.com/routhjim/llama.cpp-lab/pull/31) | 66.6 tok/s | **80.7 tok/s (+21%)** | Flash-Next batched decode, batch 16 |
 | Hot slot packing: live sequences move to the lowest KV streams | [#16](https://github.com/routhjim/llama.cpp-lab/pull/16) | 38% per-slot penalty on a {0,3} pair | **penalty gone** (swap costs 0.7-4.3 ms) | Flash-Next, np4 |
+| Split-k for sub-tile matmuls; MoE gather kernel default-on for gate/up only (KDIV 256) | [#62](https://github.com/routhjim/llama.cpp-lab/pull/62) | 361 tok/s prefill | **480 tok/s (+33%)**; real TB turns 242 -> 298 | Flash-Next C2T8, 3-way split, ub 256, 10k-token cold prefill |
+| Fused hyper-connection ops (HC_COMBINE, HC_MIX); conv-state rollback copy without cont | [#58](https://github.com/routhjim/llama.cpp-lab/pull/58) | 49.9 tok/s decode | **55.1 tok/s (+10%)** | Flash-Next C2T8, 3-way split, 34 real TB2.1 turns |
+| Three-way layer split: iGPU 24 layers, XTX#1 11 layers + MTP drafter, XTX#2 12 layers + output (`SPLIT=25,11,13 -ub 256`) | | 28.6 tok/s end to end (drafter-only XTX) | **36.1 tok/s (+26%)** | Flash-Next C2T8, PCIe Gen4 docks, 34 real TB2.1 turns |
 | Prompt-cache disk tier made NVMe-resident, not RAM-gated | [#37](https://github.com/routhjim/llama.cpp-lab/pull/37) | 13% cache hit, task killed at 6 h | **98% hit at 114k context, task passed in 86 min** | Terminal-Bench 2.1 task, one run each |
 
-Production placement: target on the iGPU, MTP drafter on an XTX (`SPLIT=drafter`). Placement numbers so far were
-measured with the dock links at PCIe Gen1 (see below); a Gen4 re-measure, including layers on the second XTX, is queued.
+Production placement since 2026-10-03: the three-way split above, on lab main with #58-#62. Same 34 real TB2.1 turns,
+end to end: 28.6 tok/s (drafter-only) -> 36.1 (three-way) -> **39.9** (with #58-#62); prefill 298 tok/s, decode 52-55 tok/s.
+Also in main, not a speed change by themselves: int8 coopmat1 MMQ ported from upstream #27952/#25483 ([#61](https://github.com/routhjim/llama.cpp-lab/pull/61); dense
+quant GEMM +15-30% in microbenchmarks, Flash-Next prefill flat because its MoE at ub 256 is not GEMM-bound), speculative
+coupling and reasoning budgets with backend sampling `-bs` ([#59](https://github.com/routhjim/llama.cpp-lab/pull/59)), and per-command-buffer GPU timestamps
+`GGML_VK_CB_TS` ([#60](https://github.com/routhjim/llama.cpp-lab/pull/60)).
+
+Where Flash-Next prefill time goes at ub 256 (perf logger, before #62): MoE expert matmuls 40%, two skinny f32
+hyper-connection/gate products 23% (fixed by #62), dense projections 17%, attention 6%, elementwise 7%, the gated
+delta-net recurrence only **1.3%**.
 
 ### One 7900 XTX: Qwen3.8-27B
 
@@ -63,9 +74,9 @@ measured with the dock links at PCIe Gen1 (see below); a Gen4 re-measure, includ
 | eGPU dock PCIe links retrained from Gen1 to Gen4 (not code: [note](docs/egpu-dock-pcie-gen1.md)) | | 0.8 GB/s host<->GPU; 185 tok/s | **3.3-3.8 GB/s; 259-269 tok/s** | same harness |
 | Cross-device copy race with several contexts on one layer-split model | [#54](https://github.com/routhjim/llama.cpp-lab/pull/54) | one instance at 0.23 acceptance, ~1 in 3 launches | **0 of 8** | 2 XTX, drafters on card 1 |
 
-Terminal-Bench 2.1 on this setup (2 instances x 4 slots, 131072 tokens reserved per slot): 32 tasks scored / 29
-passed in the first hour, vs 16-17 for one XTX or for two XTX before these changes; decode per stream 24.4 tok/s vs
-13.7. Run still in progress; see the write-up.
+Terminal-Bench 2.1 on this setup (2 instances x 4 slots, 131072 tokens reserved per slot), stopped at 77.5 minutes:
+**37 tasks scored / 34 passed**, vs 23 / 21 for two XTX before these changes and 17 / 16 for one XTX at the same
+elapsed time; decode per stream 23.7 tok/s vs 13.7, prefill 434 tok/s per request, ~171 tok/s delivered. See the write-up.
 
 The Flash-Next concurrency work (#15-#18) has its own write-up:
 [`docs/flash-next-concurrency.md`](docs/flash-next-concurrency.md).
@@ -121,6 +132,9 @@ Recorded so nobody has to measure them again.
 | Importance-matrix requant of the dense path, served with MTP | quality equal to UD, but +2 to +4% decode in production (C1: +18.5% without a drafter). We run C2T8 anyway; see [the write-up](docs/flash-next-dense-requant.md). A re-fit MTP head then adds +4 points of acceptance ([#52](https://github.com/routhjim/llama.cpp-lab/pull/52)). |
 | MTP draft depth 2 on Flash-Next at np1 | -5.3% vs depth 3 on UD, -0.9% on C2T8 |
 | Upstream MoE-aware `mul_mat_id` tile selection ([ggml-org #29182](https://github.com/ggml-org/llama.cpp/pull/29182)) | -6% prefill at 4k and 16k on Flash-Next (ABBA, same build otherwise); not picked |
+| A faster gated delta-net (GDN) prefill kernel, as in the ROCm forks | not attempted: GDN is 1.3% of Flash-Next prefill here (our Vulkan kernel already has the upstream #29476 tuning); halo-box measured +0.4-0.5% end to end from their Vulkan port, which also needs K=1 (no MTP rollback snapshots) |
+| MUL_MAT_ID tile chosen from rows per expert (~5 at 512x10, ub 256) instead of total tokens | 10-30% slower on both GPUs: the small tiles lose more than the padding costs |
+| MoE gather kernel on the down projection (k 640-768) | slower than the matmul for q5_1/q8_0; with it, prefill was 361 vs 438 tok/s without gather. #62 limits gather to k >= 1280 |
 | Device -> device copies with no CPU wait (dma-buf bridge + `sync_fd` semaphore) | 113 vs 191 tok/s without: a queue waiting on another device's fence stalls it. [Details](docs/qwen38-two-xtx-pipeline.md#what-did-not-work) |
 | Importing host buffers into every GPU (userptr) | amdgpu revalidates userptr pages on every submit: ~26% of decode-thread time in the CS ioctl |
 | Micro-batching one context's decode over a layer split | np4 61.7 -> 39.4 tok/s; run several instances instead ([#56](https://github.com/routhjim/llama.cpp-lab/pull/56)) |

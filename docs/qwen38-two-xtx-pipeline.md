@@ -69,18 +69,21 @@ it. An earlier bug (#54): a cross-device copy's staging buffer refilled by anoth
 ## Terminal-Bench 2.1
 
 Terminal-Bench 2.1, 83 tasks ordered shortest first, MEDIUM reasoning, 16 tasks live, 2 instances x np4 with 131072
-tokens reserved per slot, same harness and instructions for all three runs. **tb21x2b is still running** (numbers at
-68 minutes, 2026-10-03); this section is updated when it finishes.
+tokens reserved per slot, same harness and instructions for all three runs. tb21x2b was stopped at 77.5 minutes
+(2026-10-03).
 
 | | one XTX, np2 (09-20) | two XTX, before #55, PCIe Gen1 links | **two XTX, #55 + Gen4 links** |
 |---|---|---|---|
 | tasks scored / passed in the first 60 min | 16 / 15 | 17 / 16 | **32 / 29** |
-| decode per stream (server timings) | | 13.7 t/s | **24.4 t/s** |
-| prefill per request | | 274 t/s | **449 t/s** |
-| aggregate delivered | 67 -> 54 t/s | ~100 t/s | **~173 t/s** |
+| tasks scored / passed at 77.5 min | 17 / 16 | 23 / 21 | **37 / 34** |
+| decode per stream (server timings) | | 13.7 t/s | **23.7 t/s** |
+| prefill per request | | 274 t/s | **434 t/s** |
+| aggregate delivered | 67 -> 54 t/s | ~100 t/s | **~171 t/s** |
 | draft acceptance | | 0.861 | 0.869 |
 
-Same outcomes, faster: on the 26 tasks both two-XTX runs have scored, every pass/fail matches; against the one-XTX
+The three failures: cancel-async-tasks, query-optimize, mteb-retrieve.
+
+Same outcomes, faster (compared at 68 minutes): on the 26 tasks both two-XTX runs have scored, every pass/fail matches; against the one-XTX
 run (34 in common) one task differs each way (query-optimize passed only there, configure-git-webserver passes only
 here). Median wall time per task: 14.6 min vs 28.6 for the Gen1 run.
 
