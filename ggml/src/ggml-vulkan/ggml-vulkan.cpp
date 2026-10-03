@@ -9051,7 +9051,11 @@ static void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& sr
         ggml_vk_queue_command_pools_cleanup(src->device);
     } else {
         VK_LOG_DEBUG("ggml_vk_buffer_copy(MULTI_DEVICE, " << size << ")");
-        // Copy device to device
+        // Copy device to device through src->device->sync_staging. Each step below locks one device only, and the
+        // staging buffer is shared by every user of the device (host->device uploads also use it when host-visible
+        // vidmem is off): another thread could refill it between the two steps and this copy would deliver its data
+        // (seen with several contexts on one layer-split model). Hold both device locks for the whole copy.
+        std::scoped_lock guard(src->device->mutex, dst->device->mutex);
         ggml_vk_ensure_sync_staging_buffer(src->device, size);
 
         // Copy to src staging buffer
