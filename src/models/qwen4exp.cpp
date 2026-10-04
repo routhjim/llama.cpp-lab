@@ -342,19 +342,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
 
     // grouped RMSNorm: reduce over one stream, then scale all streams with the [hc_dim] gamma
     // the converter folded each gamma to (1 + w)
+    // The weight view first, so RMS_NORM -> MUL -> SCALE are adjacent graph nodes (the Vulkan backend fuses all three).
+    // ...and placed in the graph NOW: ggml orders nodes depth-first through src[0] then src[1], so a reshape built
+    // inline lands between RMS_NORM and MUL and blocks every fusion of this norm.
+    ggml_tensor * w_norm_2d = ggml_reshape_2d(ctx0, w_norm, n_embd, hc);
+    ggml_build_forward_expand(gf, w_norm_2d);
     ggml_tensor * xn = ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps);
     // Scale BEFORE the reshape. The backend fuses RMS_NORM+MUL only when the two are adjacent
     // nodes, and the reshape between them blocked it here -- this was the one norm in the model
     // that ran unfused (profile: "RMS_NORM dst(f32 2560,4)" with no RMS_NORM_MUL prefix, while
     // every 128/256-wide norm fused). w_norm is [hc_dim] = [n_embd*hc], so viewing it as
     // [n_embd, hc] broadcasts over the token axis and the math is unchanged.
-    xn = ggml_mul(ctx0, xn, ggml_reshape_2d(ctx0, w_norm, n_embd, hc));
-    xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
+    xn = ggml_mul(ctx0, xn, w_norm_2d);
     // Fold the three separate 1/hc scalings into ONE on xn. Every consumer of xn below wants the
     // same factor: `lo` and `inject` are linear in xn so the scale commutes through their matmuls,
     // and `gated`/`mixed` inherit it, which makes the old scale(mixed, 1/hc) the same mean. Costs
     // one dispatch instead of three (scale(lo)[320], scale(mixed)[2560], scale(inject)[4]).
     xn = ggml_scale(ctx0, xn, 1.0f / (float) hc);
+    xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
     cb(xn, "hc_norm", il);
 
     ggml_tensor * lo = build_lora_mm(w_down, xn);
