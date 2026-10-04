@@ -152,6 +152,17 @@ cmake --build build -j
 
 ### Running Flash-Next
 
+Measured on the same 34 real TB2.1 turns, current build:
+
+| | iGPU only | iGPU + two XTX |
+|---|---|---|
+| End to end | 28.5-29.6 tok/s | **39.9 tok/s** (1.37x) |
+| Decode | 36-40 tok/s | 52-55 tok/s |
+| Prefill, real turns | 213-222 tok/s | 298 tok/s |
+| Prefill, 10k-token prompt | 381 tok/s | 480 tok/s |
+
+On the iGPU alone the chip sits at 93-94 C and throttles; the low end of each range is a throttled run.
+
 Both layouts use the same model flags (C2T8 target, re-fit MTP head at depth 3, coupled sampling, q8_0 KV, 256k context):
 
 ```sh
@@ -160,17 +171,14 @@ FN="-m Qwen3.8-Flash-Next-C2T8-00001-of-00004.gguf -md mtp-Qwen3.8-Flash-Next-Q4
   -lm mmap -lzm auto -c 262144 -np 1 --jinja"
 ```
 
-**iGPU only** (no eGPU needed). 28.5-29.6 tok/s end to end on 34 real TB2.1 turns; decode 36-40 tok/s, prefill
-213-222 tok/s on those turns and 381 tok/s on a 10k-token prompt. The iGPU runs at 93-94 C and throttles; the low end
-of each range is a throttled run.
+**iGPU only** (no eGPU needed):
 
 ```sh
 build/bin/llama-server $FN -dev Vulkan2 -devd Vulkan2 -ub 2048
 ```
 
 **iGPU + two 7900 XTX** (production): 24 layers on the iGPU, 11 + the MTP drafter on XTX#1, 12 + the output head on
-XTX#2. **39.9 tok/s** end to end on the same turns (1.37x), decode 52-55 tok/s, prefill 298 tok/s on the turns and 480
-on a 10k-token prompt. `-ub 256` is what lets 23 layers fit on the cards; check the dock links run at Gen4 first
+XTX#2. `-ub 256` is what lets 23 layers fit on the cards; check the dock links run at Gen4 first
 ([note](docs/egpu-dock-pcie-gen1.md)).
 
 ```sh
