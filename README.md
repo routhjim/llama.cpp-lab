@@ -47,7 +47,8 @@ serves: Flash-Next split across the iGPU and both XTX, dense Qwen3.8-27B on one 
 | Prompt-cache disk tier made NVMe-resident, not RAM-gated | [#37](https://github.com/routhjim/llama.cpp-lab/pull/37) | 13% cache hit, task killed at 6 h | **98% hit at 114k context, task passed in 86 min** | Terminal-Bench 2.1 task, one run each |
 
 Production placement since 2026-10-03: the three-way split above, on lab main with #58-#62. Same 34 real TB2.1 turns,
-end to end: 28.6 tok/s (drafter-only) -> 36.1 (three-way) -> **39.9** (with #58-#62); prefill 298 tok/s, decode 52-55 tok/s.
+end to end: 28.5-29.6 tok/s on the iGPU alone -> 36.1 (three-way) -> **39.9** (with #58-#62); prefill 298 tok/s, decode
+52-55 tok/s. How to run either layout: [Running Flash-Next](#running-flash-next).
 Also in main, not a speed change by themselves: int8 coopmat1 MMQ ported from upstream #27952/#25483 ([#61](https://github.com/routhjim/llama.cpp-lab/pull/61); dense
 quant GEMM +15-30% in microbenchmarks, Flash-Next prefill flat because its MoE at ub 256 is not GEMM-bound), speculative
 coupling and reasoning budgets with backend sampling `-bs` ([#59](https://github.com/routhjim/llama.cpp-lab/pull/59)), and per-command-buffer GPU timestamps
@@ -149,13 +150,37 @@ cmake --build build -j
 
 `-DGGML_VULKAN_MMV_MAX_COLS=32` matters: the default of 16 puts a decode cliff at verify batches above 16.
 
-Flash-Next on the iGPU, the way it runs here:
+### Running Flash-Next
+
+Both layouts use the same model flags (C2T8 target, re-fit MTP head at depth 3, coupled sampling, q8_0 KV, 256k context):
 
 ```sh
-build/bin/llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
-  -md mtp-Qwen3.8-Flash-Next-Q4DRAFT.gguf --spec-type draft-mtp --spec-draft-n-max 3 --spec-coupled \
-  -ngl 99 -ngld 99 -fa on -ctk q8_0 -ctv q8_0 -lm mmap -lzm auto -c 262144 -np 1 --jinja
+FN="-m Qwen3.8-Flash-Next-C2T8-00001-of-00004.gguf -md mtp-Qwen3.8-Flash-Next-Q4DRAFT-refit0930.gguf \
+  --spec-type draft-mtp --spec-draft-n-max 3 --spec-coupled -ngl 99 -ngld 99 -fa on -ctk q8_0 -ctv q8_0 \
+  -lm mmap -lzm auto -c 262144 -np 1 --jinja"
 ```
+
+**iGPU only** (no eGPU needed). 28.5-29.6 tok/s end to end on 34 real TB2.1 turns; decode 36-40 tok/s, prefill
+213-222 tok/s on those turns and 381 tok/s on a 10k-token prompt. The iGPU runs at 93-94 C and throttles; the low end
+of each range is a throttled run.
+
+```sh
+build/bin/llama-server $FN -dev Vulkan2 -devd Vulkan2 -ub 2048
+```
+
+**iGPU + two 7900 XTX** (production): 24 layers on the iGPU, 11 + the MTP drafter on XTX#1, 12 + the output head on
+XTX#2. **39.9 tok/s** end to end on the same turns (1.37x), decode 52-55 tok/s, prefill 298 tok/s on the turns and 480
+on a 10k-token prompt. `-ub 256` is what lets 23 layers fit on the cards; check the dock links run at Gen4 first
+([note](docs/egpu-dock-pcie-gen1.md)).
+
+```sh
+GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM=1 build/bin/llama-server $FN \
+  -dev Vulkan2,Vulkan0,Vulkan1 --split-mode layer --tensor-split 25,11,13 -devd Vulkan0 -ub 256
+```
+
+Device numbers here: Vulkan0/1 = the XTX cards, Vulkan2 = the iGPU; check yours with `--list-devices`.
+`GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM=1` is needed when a card came up with a 256 MiB BAR (hot-plugged dock).
+The tensor split counts 49 slots (48 layers + the output), so the last card's layer count is its share minus one.
 
 Always pass `-lm mmap` for Flash-Next: `auto` disables mmap for every device when one device
 lacks it, and the load then needs the whole file in RAM.
