@@ -11765,9 +11765,14 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     float sp_max_bias = 0.0f, sp_softcap = 0.0f;
     memcpy(&sp_max_bias, (const float *) dst->op_params + 1, sizeof(float));
     memcpy(&sp_softcap,  (const float *) dst->op_params + 2, sizeof(float));
+    // Quantized K/V pays dequant per gathered row, so sparse only wins far above the kept size: upstream #29639 put the
+    // break-even at 12-16x on RDNA3 (2x cost 4% decode at 16k with q8_0). GGML_VK_FA_SPARSE_QRATIO overrides (default 16).
+    static const uint32_t sparse_qratio = [] { const char * e = getenv("GGML_VK_FA_SPARSE_QRATIO"); return e ? (uint32_t) std::max(1, atoi(e)) : 16u; }();
+    const bool kv_quant = ggml_is_quantized(k->type) || ggml_is_quantized(v->type);
+    const uint32_t sparse_ratio = kv_quant ? sparse_qratio : 2u;
     bool use_sparse = mask != nullptr && n_kv_max > 0 && ggml_vk_fa_sparse_enabled() &&
         sp_max_bias == 0.0f && sp_softcap == 0.0f && nem0 == KV && nem2 == 1 &&
-        neq1 <= 8 && KV >= std::max<uint32_t>(2048u, 2u * (uint32_t) n_kv_max);
+        neq1 <= 8 && KV >= std::max<uint32_t>(2048u, sparse_ratio * (uint32_t) n_kv_max);
     uint32_t KVL = KV;
     if (use_sparse) {
         vk_fa_tuning_params sp = get_fa_tuning_params_scalar(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc);
