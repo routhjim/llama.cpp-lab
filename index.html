@@ -178,7 +178,7 @@
     <div class="setup-head">
       <span class="label">Setup 1 &middot; iGPU + two eGPUs</span>
       <h2>Qwen3.8-Flash-Next on the iGPU and both XTX</h2>
-      <p>180B sparse MoE (512 experts, top-10) with hyper-connections and a sparse-attention indexer, C2T8 quant, MTP depth 3. Production splits the layers three ways: iGPU, XTX#1 (with the MTP drafter) and XTX#2. 39.9 tok/s end to end on real TB2.1 turns, from 28.6 with only the drafter on an XTX.</p>
+      <p>180B sparse MoE (512 experts, top-10) with hyper-connections and a sparse-attention indexer, C2T8 quant, MTP depth 3. Production splits the layers three ways: iGPU, XTX#1 (with the MTP drafter) and XTX#2. 39.9 tok/s end to end on real TB2.1 turns. It also runs on the iGPU alone at 28.5&ndash;29.6 tok/s (see below).</p>
       <span class="stack">run-flashnext.sh &middot; SPLIT=25,11,13 &middot; -ub 256 &middot; np1 &middot; 256k context &middot; q8_0 KV</span>
     </div>
     <div class="ledger">
@@ -188,7 +188,7 @@
           <div class="prs"><span>launcher</span></div>
           <div class="cond">Flash-Next C2T8 &middot; PCIe Gen4 docks &middot; <code>SPLIT=25,11,13 -ub 256</code> &middot; 34 real TB2.1 turns, end to end</div>
         </div>
-        <div class="nums"><span class="before">28.6 tok/s (drafter-only)</span><span class="after">36.1 <small>tok/s</small></span></div>
+        <div class="nums"><span class="before">28.6 tok/s (one XTX, drafter only)</span><span class="after">36.1 <small>tok/s</small></span></div>
         <div class="meter"><span class="factor">1.26&times;</span><div class="track"><div class="fill" style="width:17%"></div></div><div class="scale"><span>1&times;</span><span>2.5&times;</span></div></div>
       </div>
       <div class="row">
@@ -300,6 +300,7 @@
         <div class="meter"><span class="tag">penalty removed</span></div>
       </div>
     </div>
+    <p class="callout"><strong>iGPU only, no eGPU:</strong> 28.5&ndash;29.6 tok/s end to end on the same 34 TB2.1 turns, decode 36&ndash;40 tok/s, prefill 213&ndash;222 tok/s on the turns and 381 tok/s on a 10k-token prompt (three-way split: 39.9 / 52&ndash;55 / 298 / 480). The iGPU sits at 93&ndash;94&nbsp;&deg;C and throttles; the low ends are throttled runs. Same build, <code>-dev Vulkan2 -devd Vulkan2 -ub 2048</code>; commands under <a href="#build">Reproduce it</a>.</p>
     <p class="callout">Where Flash-Next prefill time goes at ub 256 (before #62): MoE expert matmuls 40%, two skinny f32 hyper-connection products 23% (fixed by #62), dense projections 17%, attention 6%, elementwise 7%, the gated delta-net recurrence only 1.3%. Also merged: int8 coopmat1 MMQ ported from upstream (<a href="https://github.com/routhjim/llama.cpp-lab/pull/61">#61</a>; flat on Flash-Next prefill), coupling and reasoning budgets with backend sampling (<a href="https://github.com/routhjim/llama.cpp-lab/pull/59">#59</a>), per-command-buffer GPU timestamps (<a href="https://github.com/routhjim/llama.cpp-lab/pull/60">#60</a>).</p>
     <span class="sub">Findings</span>
     <div class="findings">
@@ -474,11 +475,20 @@
 <pre>cmake -B build -DGGML_VULKAN=ON -DGGML_VULKAN_MMV_MAX_COLS=32 -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j</pre>
     <p class="note"><code>MMV_MAX_COLS=32</code> matters for Flash-Next: the default of 16 puts a decode cliff at verify batches above 16.</p>
-<pre># Flash-Next on the iGPU
-build/bin/llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
-  -md mtp-Qwen3.8-Flash-Next-Q4DRAFT.gguf --spec-type draft-mtp \
+<pre># Flash-Next: model flags shared by both layouts
+FN="-m Qwen3.8-Flash-Next-C2T8-00001-of-00004.gguf \
+  -md mtp-Qwen3.8-Flash-Next-Q4DRAFT-refit0930.gguf --spec-type draft-mtp \
   --spec-draft-n-max 3 --spec-coupled -ngl 99 -ngld 99 -fa on \
-  -ctk q8_0 -ctv q8_0 -lm mmap -lzm auto -c 262144 -np 1 --jinja</pre>
+  -ctk q8_0 -ctv q8_0 -lm mmap -lzm auto -c 262144 -np 1 --jinja"
+
+# iGPU only
+build/bin/llama-server $FN -dev Vulkan2 -devd Vulkan2 -ub 2048
+
+# iGPU + two 7900 XTX (production): 24 / 11 + drafter / 12 + output layers
+GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM=1 build/bin/llama-server $FN \
+  -dev Vulkan2,Vulkan0,Vulkan1 --split-mode layer --tensor-split 25,11,13 \
+  -devd Vulkan0 -ub 256</pre>
+    <p class="note">Device numbers are this machine's (Vulkan0/1 = the XTX cards, Vulkan2 = the iGPU); check yours with <code>--list-devices</code>. The tensor split counts 49 slots (48 layers + output). The vidmem variable is needed when a card came up with a 256&nbsp;MiB BAR (hot-plugged dock).</p>
     <p class="note">Always pass <code>-lm mmap</code> for Flash-Next. With <code>auto</code>, one device that lacks mmap turns it off for all of them, and the load then needs the whole file in RAM.</p>
 <pre># Qwen3.8-27B pipelined over two 7900 XTX (one endpoint on :8090)
 MODEL=Qwen3.8-27B-Q4_K_S.gguf DRAFT=mtp-Qwen3.8-27B-Q4_K_M.gguf TMPL=qwen38.jinja \
