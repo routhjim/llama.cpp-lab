@@ -11759,9 +11759,10 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     float sp_max_bias = 0.0f, sp_softcap = 0.0f;
     memcpy(&sp_max_bias, (const float *) dst->op_params + 1, sizeof(float));
     memcpy(&sp_softcap,  (const float *) dst->op_params + 2, sizeof(float));
-    // Quantized K/V pays dequant per gathered row, so sparse only wins far above the kept size: upstream #29639 put the
-    // break-even at 12-16x on RDNA3 (2x cost 4% decode at 16k with q8_0). GGML_VK_FA_SPARSE_QRATIO overrides (default 16).
-    static const uint32_t sparse_qratio = [] { const char * e = getenv("GGML_VK_FA_SPARSE_QRATIO"); return e ? (uint32_t) std::max(1, atoi(e)) : 16u; }();
+    // Upstream #29639 put the quantized-K/V break-even at 12-16x the kept size on RDNA3, but it does not reproduce on
+    // our sparse path: Flash-Next 3-way split, 34 real TB turns, q8_0 KV: 2x decode 54.9 t/s vs 16x 52.4 (2026-10-04).
+    // So 2x stays the default for every type; GGML_VK_FA_SPARSE_QRATIO still overrides the quantized threshold.
+    static const uint32_t sparse_qratio = [] { const char * e = getenv("GGML_VK_FA_SPARSE_QRATIO"); return e ? (uint32_t) std::max(1, atoi(e)) : 2u; }();
     const bool kv_quant = ggml_is_quantized(k->type) || ggml_is_quantized(v->type);
     const uint32_t sparse_ratio = kv_quant ? sparse_qratio : 2u;
     bool use_sparse = mask != nullptr && n_kv_max > 0 && ggml_vk_fa_sparse_enabled() &&
