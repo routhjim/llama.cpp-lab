@@ -442,7 +442,14 @@ void llama_memory_hybrid_idx::set_input_qsa(
     int32_t * dst_cell_blk  = (int32_t *) cell_blk->data;
     int32_t * dst_blk_cells = pooled ? nullptr : (int32_t *) blk_cells->data;
     int32_t * dst_blk_pos   = pooled ? nullptr : (int32_t *) blk_pos->data;
-    float   * dst_bias      = (float   *) bias->data;
+    // the fused lightning-indexer path takes the per-block bias as its f16 mask (blk_bias only); 1e9 would overflow
+    // f16 to +inf and meet the attention mask's -inf as a nan, so the always-visible tail gets 1e4 there (the score
+    // is a sum of 4 rectified dot products of rms-normed 128-d vectors, far below it)
+    const bool    bias_f16      = bias->type == GGML_TYPE_F16;
+    GGML_ASSERT(!bias_f16 || blk_bias);
+    float       * dst_bias      = bias_f16 ? nullptr : (float *) bias->data;
+    ggml_fp16_t * dst_bias16    = bias_f16 ? (ggml_fp16_t *) bias->data : nullptr;
+    const float   tail_v        = bias_f16 ? 1e4f : 1e9f;
 
     int32_t * dst_dirty_cells = pooled ? (int32_t *) dirty_cells->data : nullptr;
     int32_t * dst_dirty_pos   = pooled ? (int32_t *) dirty_pos->data   : nullptr;
@@ -751,23 +758,26 @@ void llama_memory_hybrid_idx::set_input_qsa(
             if (blk_bias) {
                 // a block sits wholly inside or outside the tail, so one value covers it
                 // the caller adds the attention mask, which drops empty, foreign and future cells
-                float * cur_blk_bias = dst_bias + i*n_blocks;
+                auto set_blk = [&](int64_t b, float v) {
+                    if (bias_f16) { dst_bias16[i*n_blocks + b] = ggml_fp32_to_fp16(v); }
+                    else          { dst_bias  [i*n_blocks + b] = v; }
+                };
 
                 for (int64_t b = 0; b < n_blocks; ++b) {
                     if (b >= n_bid || !cells.seq_has((uint32_t) bid_cell[b], seq_id)) {
-                        cur_blk_bias[b] = -INFINITY;
+                        set_blk(b, -INFINITY);
                         continue;
                     }
 
                     // finite, so it can never meet a -inf and produce a nan
-                    cur_blk_bias[b] = bid_idx[b] >= tail_start ? 1e9f : 0.0f;
+                    set_blk(b, bid_idx[b] >= tail_start ? tail_v : 0.0f);
                 }
 
                 // the spare block holds the unpooled cells, which are the incomplete tail, so
                 // it gets the tail value. it must stay finite: a sequence with fewer than
                 // `ratio` cells owns no full block, and a row of -inf only gives a nan.
                 if (have_dead) {
-                    cur_blk_bias[dead_bid] = 1e9f;
+                    set_blk(dead_bid, tail_v);
                 }
 
                 continue;

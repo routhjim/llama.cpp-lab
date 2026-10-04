@@ -711,6 +711,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         const char * env = getenv("LLAMA_QSA_POOLED_MAX_TOKENS");
         return env != nullptr ? (uint32_t) atoi(env) : 32u;
     }();
+    // FN_QSA_LI (default on): score with the fused lightning indexer (one kernel: every head's rectified dot product,
+    // summed, plus the block bias as its f16 mask) instead of mul_mat + relu + per-head adds + bias add over a
+    // [n_blocks, n_idx_h, n_tps] intermediate. Upstream #29825 for our multi-stream / pooled-store graph.
+    static const bool qsa_li = [] { const char * e = getenv("FN_QSA_LI"); return e == nullptr || atoi(e) != 0; }();
+    const bool use_li = qsa_li && blk_bias;
+
     const bool use_pooled = mctx_hyb->get_pooled_k(il) != nullptr &&
         (pooled_max_tps == 0 || (uint32_t) n_tps <= pooled_max_tps);
 
@@ -723,7 +729,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias);
         qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
         qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
-        qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
+        qsa->bias      = ggml_new_tensor_3d(ctx0, use_li ? GGML_TYPE_F16 : GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
         ggml_set_input(qsa->cell_blk);
         ggml_set_input(qsa->bias);
         if (use_pooled) {
@@ -822,9 +828,22 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             ext_factor, attn_factor, beta_fast, beta_slow);
     cb(q, "indexer_q", il);
 
+    ggml_tensor * score = nullptr;
+    if (use_li) {
+        // q [D, H, T, S], keys [D, 1, N, S], unit head weights [H, T, 1, S], f16 block bias as the mask [N, T, 1, S]
+        ggml_tensor * q4 = ggml_reshape_4d(ctx0, q, idx_dim, n_idx_h, n_tps, n_stream);
+        ggml_tensor * k4 = ggml_view_4d(ctx0, pooled, idx_dim, 1, n_blocks, n_stream,
+                pooled->nb[1], pooled->nb[1], pooled->nb[2], 0);
+        ggml_tensor * w  = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_idx_h, n_tps, 1, n_stream), 1.0f);
+        ggml_tensor * m4 = ggml_reshape_4d(ctx0, inp->bias, n_blocks, n_tps, 1, n_stream);
+        score = ggml_lightning_indexer(ctx0, q4, k4, w, m4);              // [N, T, 1, S], bias included
+        score = ggml_reshape_3d(ctx0, score, n_blocks, n_tps, n_stream);
+        res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
+        cb(score, "indexer_score", il);
+    } else {
     // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
     // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
-    ggml_tensor * score = ggml_mul_mat(ctx0, pooled,
+    score = ggml_mul_mat(ctx0, pooled,
             ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h*n_tps, n_stream));
     score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
     score = ggml_relu(ctx0, score);
@@ -843,6 +862,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     // one value per block, so it is cheaper to bias here than after the cells are expanded
     if (blk_bias) {
         score = ggml_add(ctx0, score, inp->bias);
+    }
     }
 
     // every token of a block gets the block score; the budget is whole blocks, so top-k cuts on a block boundary
