@@ -112,6 +112,8 @@
   .neg th { text-align: left; padding: 0 16px 10px 0; }
   .neg td { padding: 14px 16px 14px 0; border-top: 1px solid var(--rule); vertical-align: top; }
   .neg td:first-child { font-weight: 600; width: 38%; }
+  .neg.layouts { margin-bottom: 8px; }
+  .neg.layouts td:first-child { width: 34%; }
   .delta { font: 600 13.5px/1.4 var(--mono); color: var(--loss); white-space: nowrap; }
   .tbl { overflow-x: auto; }
 
@@ -300,7 +302,17 @@
         <div class="meter"><span class="tag">penalty removed</span></div>
       </div>
     </div>
-    <p class="callout"><strong>iGPU only, no eGPU:</strong> 28.5&ndash;29.6 tok/s end to end on the same 34 TB2.1 turns, decode 36&ndash;40 tok/s, prefill 213&ndash;222 tok/s on the turns and 381 tok/s on a 10k-token prompt (three-way split: 39.9 / 52&ndash;55 / 298 / 480). The iGPU sits at 93&ndash;94&nbsp;&deg;C and throttles; the low ends are throttled runs. Same build, <code>-dev Vulkan2 -devd Vulkan2 -ub 2048</code>; commands under <a href="#build">Reproduce it</a>.</p>
+    <span class="sub">iGPU only vs iGPU + two XTX</span>
+    <table class="neg layouts">
+      <thead><tr><th class="label">Same 34 TB2.1 turns</th><th class="label">iGPU only</th><th class="label">iGPU + two XTX</th></tr></thead>
+      <tbody>
+        <tr><td>End to end</td><td>28.5&ndash;29.6 tok/s</td><td><strong>39.9 tok/s</strong> (1.37&times;)</td></tr>
+        <tr><td>Decode</td><td>36&ndash;40 tok/s</td><td>52&ndash;55 tok/s</td></tr>
+        <tr><td>Prefill, real turns</td><td>213&ndash;222 tok/s</td><td>298 tok/s</td></tr>
+        <tr><td>Prefill, 10k-token prompt</td><td>381 tok/s</td><td>480 tok/s</td></tr>
+      </tbody>
+    </table>
+    <p class="note">On the iGPU alone the chip sits at 93&ndash;94&nbsp;&deg;C and throttles; the low end of each range is a throttled run. Both layouts run the same build; commands under <a href="#build">Reproduce it</a>.</p>
     <p class="callout">Where Flash-Next prefill time goes at ub 256 (before #62): MoE expert matmuls 40%, two skinny f32 hyper-connection products 23% (fixed by #62), dense projections 17%, attention 6%, elementwise 7%, the gated delta-net recurrence only 1.3%. Also merged: int8 coopmat1 MMQ ported from upstream (<a href="https://github.com/routhjim/llama.cpp-lab/pull/61">#61</a>; flat on Flash-Next prefill), coupling and reasoning budgets with backend sampling (<a href="https://github.com/routhjim/llama.cpp-lab/pull/59">#59</a>), per-command-buffer GPU timestamps (<a href="https://github.com/routhjim/llama.cpp-lab/pull/60">#60</a>).</p>
     <span class="sub">Findings</span>
     <div class="findings">
