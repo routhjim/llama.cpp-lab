@@ -180,20 +180,8 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     hc_head_down = create_tensor(tn(LLM_TENSOR_HC_HEAD_DOWN, "weight"), { hc_dim, hc_lr }, 0);
     hc_head_up   = create_tensor(tn(LLM_TENSOR_HC_HEAD_UP,   "weight"), { hc_lr, hc_dim }, 0);
 
-    // Reduced-vocabulary draft head (MTP-only files): output.weight then holds only the rows listed in d2t (I64 token
-    // ids) and graph_mtp scatters them into a -inf full-vocab row. The drafter's head is ~0.5 ms of each ~1.3 ms draft
-    // pass at 248k rows; the 32k most frequent cover essentially all of what the target produces.
-    int64_t n_out_rows = n_vocab;
-    if (mtp_only) {
-        if (const ggml_tensor * m = ml.get_tensor_meta("d2t")) {
-            n_out_rows = m->ne[0];
-            d2t = create_tensor(tn(LLM_TENSOR_D2T), { n_out_rows }, 0);
-            LLAMA_LOG_INFO("%s: MTP draft head over a %lld-token vocabulary subset (d2t)\n", __func__, (long long) n_out_rows);
-        }
-    }
-    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_out_rows }, TENSOR_NOT_REQUIRED);
+    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
     if (output == NULL) {
-        GGML_ASSERT(n_out_rows == n_vocab && "a d2t subset needs its own output.weight");
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
 
@@ -1704,20 +1692,6 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     res->t_embd = cur;
 
     cur = build_lora_mm(model.output, cur);
-
-    if (model.d2t) {
-        // subset head: scatter the n_sub logits into a -inf row of the full vocabulary (same trick as eagle3: view the
-        // logits as [1, n_vocab, n_outputs] so each "row" is one float and SET_ROWS does the scatter)
-        const int64_t n_sub     = cur->ne[0];
-        const int64_t n_outputs = cur->ne[1];
-        const int64_t n_vocab   = (int64_t) model.vocab.n_tokens();
-        GGML_ASSERT(model.d2t->type == GGML_TYPE_I64 && model.d2t->ne[0] == n_sub);
-        ggml_tensor * logits = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, n_outputs), -INFINITY);
-        cur = ggml_set_rows(ctx0, logits,
-                ggml_reshape_3d(ctx0, cur,       1,     n_sub, n_outputs),
-                ggml_reshape_3d(ctx0, model.d2t, n_sub, 1,     1));
-        cur = ggml_reshape_2d(ctx0, cur, n_vocab, n_outputs);
-    }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
