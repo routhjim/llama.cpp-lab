@@ -477,6 +477,9 @@ struct leaf_alloc {
 struct node_alloc {
     struct tensor_alloc dst;
     struct tensor_alloc src[GGML_MAX_SRC];
+    // node this plan was made for; a rebuilt graph with other ops or outputs here must re-plan
+    enum ggml_op op;
+    bool         is_output;
 };
 
 struct ggml_gallocr {
@@ -857,6 +860,8 @@ static bool ggml_gallocr_reserve_n_impl(
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
         struct node_alloc * node_alloc = &galloc->node_allocs[i];
+        node_alloc->op        = node->op;
+        node_alloc->is_output = (node->flags & GGML_TENSOR_FLAG_OUTPUT) != 0;
         if (node->view_src || node->data) {
             node_alloc->dst.buffer_id = -1;
             node_alloc->dst.addr = GGML_BUFFER_ADDRESS_INVALID;
@@ -1024,6 +1029,13 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
         struct node_alloc * node_alloc = &galloc->node_allocs[i];
+
+        if (node_alloc->op != node->op || node_alloc->is_output != ((node->flags & GGML_TENSOR_FLAG_OUTPUT) != 0)) {
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: node %s differs from the planned node (op or output flag)\n", __func__, node->name);
+#endif
+            return true;
+        }
 
         if (!ggml_gallocr_node_needs_realloc(galloc, node, &node_alloc->dst)) {
 #ifndef NDEBUG
