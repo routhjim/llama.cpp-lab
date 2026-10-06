@@ -626,10 +626,17 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
             // dist and common_spec_coupled_pick do, over the backend's post top-k/top-p probabilities (k entries,
             // already read back -- not the full vocabulary).
             if (gsmpl->coupled_pos_cur >= 0 && llama_get_sampled_probs_ith(ctx, idx) != nullptr && cur_p.size > 1) {
+                const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
                 size_t sel = 0;
                 bool have = false;
                 double best_p = 0.0, best_e = 1.0;
                 for (size_t i = 0; i < cur_p.size; ++i) {
+                    // bad readback: keep the backend token
+                    if (cur_p.data[i].id < 0 || cur_p.data[i].id >= n_vocab) {
+                        LOG_WRN("%s: backend candidate id %d out of range, keeping the backend token\n", __func__, cur_p.data[i].id);
+                        have = false;
+                        break;
+                    }
                     const double pi = (double) cur_p.data[i].p;
                     if (!(pi > 0.0)) {
                         continue; // masked by the backend top-p / min-p
