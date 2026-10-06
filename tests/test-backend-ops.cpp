@@ -3711,6 +3711,29 @@ struct test_rms_norm_back : public test_case {
 };
 
 // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ADD
+// Flash-Next hyper-connection norm: rms_norm(x) * w (w broadcast over tokens) * (1/hc), fused as RMS_NORM_MUL_SCALE
+struct test_rms_norm_mul_scale : public test_case {
+    const std::array<int64_t, 4> ne;   // {n_embd, hc, n_tokens, 1}
+    const float scale;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "RMS_NORM_MUL_SCALE"; }
+    bool run_whole_graph() override { return true; }
+    std::string vars() override { return VARS_TO_STR2(ne, scale); }
+
+    test_rms_norm_mul_scale(std::array<int64_t, 4> ne = {2560, 4, 4, 1}, float scale = 0.25f) : ne(ne), scale(scale) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
+        ggml_tensor * w2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);   // 2-D weight: no view node in between
+        ggml_set_name(x, "x"); ggml_set_name(w2, "w");
+        x = ggml_add(ctx, x, x);                                      // a compute node first, like the model
+        ggml_tensor * out = ggml_scale(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w2), scale);
+        out = ggml_reshape_2d(ctx, out, ne[0] * ne[1], ne[2] * ne[3]);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_rms_norm_mul_add : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
@@ -10643,7 +10666,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // lightning_indexer
     for (int kv : { 256 }) {
         for (int bs : { 1, 512 }) {
-            for (int nh : { 32, 64 }) {
+            for (int nh : { 4, 32, 64 }) {
                 for (auto [ns, nm] : { std::pair{1, 1}, std::pair{4, 4}, std::pair{4, 1} }) {
                     for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL}) {
                         test_cases.emplace_back(new test_lightning_indexer(128, nh, kv, bs, ns, nm, type_K));
@@ -10659,6 +10682,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    for (int64_t nt : {1, 4, 7, 256}) {
+        test_cases.emplace_back(new test_rms_norm_mul_scale({2560, 4, nt, 1}, 0.25f));
+        test_cases.emplace_back(new test_rms_norm_mul_scale({64, 3, nt, 1}, 0.5f));
+    }
+
+    // tall mat-vec pipelines (RDNA3, 1-4 columns, m >= 16 x CUs): exercise them with real tall shapes
+    for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, GGML_TYPE_Q6_K, GGML_TYPE_Q4_0}) {
+        for (int n = 1; n <= 4; ++n) {
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 2560, n, 1024, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 6144, n, 512, {1, 1}, {1, 1}));
+        }
+    }
+
     return test_cases;
 }
 #ifdef _MSC_VER
@@ -10668,6 +10704,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // FN_DECODE_PERF=1: only Flash-Next verify-shaped mat-vecs (4 columns = MTP depth 3 + 1)
+    if (getenv("FN_DECODE_PERF")) {
+        const int nc = getenv("FN_DECODE_COLS") ? atoi(getenv("FN_DECODE_COLS")) : 4;
+        struct shp { ggml_type t; int m, k; };
+        for (shp x : std::vector<shp>{ {GGML_TYPE_Q8_0, 2560, 6144}, {GGML_TYPE_Q8_0, 10240, 320}, {GGML_TYPE_Q8_0, 320, 10240},
+                                        {GGML_TYPE_Q8_0, 640, 2560}, {GGML_TYPE_Q4_K, 10240, 2560}, {GGML_TYPE_Q4_K, 6144, 2560},
+                                        {GGML_TYPE_Q4_K, 12288, 2560}, {GGML_TYPE_F32, 512, 2560}, {GGML_TYPE_F16, 512, 2560},
+                                        {GGML_TYPE_F32, 4, 10240} }) {
+            test_cases.emplace_back(new test_mul_mat(x.t, GGML_TYPE_F32, x.m, nc, x.k, {1, 1}, {1, 1}));
+        }
+        return test_cases;
+    }
+
 
     // skinny f32 products from Flash-Next prefill (hyper-connection gates): m below one matmul tile, large k
     for (auto [m, k] : std::vector<std::pair<int,int>>{{4, 10240}, {1, 2560}, {48, 2560}, {4, 2560}}) {

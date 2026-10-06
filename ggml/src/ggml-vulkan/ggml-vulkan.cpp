@@ -999,6 +999,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_dequant_mul_mat_vec_id_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
 
     vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
+    // RDNA3, 1-4 columns: the same shader with more rows per workgroup, for TALL matrices only (see tall_min_m)
+    vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32_tall[GGML_TYPE_COUNT][4];
+    uint32_t mmv_tall_min_m = 0;
     vk_pipeline pipeline_dequant_mul_mat_vec_id_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
     // MoE for small per-expert batches over count_experts' hoisted row ids (GGML_VK_MMID_GATHER)
     vk_pipeline pipeline_mmid_gather_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
@@ -1990,9 +1993,7 @@ struct vk_op_lightning_indexer_push_constants {
     uint32_t n_kv;
     uint32_t n_heads;
     uint32_t n_tokens;
-    uint32_t n_streams;
     uint32_t n_masks;
-    uint32_t dispatch_x;
     uint32_t q_nb1;
     uint32_t q_nb2;
     uint32_t q_nb3;
@@ -2365,6 +2366,7 @@ static void ggml_vk_print_device_lost_info(const vk_device& device) {
 
 class vk_perf_logger {
   public:
+    std::string device_name;   // printed in the header so multi-device splits can be told apart
     void print_timings(bool force = false) {
         if (timings.empty()) {
             return;
@@ -2375,7 +2377,7 @@ class vk_perf_logger {
         }
         print_count = 0;
         uint64_t total_all_op_times = 0;
-        std::cerr << "----------------\nVulkan Timings:" << std::endl;
+        std::cerr << "----------------\nVulkan Timings:" << (device_name.empty() ? "" : " [" + device_name + "]") << std::endl;
         for (const auto & t : timings) {
             uint64_t total_op_times = 0;
             for (const auto & time : t.second) {
@@ -2610,6 +2612,7 @@ struct ggml_backend_vk_context {
     // number of additional consecutive nodes that are being fused with the
     // node currently being processed
     int num_additional_fused_ops {};
+    float rms_fused_out_scale {};   // != 0: the current RMS_NORM node is fused as RMS_NORM_MUL_SCALE with this factor
     // Bitmask of which fused ops need to write an intermediate value to memory.
     // Bit 'i' means nodes[start_of_fusion + i] writes to memory.
     // If there's no fusion, bit 0 is still set.
@@ -5673,6 +5676,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
         return v;
     }();
+    // tall mat-vec threshold: enough rows that 4-row workgroups still give every CU 4 of them
+    device->mmv_tall_min_m = [&] { const char * e = getenv("GGML_VK_MMV_TALL_MIN_M");
+        return e ? (uint32_t) atoi(e) : (is_rdna3 ? 16u * std::max(1u, device->shader_core_count) : 0u); }();
     auto const &rm_int_n = [&](uint32_t rows, uint32_t i) -> uint32_t {
         if (i < rm_int_cols_override.size() && rm_int_cols_override[i] > 0) {
             return rm_int_cols_override[i];
@@ -5810,6 +5816,18 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_IQ1_S][i], "mul_mat_vec_iq1_s_q8_1_f32", arr_dmmv_iq1_s_q8_1_f32_len[reduc], arr_dmmv_iq1_s_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_iq_int(i), 1, 1}, {wg_size_subgroup_int, 1*rm_iq_int(i), i+1}, 1, true, use_subgroups, subgroup_size_int);
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_IQ1_M][i], "mul_mat_vec_iq1_m_q8_1_f32", arr_dmmv_iq1_m_q8_1_f32_len[reduc], arr_dmmv_iq1_m_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_iq_int(i), 1, 1}, {wg_size_subgroup_int, 1*rm_iq_int(i), i+1}, 1, true, use_subgroups, subgroup_size_int);
+
+                // Tall variant (RDNA3, 1-4 cols). One row per workgroup leaves a tall q8_0/q4_K mat-vec at 4 columns
+                // well short of bandwidth (XTX q8_0 2560x6144: 15.7 -> 12.1 us at 4 rows), but 4 rows starves a short
+                // one (320x10240: 5.4 -> 13.9 us), so it is a second pipeline picked by M at dispatch.
+                if (is_rdna3 && w == DMMV_WG_SIZE_SUBGROUP && i < 4) {
+                    static const uint32_t tr = [] { const char * e = getenv("GGML_VK_MMV_TALL_ROWS"); return e ? (uint32_t) std::max(1, atoi(e)) : 4u; }();
+#define MMV_TALL(T, tn) ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32_tall[T][i], "mul_mat_vec_" #tn "_q8_1_f32_tall", arr_dmmv_##tn##_q8_1_f32_len[reduc], arr_dmmv_##tn##_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {tr, 1, 1}, {wg_size_subgroup_int, tr, i+1}, 1, true, use_subgroups, subgroup_size_int);
+                    MMV_TALL(GGML_TYPE_Q4_0, q4_0) MMV_TALL(GGML_TYPE_Q4_1, q4_1) MMV_TALL(GGML_TYPE_Q5_0, q5_0)
+                    MMV_TALL(GGML_TYPE_Q5_1, q5_1) MMV_TALL(GGML_TYPE_Q8_0, q8_0)
+                    MMV_TALL(GGML_TYPE_Q4_K, q4_k) MMV_TALL(GGML_TYPE_Q5_K, q5_k) MMV_TALL(GGML_TYPE_Q6_K, q6_k)
+#undef MMV_TALL
+                }
 
             }
 #endif // GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT
@@ -6379,15 +6397,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_gated_linear_attn_f32, "gated_linear_attn_f32", gated_linear_attn_f32_len, gated_linear_attn_f32_data, "main", 6, sizeof(vk_op_gated_linear_attn_push_constants), {1, 1, 1}, {}, 1);
 
-    {
-        const bool li_subgroup = device->subgroup_arithmetic && device->subgroup_require_full_support;
-        const size_t li_len   = li_subgroup ? lightning_indexer_subgroup_f32_len  : lightning_indexer_f32_len;
-        const void * li_data  = li_subgroup ? (const void *)lightning_indexer_subgroup_f32_data : (const void *)lightning_indexer_f32_data;
-
-        for (ggml_type k_type : lightning_indexer_k_types) {
-            const std::string name = "lightning_indexer_" + std::string(ggml_type_name(k_type)) + "_k_f32";
-            ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_f32[k_type], name.c_str(), li_len, li_data, "main", 5, sizeof(vk_op_lightning_indexer_push_constants), {1, 1, 1}, {(uint32_t)k_type, fa_block_bytes(k_type), device->subgroup_size}, 1, true, li_subgroup);
-        }
+    for (ggml_type k_type : lightning_indexer_k_types) {
+        const std::string name = "lightning_indexer_" + std::string(ggml_type_name(k_type)) + "_k_f32";
+        ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_f32[k_type], name.c_str(), lightning_indexer_f32_len, lightning_indexer_f32_data, "main", 5, sizeof(vk_op_lightning_indexer_push_constants), {1, 1, 1}, {(uint32_t)k_type, fa_block_bytes(k_type)}, 1, true);
     }
 
     {
@@ -8201,6 +8213,7 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
 
     if (vk_perf_logger_enabled) {
         ctx->perf_logger = std::unique_ptr<vk_perf_logger>(new vk_perf_logger());
+        ctx->perf_logger->device_name = ctx->device->name;
     }
 
 #ifdef GGML_VULKAN_CHECK_RESULTS
@@ -8409,6 +8422,12 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
     if (b_type == GGML_TYPE_Q8_1) {
         if (ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
             dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
+        }
+        // on the iGPU (UMA) only the K-quants gain from it (q4_K 10240x2560: 111 -> 81 us); q8_0 loses (2560x6144: 32 -> 42)
+        const bool tall_type_ok = !ctx->device->uma || a_type == GGML_TYPE_Q4_K || a_type == GGML_TYPE_Q5_K || a_type == GGML_TYPE_Q6_K;
+        if (num_cols <= 4 && dmmv_wg == DMMV_WG_SIZE_SUBGROUP && ctx->device->mmv_tall_min_m > 0 && m >= ctx->device->mmv_tall_min_m && tall_type_ok &&
+                ctx->device->pipeline_dequant_mul_mat_vec_q8_1_f32_tall[a_type][num_cols-1] != nullptr) {
+            return ctx->device->pipeline_dequant_mul_mat_vec_q8_1_f32_tall[a_type][num_cols-1];
         }
         return ctx->device->pipeline_dequant_mul_mat_vec_q8_1_f32[dmmv_wg][a_type][num_cols-1];
     }
@@ -11740,9 +11759,15 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     float sp_max_bias = 0.0f, sp_softcap = 0.0f;
     memcpy(&sp_max_bias, (const float *) dst->op_params + 1, sizeof(float));
     memcpy(&sp_softcap,  (const float *) dst->op_params + 2, sizeof(float));
+    // Upstream #29639 put the quantized-K/V break-even at 12-16x the kept size on RDNA3, but it does not reproduce on
+    // our sparse path: Flash-Next 3-way split, 34 real TB turns, q8_0 KV: 2x decode 54.9 t/s vs 16x 52.4 (2026-10-04).
+    // So 2x stays the default for every type; GGML_VK_FA_SPARSE_QRATIO still overrides the quantized threshold.
+    static const uint32_t sparse_qratio = [] { const char * e = getenv("GGML_VK_FA_SPARSE_QRATIO"); return e ? (uint32_t) std::max(1, atoi(e)) : 2u; }();
+    const bool kv_quant = ggml_is_quantized(k->type) || ggml_is_quantized(v->type);
+    const uint32_t sparse_ratio = kv_quant ? sparse_qratio : 2u;
     bool use_sparse = mask != nullptr && n_kv_max > 0 && ggml_vk_fa_sparse_enabled() &&
         sp_max_bias == 0.0f && sp_softcap == 0.0f && nem0 == KV && nem2 == 1 &&
-        neq1 <= 8 && KV >= std::max<uint32_t>(2048u, 2u * (uint32_t) n_kv_max);
+        neq1 <= 8 && KV >= std::max<uint32_t>(2048u, sparse_ratio * (uint32_t) n_kv_max);
     uint32_t KVL = KV;
     if (use_sparse) {
         vk_fa_tuning_params sp = get_fa_tuning_params_scalar(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc);
@@ -13768,9 +13793,9 @@ static void ggml_vk_lightning_indexer(ggml_backend_vk_context * ctx, vk_context&
     const uint32_t n_streams = q->ne[3];
     const uint32_t n_masks   = m->ne[3];
 
-    const uint32_t n_outputs = (uint32_t)(dst->ne[0] * dst->ne[1] * dst->ne[3]);
-    const uint32_t dispatch_x = std::min(n_outputs, ctx->device->properties.limits.maxComputeWorkGroupCount[0]);
-    const uint32_t dispatch_y = CEIL_DIV(n_outputs, dispatch_x);
+    // one workgroup per tile of 64 keys and 8 tokens, see lightning_indexer.comp
+    const uint32_t n_tiles_kv = CEIL_DIV(n_kv, 64);
+    const uint32_t n_tiles_t  = CEIL_DIV(n_tokens, 8);
 
     // q, w and dst are f32 and m is f16, so their strides are passed in elements;
     // k may be quantized, so its strides stay in bytes
@@ -13787,7 +13812,7 @@ static void ggml_vk_lightning_indexer(ggml_backend_vk_context * ctx, vk_context&
     const uint32_t d_nb3 = dst->nb[3] / sizeof(float);
 
     const vk_op_lightning_indexer_push_constants pc = {
-        n_kv, n_heads, n_tokens, n_streams, n_masks, dispatch_x,
+        n_kv, n_heads, n_tokens, n_masks,
         q_nb1, q_nb2, q_nb3,
         k_nb2, k_nb3,
         w_nb1, w_nb3,
@@ -13797,7 +13822,7 @@ static void ggml_vk_lightning_indexer(ggml_backend_vk_context * ctx, vk_context&
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         {ggml_vk_tensor_subbuffer(ctx, q), ggml_vk_tensor_subbuffer(ctx, k), ggml_vk_tensor_subbuffer(ctx, w), ggml_vk_tensor_subbuffer(ctx, m), ggml_vk_tensor_subbuffer(ctx, dst)},
-        pc, {dispatch_x, dispatch_y, 1});
+        pc, {n_tiles_kv, n_tiles_t, n_streams});
 }
 
 static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
@@ -14333,11 +14358,12 @@ static void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, 
     const ggml_tensor * src0;
     const ggml_tensor * src1;
 
+    const float fused_scale = ctx->rms_fused_out_scale;
     if (ctx->num_additional_fused_ops > 0) {
-        // fused rms_norm + mul
+        // fused rms_norm + mul (+ scale)
         ggml_tensor *mul = cgraph->nodes[node_idx + 1];
         ggml_tensor *other_src = mul->src[0] == cgraph->nodes[node_idx + 0] ? mul->src[1] : mul->src[0];
-        dst = mul;
+        dst = fused_scale != 0.0f ? cgraph->nodes[node_idx + 2] : mul;
         src0 = cgraph->nodes[node_idx]->src[0];
         src1 = other_src;
     } else {
@@ -14357,11 +14383,11 @@ static void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, 
         (uint32_t)src1->ne[0], (uint32_t)src1->ne[1], (uint32_t)src1->ne[2],(uint32_t)src1->ne[3], (uint32_t)src1->nb[0] / src1_type_size, (uint32_t)src1->nb[1] / src1_type_size, (uint32_t)src1->nb[2] / src1_type_size, (uint32_t)src1->nb[3] / src1_type_size,
         (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],(uint32_t) dst->ne[3], (uint32_t) dst->nb[0] /  dst_type_size, (uint32_t) dst->nb[1] /  dst_type_size, (uint32_t) dst->nb[2] /  dst_type_size, (uint32_t) dst->nb[3] /  dst_type_size,
         0,
-        op_params[0], 0.0f, (int32_t)param3,
+        op_params[0], fused_scale, (int32_t)param3,
     };
 
-    // more than one fused op means rms_norm+mul+rope
-    if (ctx->num_additional_fused_ops > 1) {
+    // more than one fused op means rms_norm+mul+rope (unless it is rms_norm+mul+scale)
+    if (ctx->num_additional_fused_ops > 1 && fused_scale == 0.0f) {
         static constexpr uint32_t max_tensors = 7;
         const ggml_tensor *tensors[max_tensors] {};
 
@@ -18949,6 +18975,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_moe_scale = false;
         ctx->fused_topk_qsa = false;
         const char *fusion_string {};
+        // GGML_VK_DISABLE_RMS_MUL_SCALE=1 turns the RMS_NORM_MUL_SCALE fusion off
+        static const bool rms_mul_scale_fuse = getenv("GGML_VK_DISABLE_RMS_MUL_SCALE") == nullptr;
         if (!ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
             if (num_adds) {
@@ -18999,6 +19027,18 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 fusion_string = "RMS_NORM_MUL_ROPE";
                 // rope is approximately elementwise - whole rows are done by a single workgroup and it's row-wise
                 op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = true;
+                op_srcs_fused_elementwise[2] = true;
+            } else if (rms_mul_scale_fuse && ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_SCALE }) &&
+                       ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }) &&
+                       ggml_nrows(cgraph->nodes[i]) > 1 && cgraph->nodes[i + 2]->type == GGML_TYPE_F32 &&
+                       ggml_get_op_params_f32(cgraph->nodes[i + 2], 1) == 0.0f &&
+                       ggml_get_op_params_f32(cgraph->nodes[i + 2], 0) != 0.0f) {
+                // Flash-Next's hyper-connection norm: rms_norm * w, then the 1/hc scale (2 dispatches/layer saved)
+                ctx->num_additional_fused_ops = 2;
+                ctx->rms_fused_out_scale = ggml_get_op_params_f32(cgraph->nodes[i + 2], 0);
+                fusion_string = "RMS_NORM_MUL_SCALE";
+                op_srcs_fused_elementwise[0] = true;
                 op_srcs_fused_elementwise[1] = true;
                 op_srcs_fused_elementwise[2] = true;
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
@@ -19155,6 +19195,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             }
             if (need_disable) {
                 ctx->num_additional_fused_ops = 0;
+                ctx->rms_fused_out_scale = 0.0f;
                 ctx->fused_ops_write_mask = 1;
                 ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
                 ctx->fused_topk_moe_scale = false;
@@ -19271,6 +19312,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         }
         i += ctx->num_additional_fused_ops;
         ctx->num_additional_fused_ops = 0;
+        ctx->rms_fused_out_scale = 0.0f;
         ctx->fused_ops_write_mask = 0;
     }
 
