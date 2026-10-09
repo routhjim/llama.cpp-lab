@@ -1724,6 +1724,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"-ctxcp-path", "--ctx-checkpoints-path"}, "PATH",
+        "keep context checkpoints in unnamed files in this directory instead of host memory (default: none = host memory)",
+        [](common_params & params, const std::string & value) {
+            params.ctx_checkpoints_path = value;
+        }
+    ).set_env("LLAMA_ARG_CTX_CHECKPOINTS_PATH").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--slot-pack"},
         "keep active slots packed at the lowest indices by relocating idle slot caches.\n"
         "attention cost scales with the stream RANGE spanned by active sequences, not their\n"

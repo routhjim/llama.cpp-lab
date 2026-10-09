@@ -943,6 +943,31 @@ extern "C" {
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
 
+    // Streaming variants of llama_state_seq_get_data_ext / llama_state_seq_set_data_ext: the state
+    // passes through a callback in pieces (tensor data at most 4 MiB at a time) instead of one
+    // buffer of llama_state_seq_get_size_ext bytes, so it can go to or come from a file without
+    // being held in host memory. The bytes are the same as the buffer variants produce.
+    // A callback returns false to abort; the call then returns 0.
+    // LLAMA_STATE_SEQ_FLAGS_ON_DEVICE is not supported.
+    typedef bool (*llama_state_write_fn)(const void * src, size_t size, void * user_data);
+    typedef bool (*llama_state_read_fn) (void * dst,       size_t size, void * user_data);
+
+    LLAMA_API size_t llama_state_seq_get_data_stream(
+            struct llama_context * ctx,
+            llama_state_write_fn   fn,
+                            void * user_data,
+                    llama_seq_id   seq_id,
+           llama_state_seq_flags   flags);
+
+    // size: the number of bytes the stream holds (as returned by llama_state_seq_get_data_stream)
+    LLAMA_API size_t llama_state_seq_set_data_stream(
+            struct llama_context * ctx,
+             llama_state_read_fn   fn,
+                            void * user_data,
+                          size_t   size,
+                    llama_seq_id   dest_seq_id,
+           llama_state_seq_flags   flags);
+
     //
     // Decoding
     //

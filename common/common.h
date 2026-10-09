@@ -7,7 +7,9 @@
 #include "ggml-opt.h"
 #include "ggml.h"
 #include "llama.h"
+#include "state-file.h"
 
+#include <functional>
 #include <list>
 #include <memory>
 #include <set>
@@ -654,6 +656,7 @@ struct common_params {
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
+    std::string ctx_checkpoints_path = ""; // directory for context checkpoints; empty = host memory
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     int32_t cache_disk_mib      = 0;     // prompt-cache spill tier on disk: 0 = disabled, N = N MiB cap
     std::string cache_disk_path = "";    // directory for spilled prompt-cache states
@@ -1216,11 +1219,30 @@ struct common_prompt_checkpoint {
     common_state_data data_tgt;
     common_state_data data_dft;
 
+    // when set, update_tgt/update_dft keep the state in files in this directory instead of data_tgt/data_dft
+    std::string dir;
+
+    std::shared_ptr<common_state_file> file_tgt;
+    std::shared_ptr<common_state_file> file_dft;
+
     // (optional) speculative-decoding implementation state stashed with the checkpoint
     // (e.g. eagle3's deferred-boundary g_embd row)
     std::vector<uint8_t> data_spec;
 
     size_t size() const;
+
+    // the part of size() held in host memory
+    size_t size_host() const;
+
+    size_t size_tgt() const;
+    size_t size_dft() const;
+
+    // pass the tgt/dft state bytes to fn, one piece at a time
+    bool read_tgt(const std::function<bool(const void * data, size_t size)> & fn) const;
+    bool read_dft(const std::function<bool(const void * data, size_t size)> & fn) const;
+
+    // move data_tgt/data_dft to files in dir
+    bool to_files();
 
     bool empty() const;
     void clear();
@@ -1230,22 +1252,23 @@ struct common_prompt_checkpoint {
             llama_pos pos_min,
             llama_pos pos_max);
 
-    void update_tgt(
+    // return false if the state could not be stored or restored
+    bool update_tgt(
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags);
 
-    void update_dft(
+    bool update_dft(
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags);
 
-    void load_tgt(
+    bool load_tgt(
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags) const;
 
-    void load_dft(
+    bool load_dft(
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags) const;

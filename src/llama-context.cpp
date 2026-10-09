@@ -2729,6 +2729,81 @@ private:
     std::vector<uint8_t> temp_buffer;
 };
 
+// streams the state through a caller callback, so the whole state never has to be in host memory
+// at once: tensor data passes in pieces of at most `chunk` bytes
+class llama_io_write_stream : public llama_io_write_i {
+public:
+    llama_io_write_stream(llama_state_write_fn fn, void * user_data) : fn(fn), user_data(user_data) {}
+
+    void write(const void * src, size_t size) override {
+        if (size > 0 && !fn(src, size, user_data)) {
+            throw std::runtime_error("state stream write failed");
+        }
+        size_written += size;
+    }
+
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        temp_buffer.resize(std::min(size, chunk));
+        for (size_t done = 0; done < size; ) {
+            const size_t n = std::min(chunk, size - done);
+            ggml_backend_tensor_get(tensor, temp_buffer.data(), offset + done, n);
+            write(temp_buffer.data(), n);
+            done += n;
+        }
+    }
+
+    size_t n_bytes() override {
+        return size_written;
+    }
+
+private:
+    static constexpr size_t chunk = 4u*1024*1024;
+
+    llama_state_write_fn fn;
+    void * user_data;
+    size_t size_written = 0;
+    std::vector<uint8_t> temp_buffer;
+};
+
+class llama_io_read_stream : public llama_io_read_i {
+public:
+    llama_io_read_stream(llama_state_read_fn fn, void * user_data, size_t size) : fn(fn), user_data(user_data), buf_size(size) {}
+
+    void read(void * dst, size_t size) override {
+        if (size > buf_size) {
+            throw std::runtime_error("unexpectedly reached end of state stream");
+        }
+        if (size > 0 && !fn(dst, size, user_data)) {
+            throw std::runtime_error("state stream read failed");
+        }
+        size_read += size;
+        buf_size  -= size;
+    }
+
+    void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        temp_buffer.resize(std::min(size, chunk));
+        for (size_t done = 0; done < size; ) {
+            const size_t n = std::min(chunk, size - done);
+            read(temp_buffer.data(), n);
+            ggml_backend_tensor_set(tensor, temp_buffer.data(), offset + done, n);
+            done += n;
+        }
+    }
+
+    size_t n_bytes() override {
+        return size_read;
+    }
+
+private:
+    static constexpr size_t chunk = 4u*1024*1024;
+
+    llama_state_read_fn fn;
+    void * user_data;
+    size_t buf_size;
+    size_t size_read = 0;
+    std::vector<uint8_t> temp_buffer;
+};
+
 class llama_io_write_device : public llama_io_write_i {
 public:
     llama_io_write_device(uint8_t * p, size_t len, llama_memory_buffers & mbufs) : ptr(p), buf_size(len), mbufs(mbufs)  {
@@ -3091,6 +3166,50 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
         return state_seq_write_data(*io, seq_id, flags);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_context::state_seq_get_data_stream(llama_seq_id seq_id, llama_state_write_fn fn, void * user_data, llama_state_seq_flags flags) {
+    if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+        LLAMA_LOG_ERROR("%s: LLAMA_STATE_SEQ_FLAGS_ON_DEVICE cannot be streamed\n", __func__);
+        return 0;
+    }
+
+    llama_io_write_stream io(fn, user_data);
+
+    try {
+        io.write(&io_magic, sizeof(io_magic));
+        io.write(&seq_id, sizeof(seq_id));
+
+        return state_seq_write_data(io, seq_id, flags);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_context::state_seq_set_data_stream(llama_seq_id seq_id, llama_state_read_fn fn, void * user_data, size_t size, llama_state_seq_flags flags) {
+    if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+        LLAMA_LOG_ERROR("%s: LLAMA_STATE_SEQ_FLAGS_ON_DEVICE cannot be streamed\n", __func__);
+        return 0;
+    }
+
+    llama_io_read_stream io(fn, user_data, size);
+
+    try {
+        uint32_t magic_read;
+        io.read(&magic_read, sizeof(magic_read));
+        if (io_magic != magic_read) {
+            throw std::runtime_error("wrong sequence state magic");
+        }
+
+        llama_seq_id seq_id_read;
+        io.read(&seq_id_read, sizeof(seq_id_read));
+
+        return state_seq_read_data(io, seq_id, flags);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
         return 0;
     }
 }
@@ -4214,6 +4333,18 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
     ctx->synchronize();
 
     return ctx->state_seq_set_data(seq_id, src, size, flags);
+}
+
+size_t llama_state_seq_get_data_stream(llama_context * ctx, llama_state_write_fn fn, void * user_data, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    ctx->synchronize();
+
+    return ctx->state_seq_get_data_stream(seq_id, fn, user_data, flags);
+}
+
+size_t llama_state_seq_set_data_stream(llama_context * ctx, llama_state_read_fn fn, void * user_data, size_t size, llama_seq_id dest_seq_id, llama_state_seq_flags flags) {
+    ctx->synchronize();
+
+    return ctx->state_seq_set_data_stream(dest_seq_id, fn, user_data, size, flags);
 }
 
 size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {

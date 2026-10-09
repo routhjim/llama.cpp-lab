@@ -602,17 +602,27 @@ struct server_prompt_cache_state {
     server_prompt_data data;
 
     // disk spill tier: when set, `data` is empty and the state lives in these files
-    std::string spill_main;
-    std::string spill_drft;
-    size_t      spill_size = 0;
+    std::shared_ptr<common_state_file> spill_main = nullptr;
+    std::shared_ptr<common_state_file> spill_drft = nullptr;
+    size_t spill_size = 0;
 
-    bool spilled() const { return !spill_main.empty(); }
+    bool spilled() const { return spill_main != nullptr; }
 
     size_t size() const {
         size_t res = spilled() ? spill_size : data.size();
 
         for (const auto & ckpt : prompt.checkpoints) {
             res += ckpt->size();
+        }
+
+        return res;
+    }
+
+    size_t size_host() const {
+        size_t res = spilled() ? 0 : data.size();
+
+        for (const auto & ckpt : prompt.checkpoints) {
+            res += ckpt->size_host();
         }
 
         return res;
@@ -625,6 +635,7 @@ struct server_prompt_cache {
         this->limit_tokens = limit_tokens;
         this->disk_limit   = 1024ull*1024ull*(disk_limit_mib < 0 ? 0 : disk_limit_mib);
         this->disk_path    = disk_path;
+        this->no_ram       = limit_size_mib == 0;
         // A fresh instance cannot reload spill blobs left on disk by a prior run: the
         // prompt token metadata that maps a blob back to a prefix is never persisted,
         // so orphaned pc-* files are unreloadable and sit outside this instance's LRU
@@ -637,12 +648,17 @@ struct server_prompt_cache {
     // disk spill tier (0 = disabled): RAM evictions are written here instead of dropped
     size_t      disk_limit = 0;
     std::string disk_path;
-    uint64_t    spill_seq  = 0;
+
+    // --cache-ram 0: entries never stay in RAM
+    bool no_ram = false;
+
+    // entries are written from the device straight to disk, with no host copy
+    bool direct() const { return no_ram && disk_limit > 0 && !disk_path.empty(); }
 
     size_t ram_size()  const;   // bytes of states resident in RAM
     size_t disk_size() const;   // bytes of states spilled to disk
     bool   spill(server_prompt_cache_state & st);     // RAM -> disk
-    bool   unspill(server_prompt_cache_state & st);   // disk -> RAM
+    bool   save_direct(server_prompt_cache_state & st, llama_context * ctx_tgt, llama_context * ctx_dft, llama_seq_id seq_id); // device -> disk
     void   drop(std::list<server_prompt_cache_state>::iterator it);  // erase + delete files
     void   evict_ram(size_t need);   // make `need` bytes of RAM room: spill (or drop) oldest resident entries
     void   evict_disk();             // keep the disk tier under disk_limit
@@ -661,7 +677,8 @@ struct server_prompt_cache {
 
     size_t n_tokens() const;
 
-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    // host = false: do not allocate the state buffers (the caller uses save_direct)
+    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft, bool host = true);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 

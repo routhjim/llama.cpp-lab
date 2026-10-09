@@ -2294,11 +2294,23 @@ bool common_prompt_batch_decode(
 }
 
 size_t common_prompt_checkpoint::size() const {
+    return size_tgt() + size_dft() + data_spec.size();
+}
+
+size_t common_prompt_checkpoint::size_host() const {
     return data_tgt.size() + data_dft.size() + data_spec.size();
 }
 
+size_t common_prompt_checkpoint::size_tgt() const {
+    return file_tgt ? file_tgt->size() : data_tgt.size();
+}
+
+size_t common_prompt_checkpoint::size_dft() const {
+    return file_dft ? file_dft->size() : data_dft.size();
+}
+
 bool common_prompt_checkpoint::empty() const {
-    return data_tgt.empty();
+    return data_tgt.empty() && !file_tgt;
 }
 
 void common_prompt_checkpoint::clear() {
@@ -2310,6 +2322,9 @@ void common_prompt_checkpoint::clear() {
     data_tgt.clear();
     data_dft.clear();
     data_spec.clear();
+
+    file_tgt.reset();
+    file_dft.reset();
 }
 
 void common_prompt_checkpoint::update_pos(
@@ -2321,83 +2336,148 @@ void common_prompt_checkpoint::update_pos(
     this->pos_max  = pos_max;
 }
 
-void common_prompt_checkpoint::update_tgt(
+static bool checkpoint_state_get(
         llama_context * ctx,
         llama_seq_id seq_id,
-        llama_state_seq_flags flags) {
+        llama_state_seq_flags flags,
+        const std::string & dir,
+        common_state_data & data,
+        std::shared_ptr<common_state_file> & file) {
     if (ctx == nullptr) {
-        return;
+        return true;
+    }
+
+    if (!dir.empty()) {
+        data.clear();
+
+        if (!file) {
+            file = common_state_file::create(dir);
+        }
+        if (file && file->save(ctx, seq_id, flags)) {
+            return true;
+        }
+
+        file.reset();
+        return false;
     }
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
-    data_tgt.resize(ckpt_size);
+    data.resize(ckpt_size);
 
-    const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
+    const size_t n = llama_state_seq_get_data_ext(ctx, data.data(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
     }
+
+    return true;
 }
 
-void common_prompt_checkpoint::update_dft(
+static bool checkpoint_state_set(
+        llama_context * ctx,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags,
+        const common_state_data & data,
+        const std::shared_ptr<common_state_file> & file) {
+    if (ctx == nullptr) {
+        return true;
+    }
+
+    if (file) {
+        if (!file->load(ctx, seq_id, flags)) {
+            LOG_ERR("%s: failed to load checkpoint from disk\n", __func__);
+            return false;
+        }
+        return true;
+    }
+
+    if (data.empty()) {
+        return true;
+    }
+
+    const size_t n = llama_state_seq_set_data_ext(ctx, data.data(), data.size(), seq_id, flags);
+    if (n != data.size()) {
+        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", data.size(), n);
+    }
+
+    return true;
+}
+
+static bool checkpoint_state_read(
+        const common_state_data & data,
+        const std::shared_ptr<common_state_file> & file,
+        const std::function<bool(const void * data, size_t size)> & fn) {
+    if (file) {
+        return file->read(fn);
+    }
+    return data.empty() || fn(data.data(), data.size());
+}
+
+bool common_prompt_checkpoint::update_tgt(
         llama_context * ctx,
         llama_seq_id seq_id,
         llama_state_seq_flags flags) {
-    if (ctx == nullptr) {
-        return;
-    }
-
-    const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
-
-    data_dft.resize(ckpt_size);
-
-    const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
-    if (n != ckpt_size) {
-        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
-    }
+    return checkpoint_state_get(ctx, seq_id, flags, dir, data_tgt, file_tgt);
 }
 
-void common_prompt_checkpoint::load_tgt(
+bool common_prompt_checkpoint::update_dft(
+        llama_context * ctx,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags) {
+    return checkpoint_state_get(ctx, seq_id, flags, dir, data_dft, file_dft);
+}
+
+bool common_prompt_checkpoint::load_tgt(
         llama_context * ctx,
         llama_seq_id seq_id,
         llama_state_seq_flags flags) const {
-    if (ctx == nullptr) {
-        return;
-    }
-
-    if (data_tgt.empty()) {
-        return;
-    }
-
-    const size_t n = llama_state_seq_set_data_ext(ctx, data_tgt.data(), data_tgt.size(), seq_id, flags);
-    if (n != data_tgt.size()) {
-        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", data_tgt.size(), n);
-    }
+    return checkpoint_state_set(ctx, seq_id, flags, data_tgt, file_tgt);
 }
 
-void common_prompt_checkpoint::load_dft(
+bool common_prompt_checkpoint::load_dft(
         llama_context * ctx,
         llama_seq_id seq_id,
         llama_state_seq_flags flags) const {
-    if (ctx == nullptr) {
-        return;
+    return checkpoint_state_set(ctx, seq_id, flags, data_dft, file_dft);
+}
+
+bool common_prompt_checkpoint::read_tgt(const std::function<bool(const void * data, size_t size)> & fn) const {
+    return checkpoint_state_read(data_tgt, file_tgt, fn);
+}
+
+bool common_prompt_checkpoint::read_dft(const std::function<bool(const void * data, size_t size)> & fn) const {
+    return checkpoint_state_read(data_dft, file_dft, fn);
+}
+
+bool common_prompt_checkpoint::to_files() {
+    if (dir.empty()) {
+        return true;
     }
 
-    if (data_dft.empty()) {
-        return;
-    }
+    const auto move = [&](common_state_data & data, std::shared_ptr<common_state_file> & file) {
+        if (data.empty()) {
+            return true;
+        }
+        file = common_state_file::create(dir);
+        if (!file || !file->assign(data.data(), data.size())) {
+            file.reset();
+            return false;
+        }
+        data.clear();
+        data.shrink_to_fit();
+        return true;
+    };
 
-    const size_t n = llama_state_seq_set_data_ext(ctx, data_dft.data(), data_dft.size(), seq_id, flags);
-    if (n != data_dft.size()) {
-        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", data_dft.size(), n);
-    }
+    return move(data_tgt, file_tgt) && move(data_dft, file_dft);
 }
 
 void common_prompt_checkpoint::clear_tgt() {
     data_tgt.clear();
+    file_tgt.reset();
 }
 
 void common_prompt_checkpoint::clear_dft() {
     data_dft.clear();
+    file_dft.reset();
     data_spec.clear();
 }
