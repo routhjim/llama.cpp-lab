@@ -1708,7 +1708,7 @@ size_t server_prompt_cache::ram_size() const {
             // its checkpoints. Measured 2026-09-09 on a TB2.1 run: 19 spilled entries at
             // -ctxcp 4 held ~9.7 GiB of anonymous RAM against a --cache-ram budget of 2 GiB.
             for (const auto & ckpt : state.prompt.checkpoints) {
-                res += ckpt.size();
+                res += ckpt->size();
             }
         }
     }
@@ -1735,7 +1735,7 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-static bool write_blob(const std::string & path, const std::vector<uint8_t> & data) {
+static bool write_blob(const std::string & path, const common_state_data & data) {
     FILE * f = fopen(path.c_str(), "wb");
     if (!f) {
         return false;
@@ -1748,7 +1748,7 @@ static bool write_blob(const std::string & path, const std::vector<uint8_t> & da
     return ok;
 }
 
-static bool read_blob(const std::string & path, std::vector<uint8_t> & data) {
+static bool read_blob(const std::string & path, common_state_data & data) {
     FILE * f = fopen(path.c_str(), "rb");
     if (!f) {
         return false;
@@ -1803,7 +1803,7 @@ bool server_prompt_cache::unspill(server_prompt_cache_state & st) {
         return true;
     }
     const int64_t t0 = ggml_time_us();
-    std::vector<uint8_t> main, drft;
+    common_state_data main, drft;
     if (!read_blob(st.spill_main, main) || (!st.spill_drft.empty() && !read_blob(st.spill_drft, drft))) {
         SRV_WRN(" - prompt cache: reload from disk FAILED (%s)\n", st.spill_main.c_str());
         return false;
@@ -1854,7 +1854,7 @@ void server_prompt_cache::evict_ram(size_t need) {
             }
             size_t freed = 0;
             for (const auto & c : ck->prompt.checkpoints) {
-                freed += c.size();
+                freed += c->size();
             }
             SRV_WRN(" - prompt cache over --cache-ram, dropping %zu context checkpoint(s) from a spilled entry (%.3f MiB)\n",
                     ck->prompt.checkpoints.size(), freed / (1024.0 * 1024.0));
@@ -1943,7 +1943,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     // calculate checkpoints size to see if it will fit with the prompt
     size_t checkpoints_size = 0;
     for (const auto & ckpt : prompt.checkpoints) {
-        checkpoints_size += ckpt.size();
+        checkpoints_size += ckpt->size();
     }
 
     const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
@@ -1977,8 +1977,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     // make room before allocating the new vectors to avoid breaching the limit (spills to disk when enabled)
     evict_ram(state_size_new);
 
-    std::vector<uint8_t> state_data_tgt;
-    std::vector<uint8_t> state_data_dft;
+    common_state_data state_data_tgt;
+    common_state_data state_data_dft;
 
     // check if we can allocate enough memory for the new state
     try {
