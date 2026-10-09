@@ -9564,6 +9564,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 32, 1, 32)); // too small (N<64)
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 1024, 1, 1024)); // too big (N>512)
 
+    // Qwen3.8-27B shapes in the small-n split-K band (n 17-64, k >= 2048)
+    for (ggml_type ta : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_F32}) {
+        for (int n : {17, 24, 32, 48, 64}) {
+            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 5120, n, 17408, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 6144, n, 5120, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 1024, n, 5120, {1, 1}, {1, 1}));
+        }
+    }
+
 #if 0
     // > 4GB A matrix. Too slow to be enabled by default.
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16,  900000,  3, 2592, {1, 1}, {1, 1}));
