@@ -233,6 +233,9 @@ struct vk_pipeline_struct {
     uint32_t parameter_count;
     std::array<uint32_t, 3> wg_denoms;
     uint32_t align;
+    uint32_t subgroup_size {};
+    // workgroup size, set for matmul pipelines only
+    uint32_t wg_size {};
     // true if fields have been set by ggml_vk_create_pipeline
     bool initialized {};
     // true while a compile is in flight, used to dedupe concurrent claims.
@@ -4817,6 +4820,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 pipeline->push_constant_size = push_constant_size;
                 pipeline->wg_denoms = wg_denoms;
                 pipeline->align = align;
+                pipeline->subgroup_size = (device->subgroup_size_control && required_subgroup_size > 0) ? required_subgroup_size : device->subgroup_size;
+                // matmul spec constant 0 is BLOCK_SIZE (warptile[0])
+                if (strncmp(name, "matmul", 6) == 0 && !specialization_constants.empty()) {
+                    pipeline->wg_size = specialization_constants[0];
+                }
                 pipeline->initialized = true;
 #if defined(VK_EXT_shader_64bit_indexing)
                 pipeline->is_64b_indexing = (i == 1);
@@ -9433,6 +9441,21 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
     }
 
     uint32_t split_k = 1;
+
+    // Small n gives too few waves to hide latency (upstream #30146). RDNA has 2 SIMDs per CU, aim for 4 waves per SIMD.
+    // GGML_VK_SPLITK_SMALL_N=0 disables it. The rule below still applies and the larger split wins.
+    static const bool small_n = [] { const char * e = getenv("GGML_VK_SPLITK_SMALL_N"); return !e || atoi(e) != 0; }();
+    uint32_t split_k_small_n = 1;
+    if (small_n && (ctx->device->architecture == AMD_RDNA3 || ctx->device->architecture == AMD_RDNA4) &&
+        ctx->device->shader_core_count != 0 && k >= 2048 && pipeline->wg_size != 0 && pipeline->subgroup_size != 0 &&
+        (n < pipeline->wg_denoms[1] || n <= 64)) {
+        const uint32_t waves = CEIL_DIV(m, pipeline->wg_denoms[0]) * CEIL_DIV(n, pipeline->wg_denoms[1]) * CEIL_DIV(pipeline->wg_size, pipeline->subgroup_size);
+        const uint32_t simds = ctx->device->shader_core_count * 2;
+        if (waves < 2 * simds) {
+            split_k_small_n = std::min(8u, CEIL_DIV(4 * simds, waves));
+        }
+    }
+
     // GGML_VK_SPLITK_SMALL_M=0 restores the old rule (no split when m or n is below one tile). Skinny products such as
     // a [k=10240 x 4] gate over 256 tokens otherwise run as 2-8 workgroups each walking all of k.
     static const bool small_m = [] { const char * e = getenv("GGML_VK_SPLITK_SMALL_M"); return !e || atoi(e) != 0; }();
@@ -9451,22 +9474,24 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
             // Cap the split at 8x. Unless k is huge this is a lot of overhead.
             // A sub-tile product has tiny partials (m*n floats per split), so it can afford more.
             split_k = std::min(split_k, fits ? 8u : 16u);
-
-            // ggml_vk_matmul will align the splits to be a multiple of 256.
-            // If this rounded up size would cause the last split to be empty,
-            // then reduce the split count.
-            while (true) {
-                if (split_k == 1) {
-                    break;
-                }
-                uint32_t k_split = CEIL_DIV(k, split_k);
-                k_split = ROUNDUP_POW2(k_split, 256);
-                if (k_split * (split_k - 1) < k) {
-                    break;
-                }
-                split_k--;
-            }
         }
+    }
+
+    split_k = std::max(split_k, split_k_small_n);
+
+    // ggml_vk_matmul will align the splits to be a multiple of 256.
+    // If this rounded up size would cause the last split to be empty,
+    // then reduce the split count.
+    while (true) {
+        if (split_k == 1) {
+            break;
+        }
+        uint32_t k_split = CEIL_DIV(k, split_k);
+        k_split = ROUNDUP_POW2(k_split, 256);
+        if (k_split * (split_k - 1) < k) {
+            break;
+        }
+        split_k--;
     }
 
     return split_k;
