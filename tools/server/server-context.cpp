@@ -321,9 +321,20 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
+        const bool direct = prompt_cache.direct();
+
+        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, !direct);
         if (cur == nullptr) {
             return false;
+        }
+
+        if (direct) {
+            if (!prompt_cache.save_direct(*cur, ctx_tgt, ctx_dft, seq)) {
+                SLT_ERR(*this, "%s", "failed to save prompt state to disk\n");
+                prompt_cache.states.pop_back();
+                return false;
+            }
+            return true;
         }
 
         // the buffers are not zero-initialized, so a short read must not reach the cache
@@ -2478,8 +2489,13 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
-        cur.update_tgt(ctx_tgt, slot.seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        cur.update_dft(ctx_dft, slot.seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        cur.dir = params_base.ctx_checkpoints_path;
+
+        if (!cur.update_tgt(ctx_tgt, slot.seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ||
+            !cur.update_dft(ctx_dft, slot.seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+            SLT_WRN(slot, "failed to write context checkpoint to '%s', skipping it\n", cur.dir.c_str());
+            return;
+        }
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.seq, cur.data_spec);
 
@@ -2741,16 +2757,23 @@ private:
                                 fckpt.write((const char *) &idt,   sizeof(idt));
                                 fckpt.write((const char *) &pmin,  sizeof(pmin));
                                 fckpt.write((const char *) &pmax,  sizeof(pmax));
-                                const auto write_buf = [&](const auto & v) {
-                                    const uint64_t n = (uint64_t) v.size();
-                                    fckpt.write((const char *) &n, sizeof(n));
-                                    if (n) {
-                                        fckpt.write((const char *) v.data(), n);
-                                    }
+                                const auto write_part = [&](const void * data, size_t size) {
+                                    fckpt.write((const char *) data, size);
+                                    return (bool) fckpt;
                                 };
-                                write_buf(c.data_tgt);
-                                write_buf(c.data_dft);
-                                write_buf(c.data_spec);
+                                uint64_t n = c.size_tgt();
+                                fckpt.write((const char *) &n, sizeof(n));
+                                if (!c.read_tgt(write_part)) {
+                                    fckpt.setstate(std::ios::failbit);
+                                }
+                                n = c.size_dft();
+                                fckpt.write((const char *) &n, sizeof(n));
+                                if (!c.read_dft(write_part)) {
+                                    fckpt.setstate(std::ios::failbit);
+                                }
+                                n = c.data_spec.size();
+                                fckpt.write((const char *) &n, sizeof(n));
+                                write_part(c.data_spec.data(), c.data_spec.size());
                             }
                             fckpt.close();
                             if (fckpt) {
@@ -2894,8 +2917,9 @@ private:
                                             return true;
                                         };
                                         bool ok = read_buf(c.data_tgt) && read_buf(c.data_dft) && read_buf(c.data_spec);
-                                        if (!ok || !fckpt) {
-                                            SRV_WRN("checkpoint sidecar for %s is truncated; keeping %zu of %u\n",
+                                        c.dir = params_base.ctx_checkpoints_path;
+                                        if (!ok || !fckpt || !c.to_files()) {
+                                            SRV_WRN("checkpoint sidecar for %s is truncated or could not be stored; keeping %zu of %u\n",
                                                     filename.c_str(), slot->prompt.checkpoints.size(), cnt);
                                             break;
                                         }
@@ -3371,7 +3395,7 @@ private:
                     SLT_DBG(slot, "created speculative checkpoint (pos_min = %d, pos_max = %d, n_tokens = %d, size = %.3f MiB, draft = %.3f MiB)\n",
                             ckpt.pos_min, ckpt.pos_max, slot.prompt.n_tokens(),
                             (float) ckpt.size() / 1024 / 1024,
-                            (float) ckpt.data_dft.size() / 1024 / 1024);
+                            (float) ckpt.size_dft() / 1024 / 1024);
                 }
 
                 if (use_ckpt_dft) {
@@ -3654,14 +3678,18 @@ private:
                                         const auto & cur = **it;
 
                                         // restore the context checkpoint
-                                        cur.load_tgt(ctx_tgt, slot.seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                        cur.load_dft(ctx_dft, slot.seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                        // restore the draft's speculative state
-                                        common_speculative_set_state(spec.get(), slot.seq, cur.data_spec);
+                                        if (!cur.load_tgt(ctx_tgt, slot.seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ||
+                                            !cur.load_dft(ctx_dft, slot.seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+                                            SLT_WRN(slot, "%s", "failed to restore context checkpoint\n");
+                                            do_reset = true;
+                                        } else {
+                                            // restore the draft's speculative state
+                                            common_speculative_set_state(spec.get(), slot.seq, cur.data_spec);
 
-                                        pos_next = std::min(pos_next, std::max(cur.pos_min + 1, cur.pos_max));
-                                        n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) cur.n_tokens);
-                                        SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_past, (float) cur.size() / 1024 / 1024);
+                                            pos_next = std::min(pos_next, std::max(cur.pos_min + 1, cur.pos_max));
+                                            n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) cur.n_tokens);
+                                            SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_past, (float) cur.size() / 1024 / 1024);
+                                        }
                                     }
 
                                     if (do_reset) {

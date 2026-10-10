@@ -1698,19 +1698,12 @@ size_t server_prompt_cache::size() const {
 size_t server_prompt_cache::ram_size() const {
     size_t res = 0;
     for (const auto & state : states) {
-        if (!state.spilled()) {
-            res += state.size();
-        } else {
-            // A spilled entry's `data` is on disk, but spill() does NOT spill the context
-            // checkpoints -- those stay in host RAM. Skipping spilled entries entirely made that
-            // memory invisible to the --cache-ram budget, so it grew without bound: every
-            // completed task leaves a spilled entry behind, and nothing ever counted or freed
-            // its checkpoints. Measured 2026-09-09 on a TB2.1 run: 19 spilled entries at
-            // -ctxcp 4 held ~9.7 GiB of anonymous RAM against a --cache-ram budget of 2 GiB.
-            for (const auto & ckpt : state.prompt.checkpoints) {
-                res += ckpt->size();
-            }
-        }
+        // A spilled entry's `data` is on disk, but spill() does NOT spill the context
+        // checkpoints -- unless --ctx-checkpoints-path is set, those stay in host RAM. Skipping spilled
+        // entries entirely made that memory invisible to the --cache-ram budget, so it grew without bound.
+        // Measured 2026-09-09 on a TB2.1 run: 19 spilled entries at -ctxcp 4 held ~9.7 GiB of anonymous
+        // RAM against a --cache-ram budget of 2 GiB.
+        res += state.size_host();
     }
     return res;
 }
@@ -1735,62 +1728,27 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-static bool write_blob(const std::string & path, const common_state_data & data) {
-    FILE * f = fopen(path.c_str(), "wb");
-    if (!f) {
-        return false;
-    }
-    const size_t n = data.empty() ? 0 : fwrite(data.data(), 1, data.size(), f);
-    const bool ok = fclose(f) == 0 && n == data.size();
-    if (!ok) {
-        remove(path.c_str());
-    }
-    return ok;
-}
-
-static bool read_blob(const std::string & path, common_state_data & data) {
-    FILE * f = fopen(path.c_str(), "rb");
-    if (!f) {
-        return false;
-    }
-    fseek(f, 0, SEEK_END);
-    const long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (sz < 0) {
-        fclose(f);
-        return false;
-    }
-    try {
-        data.resize((size_t) sz);
-    } catch (const std::bad_alloc &) {
-        fclose(f);
-        return false;
-    }
-    const size_t n = sz > 0 ? fread(data.data(), 1, (size_t) sz, f) : 0;
-    fclose(f);
-    return n == (size_t) sz;
-}
-
 bool server_prompt_cache::spill(server_prompt_cache_state & st) {
     if (disk_limit == 0 || disk_path.empty() || st.spilled()) {
         return false;
     }
-    const std::string base = disk_path + "/pc-" + std::to_string(spill_seq++);
-    const std::string p_main = base + ".main";
-    const std::string p_drft = base + ".drft";
     const int64_t t0 = ggml_time_us();
-    if (!write_blob(p_main, st.data.main)) {
-        SRV_WRN(" - prompt cache spill FAILED (%s), dropping entry\n", p_main.c_str());
+    auto f_main = common_state_file::create(disk_path);
+    if (!f_main || !f_main->assign(st.data.main.data(), st.data.main.size())) {
+        SRV_WRN(" - prompt cache spill to %s FAILED, dropping entry\n", disk_path.c_str());
         return false;
     }
-    if (!st.data.drft.empty() && !write_blob(p_drft, st.data.drft)) {
-        remove(p_main.c_str());
-        SRV_WRN(" - prompt cache spill FAILED (%s), dropping entry\n", p_drft.c_str());
-        return false;
+    std::shared_ptr<common_state_file> f_drft;
+    if (!st.data.drft.empty()) {
+        f_drft = common_state_file::create(disk_path);
+        if (!f_drft || !f_drft->assign(st.data.drft.data(), st.data.drft.size())) {
+            SRV_WRN(" - prompt cache spill to %s FAILED, dropping entry\n", disk_path.c_str());
+            return false;
+        }
     }
     st.spill_size = st.data.size();
-    st.spill_main = p_main;
-    st.spill_drft = st.data.drft.empty() ? "" : p_drft;
+    st.spill_main = std::move(f_main);
+    st.spill_drft = std::move(f_drft);
     st.data.main.clear(); st.data.main.shrink_to_fit();
     st.data.drft.clear(); st.data.drft.shrink_to_fit();
     SRV_INF(" - prompt cache: spilled %7d tokens, %.1f MiB to disk in %.0f ms\n",
@@ -1798,35 +1756,29 @@ bool server_prompt_cache::spill(server_prompt_cache_state & st) {
     return true;
 }
 
-bool server_prompt_cache::unspill(server_prompt_cache_state & st) {
-    if (!st.spilled()) {
-        return true;
-    }
+bool server_prompt_cache::save_direct(server_prompt_cache_state & st, llama_context * ctx_tgt, llama_context * ctx_dft, llama_seq_id seq_id) {
     const int64_t t0 = ggml_time_us();
-    common_state_data main, drft;
-    if (!read_blob(st.spill_main, main) || (!st.spill_drft.empty() && !read_blob(st.spill_drft, drft))) {
-        SRV_WRN(" - prompt cache: reload from disk FAILED (%s)\n", st.spill_main.c_str());
+    auto f_main = common_state_file::create(disk_path);
+    if (!f_main || !f_main->save(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE)) {
         return false;
     }
-    st.data.main = std::move(main);
-    st.data.drft = std::move(drft);
-    remove(st.spill_main.c_str());
-    if (!st.spill_drft.empty()) {
-        remove(st.spill_drft.c_str());
+    std::shared_ptr<common_state_file> f_drft;
+    if (ctx_dft) {
+        f_drft = common_state_file::create(disk_path);
+        if (!f_drft || !f_drft->save(ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE)) {
+            return false;
+        }
     }
-    SRV_INF(" - prompt cache: reloaded %7d tokens, %.1f MiB from disk in %.0f ms\n",
+    st.spill_size = f_main->size() + (f_drft ? f_drft->size() : 0);
+    st.spill_main = std::move(f_main);
+    st.spill_drft = std::move(f_drft);
+    SRV_INF(" - prompt cache: saved %7d tokens, %.1f MiB to disk in %.0f ms\n",
             st.prompt.n_tokens(), st.spill_size / (1024.0 * 1024.0), (ggml_time_us() - t0) / 1000.0);
-    st.spill_main.clear(); st.spill_drft.clear(); st.spill_size = 0;
+    evict_disk();
     return true;
 }
 
 void server_prompt_cache::drop(std::list<server_prompt_cache_state>::iterator it) {
-    if (it->spilled()) {
-        remove(it->spill_main.c_str());
-        if (!it->spill_drft.empty()) {
-            remove(it->spill_drft.c_str());
-        }
-    }
     states.erase(it);
 }
 
@@ -1846,7 +1798,7 @@ void server_prompt_cache::evict_ram(size_t need) {
             // not state, so losing it costs that entry a re-prefill on its next hit and never
             // correctness. Without this the loop just gave up and the budget stayed breached.
             auto ck = states.begin();
-            while (ck != states.end() && ck->prompt.checkpoints.empty()) {
+            while (ck != states.end() && ck->size_host() == 0) {
                 ++ck;
             }
             if (ck == states.end()) {
@@ -1854,7 +1806,7 @@ void server_prompt_cache::evict_ram(size_t need) {
             }
             size_t freed = 0;
             for (const auto & c : ck->prompt.checkpoints) {
-                freed += c->size();
+                freed += c->size_host();
             }
             SRV_WRN(" - prompt cache over --cache-ram, dropping %zu context checkpoint(s) from a spilled entry (%.3f MiB)\n",
                     ck->prompt.checkpoints.size(), freed / (1024.0 * 1024.0));
@@ -1929,7 +1881,7 @@ void server_prompt_cache::clear_disk() {
     }
 }
 
-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft, bool host) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
@@ -1975,15 +1927,17 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     }
 
     // make room before allocating the new vectors to avoid breaching the limit (spills to disk when enabled)
-    evict_ram(state_size_new);
+    evict_ram(host ? state_size_new : 0);
 
     common_state_data state_data_tgt;
     common_state_data state_data_dft;
 
     // check if we can allocate enough memory for the new state
     try {
-        state_data_tgt.resize(state_size_tgt);
-        state_data_dft.resize(state_size_dft);
+        if (host) {
+            state_data_tgt.resize(state_size_tgt);
+            state_data_dft.resize(state_size_dft);
+        }
     } catch (const std::bad_alloc & e) {
         SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
 
@@ -2045,12 +1999,19 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
-        if (it_best->spilled() && !unspill(*it_best)) {
-            drop(it_best);
-            return true;   // nothing restored; the caller processes the prompt from scratch
-        }
-
-        {
+        if (it_best->spilled()) {
+            const int64_t t0 = ggml_time_us();
+            const bool ok =
+                it_best->spill_main->load(ctx_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) &&
+                (!it_best->spill_drft || (ctx_dft && it_best->spill_drft->load(ctx_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE)));
+            if (!ok) {
+                SRV_WRN("%s", " - prompt cache: reload from disk FAILED\n");
+                drop(it_best);
+                return false;
+            }
+            SRV_INF(" - prompt cache: reloaded %7d tokens, %.1f MiB from disk in %.0f ms\n",
+                    it_best->prompt.n_tokens(), it_best->spill_size / (1024.0 * 1024.0), (ggml_time_us() - t0) / 1000.0);
+        } else {
             auto & data = it_best->data.main;
             const size_t size = data.size();
             const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
