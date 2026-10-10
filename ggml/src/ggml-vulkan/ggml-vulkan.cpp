@@ -9218,9 +9218,16 @@ static void ggml_vk_buffer_write_2d(vk_buffer& dst, size_t offset, const void * 
     }
 }
 
+// the sync staging buffer grows to the largest transfer and is never freed, so large transfers go in pieces
+static constexpr size_t VK_SYNC_STAGING_CHUNK = 64u*1024*1024;
+
 static void ggml_vk_buffer_write(vk_buffer& dst, size_t offset, const void * src, size_t size) {
     VK_LOG_DEBUG("ggml_vk_buffer_write(" << size << ")");
-    ggml_vk_buffer_write_2d(dst, offset, src, size, size, size, 1);
+    for (size_t done = 0; done < size; ) {
+        const size_t n = std::min(VK_SYNC_STAGING_CHUNK, size - done);
+        ggml_vk_buffer_write_2d(dst, offset + done, (const uint8_t *) src + done, n, n, n, 1);
+        done += n;
+    }
 }
 
 static bool ggml_vk_buffer_read_2d_async(vk_context subctx, vk_buffer& src, size_t offset, void * dst, size_t spitch, size_t dpitch, size_t width, size_t height, bool sync_staging = false) {
@@ -9357,7 +9364,11 @@ static void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, si
 
 static void ggml_vk_buffer_read(vk_buffer& src, size_t offset, void * dst, size_t size) {
     VK_LOG_DEBUG("ggml_vk_buffer_read(" << src->buffer << ", " << offset << ", " << size << ")");
-    ggml_vk_buffer_read_2d(src, offset, dst, size, size, size, 1);
+    for (size_t done = 0; done < size; ) {
+        const size_t n = std::min(VK_SYNC_STAGING_CHUNK, size - done);
+        ggml_vk_buffer_read_2d(src, offset + done, (uint8_t *) dst + done, n, n, n, 1);
+        done += n;
+    }
 }
 
 static void ggml_vk_buffer_copy_async(vk_context& ctx, vk_buffer& dst, size_t dst_offset, vk_buffer& src, size_t src_offset, size_t size) {
